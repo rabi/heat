@@ -1,2 +1,2 @@
-add_plugin_dep ceilometer git://git.openstack.org/openstack/ceilometer
-add_plugin_dep mistral git://git.openstack.org/openstack/mistral
+add_dep_plugin ceilometer git://git.openstack.org/openstack/ceilometer
+add_dep_plugin mistral git://git.openstack.org/openstack/mistral
