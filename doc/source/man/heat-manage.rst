@@ -22,12 +22,9 @@ The standard pattern for executing a heat-manage command is:
 Run with -h to see a list of available commands:
 ``heat-manage -h``
 
-Commands are ``db_version``, ``db_sync``, ``purge_deleted`` and ``service``.
-Detailed descriptions are below.
-
-
-Heat Db version
-~~~~~~~~~~~~~~~
+Commands are ``db_version``, ``db_sync``, ``purge_deleted``,
+``migrate_convergence_1``, ``migrate_properties_data``, and
+``service``. Detailed descriptions are below.
 
 ``heat-manage db_version``
 
@@ -41,6 +38,17 @@ Heat Db version
 
     Purge db entries marked as deleted and older than [age]. When project_id
     argument is provided, only entries belonging to this project will be purged.
+
+``heat-manage migrate_properties_data``
+
+    Migrates properties data from the legacy locations in the db
+    (resource.properties_data and event.resource_properties) to the
+    modern location, the resource_properties_data table.
+
+``heat-manage migrate_convergence_1 [stack_id]``
+
+    Migrates [stack_id] from non-convergence to convergence. This requires running
+    convergence enabled heat engine(s) and can't be done when they are offline.
 
 ``heat-manage service list``
 
@@ -65,5 +73,5 @@ connection and logging.
 BUGS
 ====
 
-* Heat issues are tracked in Launchpad so you can view or report bugs here
-  `OpenStack Heat Bugs <https://bugs.launchpad.net/heat>`__
+Heat bugs are managed through StoryBoard
+`OpenStack Heat Stories <https://storyboard.openstack.org/#!/project/989>`__

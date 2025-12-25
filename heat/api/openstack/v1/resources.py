@@ -13,7 +13,6 @@
 
 import itertools
 
-import six
 from webob import exc
 
 from heat.api.openstack.v1 import util
@@ -75,7 +74,8 @@ class ResourceController(object):
 
     Implements the API actions.
     """
-    # Define request scope (must match what is in policy.json)
+    # Define request scope (must match what is in policy.yaml or policies in
+    # code)
     REQUEST_SCOPE = 'resource'
 
     def __init__(self, options):
@@ -88,29 +88,29 @@ class ResourceController(object):
             try:
                 return extractor(key, req.params[key])
             except ValueError as e:
-                raise exc.HTTPBadRequest(six.text_type(e))
+                raise exc.HTTPBadRequest(str(e))
         else:
             return default
 
-    @util.identified_stack
+    @util.registered_identified_stack
     def index(self, req, identity):
         """Lists information for all resources."""
 
-        whitelist = {
-            'type': 'mixed',
-            'status': 'mixed',
-            'name': 'mixed',
-            'action': 'mixed',
-            'id': 'mixed',
-            'physical_resource_id': 'mixed'
+        param_types = {
+            'type': util.PARAM_TYPE_MIXED,
+            'status': util.PARAM_TYPE_MIXED,
+            'name': util.PARAM_TYPE_MIXED,
+            'action': util.PARAM_TYPE_MIXED,
+            'id': util.PARAM_TYPE_MIXED,
+            'physical_resource_id': util.PARAM_TYPE_MIXED,
         }
 
         invalid_keys = (set(req.params.keys()) -
-                        set(list(whitelist) + [rpc_api.PARAM_NESTED_DEPTH,
-                                               rpc_api.PARAM_WITH_DETAIL]))
+                        set(list(param_types) + [rpc_api.PARAM_NESTED_DEPTH,
+                                                 rpc_api.PARAM_WITH_DETAIL]))
         if invalid_keys:
             raise exc.HTTPBadRequest(_('Invalid filter parameters %s') %
-                                     six.text_type(list(invalid_keys)))
+                                     str(list(invalid_keys)))
 
         nested_depth = self._extract_to_param(req,
                                               rpc_api.PARAM_NESTED_DEPTH,
@@ -121,7 +121,7 @@ class ResourceController(object):
                                              param_utils.extract_bool,
                                              default=False)
 
-        params = util.get_allowed_params(req.params, whitelist)
+        params = util.get_allowed_params(req.params, param_types)
 
         res_list = self.rpc_client.list_stack_resources(req.context,
                                                         identity,
@@ -131,12 +131,12 @@ class ResourceController(object):
 
         return {'resources': [format_resource(req, res) for res in res_list]}
 
-    @util.identified_stack
+    @util.registered_identified_stack
     def show(self, req, identity, resource_name):
         """Gets detailed information for a resource."""
 
-        whitelist = {'with_attr': util.PARAM_TYPE_MULTI}
-        params = util.get_allowed_params(req.params, whitelist)
+        param_types = {'with_attr': util.PARAM_TYPE_MULTI}
+        params = util.get_allowed_params(req.params, param_types)
         if 'with_attr' not in params:
             params['with_attr'] = None
         res = self.rpc_client.describe_stack_resource(req.context,
@@ -146,7 +146,7 @@ class ResourceController(object):
 
         return {'resource': format_resource(req, res)}
 
-    @util.identified_stack
+    @util.registered_identified_stack
     def metadata(self, req, identity, resource_name):
         """Gets metadata information for a resource."""
 
@@ -156,14 +156,14 @@ class ResourceController(object):
 
         return {rpc_api.RES_METADATA: res[rpc_api.RES_METADATA]}
 
-    @util.identified_stack
+    @util.registered_identified_stack
     def signal(self, req, identity, resource_name, body=None):
         self.rpc_client.resource_signal(req.context,
                                         stack_identity=identity,
                                         resource_name=resource_name,
                                         details=body)
 
-    @util.identified_stack
+    @util.registered_identified_stack
     def mark_unhealthy(self, req, identity, resource_name, body):
         """Mark a resource as healthy or unhealthy."""
         data = dict()
@@ -185,7 +185,7 @@ class ResourceController(object):
                 RES_UPDATE_MARK_UNHEALTHY,
                 body[RES_UPDATE_MARK_UNHEALTHY])
         except ValueError as e:
-            raise exc.HTTPBadRequest(six.text_type(e))
+            raise exc.HTTPBadRequest(str(e))
 
         data[RES_UPDATE_STATUS_REASON] = body.get(RES_UPDATE_STATUS_REASON, "")
         self.rpc_client.resource_mark_unhealthy(req.context,

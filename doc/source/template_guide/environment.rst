@@ -52,16 +52,16 @@ It also can contain some other sections:
     Merge strategies for merging parameters and parameter defaults from the
     environment file.
 
-Use the :option:`-e` option of the :command:`heat stack-create` command to
-create a stack using the environment defined in such a file.
+Use the `-e` option of the :command:`openstack stack create` command to create
+a stack using the environment defined in such a file.
 
 You can also provide environment parameters as a list of key/value pairs using
-the :option:`-P` option of the :command:`heat stack-create` command.
+the `--parameter` option of the :command:`openstack stack create` command.
 
 In the following example the environment is read from the :file:`my_env.yaml`
-file and an extra parameter is provided using the :option:`-P` option::
+file and an extra parameter is provided using the `--parameter` option::
 
-   $ heat stack-create my_stack -e my_env.yaml -P "param1=val1;param2=val2" -f my_tmpl.yaml
+   $ openstack stack create my_stack -e my_env.yaml --parameter "param1=val1;param2=val2" -t my_tmpl.yaml
 
 Environment Merging
 ~~~~~~~~~~~~~~~~~~~
@@ -71,18 +71,18 @@ strategies in an environment file.
 
 There are three merge strategy types:
 
-  ``overwrite``
-      Overwrites a parameter, existing parameter values are replaced.
+``overwrite``
+    Overwrites a parameter, existing parameter values are replaced.
 
-  ``merge``
-      Merges the existing parameter value and the new value. String values
-      are concatenated, comma delimited lists are extended and json values
-      are updated.
+``merge``
+    Merges the existing parameter value and the new value. String values
+    are concatenated, comma delimited lists are extended and json values
+    are updated.
 
-  ``deep_merge``
-      Json values are deep merged. Not useful for other types like comma
-      delimited lists and strings. If specified for them, it falls back to
-      ``merge``.
+``deep_merge``
+    Json values are deep merged. Not useful for other types like comma
+    delimited lists and strings. If specified for them, it falls back to
+    ``merge``.
 
 You can provide a default merge strategy and/or parameter specific merge strategies
 per environment file. Parameter specific merge strategy is only used for that
@@ -116,7 +116,7 @@ which is the time when these files are read.
 If the :file:`my_env.yaml` file from the example above had been put in the
 ``environment_dir`` then the user's command line could be this::
 
-    heat stack-create my_stack -P "some_parm=bla" -f my_tmpl.yaml
+    openstack stack create my_stack --parameter "some_parm=bla" -t my_tmpl.yaml
 
 Global templates
 ----------------
@@ -170,10 +170,10 @@ identifier, and must reference either another resource's ID or the URL of an
 existing template file.
 
 The following example maps a new ``OS::Networking::FloatingIP``
-resource to an existing ``OS::Nova::FloatingIP`` resource::
+resource to an existing ``OS::Neutron::FloatingIP`` resource::
 
   resource_registry:
-    "OS::Networking::FloatingIP": "OS::Nova::FloatingIP"
+    "OS::Networking::FloatingIP": "OS::Neutron::FloatingIP"
 
 You can use wildcards to map multiple resources, for example to map all
 ``OS::Neutron`` resources to ``OS::Network``::

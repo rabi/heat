@@ -13,16 +13,17 @@
 
 import copy
 import time
+from unittest import mock
 
 import fixtures
 from keystoneauth1 import exceptions as kc_exceptions
-import mock
 from oslo_log import log as logging
 
 from heat.common import exception
 from heat.common import template_format
 from heat.common import timeutils
 from heat.engine.clients.os import keystone
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.engine.clients.os.keystone import heat_keystoneclient as hkc
 from heat.engine import scheduler
 from heat.engine import stack
@@ -31,7 +32,6 @@ from heat.objects import snapshot as snapshot_object
 from heat.objects import stack as stack_object
 from heat.objects import user_creds as ucreds_object
 from heat.tests import common
-from heat.tests import fakes
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
 
@@ -65,7 +65,7 @@ class StackTest(common.HeatTestCase):
         self.stack = stack.Stack(self.ctx, 'delete_test', self.tmpl)
         stack_id = self.stack.store()
         snapshot_fake = {
-            'tenant': self.ctx.tenant_id,
+            'tenant': self.ctx.project_id,
             'name': 'Snapshot',
             'stack_id': stack_id,
             'status': 'COMPLETE',
@@ -73,7 +73,7 @@ class StackTest(common.HeatTestCase):
         }
         snapshot_object.Snapshot.create(self.ctx, snapshot_fake)
 
-        self.assertIsNotNone(snapshot_object.Snapshot.get_all(
+        self.assertIsNotNone(snapshot_object.Snapshot.get_all_by_stack(
             self.ctx, stack_id))
 
         self.stack.delete()
@@ -81,7 +81,47 @@ class StackTest(common.HeatTestCase):
         self.assertIsNone(db_s)
         self.assertEqual((stack.Stack.DELETE, stack.Stack.COMPLETE),
                          self.stack.state)
-        self.assertEqual([], snapshot_object.Snapshot.get_all(
+        self.assertEqual([], snapshot_object.Snapshot.get_all_by_stack(
+            self.ctx, stack_id))
+
+    def test_delete_with_snapshot_after_stack_add_resource(self):
+        tpl = {'heat_template_version': 'queens',
+               'resources':
+                   {'A': {'type': 'ResourceWithRestoreType'}}}
+        self.stack = stack.Stack(self.ctx, 'stack_delete_with_snapshot',
+                                 template.Template(tpl))
+        stack_id = self.stack.store()
+        self.stack.create()
+
+        data = copy.deepcopy(self.stack.prepare_abandon())
+        data['resources']['A']['resource_data']['a_string'] = 'foo'
+        snapshot_fake = {
+            'tenant': self.ctx.project_id,
+            'name': 'Snapshot',
+            'stack_id': stack_id,
+            'status': 'COMPLETE',
+            'data': data
+        }
+        snapshot_object.Snapshot.create(self.ctx, snapshot_fake)
+
+        self.assertIsNotNone(snapshot_object.Snapshot.get_all_by_stack(
+            self.ctx, stack_id))
+
+        new_tmpl = {'heat_template_version': 'queens',
+                    'resources':
+                        {'A': {'type': 'ResourceWithRestoreType'},
+                         'B': {'type': 'ResourceWithRestoreType'}}}
+        updated_stack = stack.Stack(self.ctx, 'update_stack_add_res',
+                                    template.Template(new_tmpl))
+        self.stack.update(updated_stack)
+        self.assertEqual(2, len(self.stack.resources))
+
+        self.stack.delete()
+        db_s = stack_object.Stack.get_by_id(self.ctx, stack_id)
+        self.assertIsNone(db_s)
+        self.assertEqual((stack.Stack.DELETE, stack.Stack.COMPLETE),
+                         self.stack.state)
+        self.assertEqual([], snapshot_object.Snapshot.get_all_by_stack(
             self.ctx, stack_id))
 
     def test_delete_user_creds(self):
@@ -232,7 +272,7 @@ class StackTest(common.HeatTestCase):
             self.ctx, user_creds_id)
         self.assertEqual('thetrustor', user_creds.get('trustor_user_id'))
 
-        mock_kc.return_value = fakes.FakeKeystoneClient(user_id='nottrustor')
+        mock_kc.return_value = fake_ks.FakeKeystoneClient(user_id='nottrustor')
 
         loaded_stack = stack.Stack.load(other_ctx, self.stack.id)
         loaded_stack.delete()
@@ -244,7 +284,7 @@ class StackTest(common.HeatTestCase):
                          loaded_stack.state)
 
     def test_delete_trust_backup(self):
-        class FakeKeystoneClientFail(fakes.FakeKeystoneClient):
+        class FakeKeystoneClientFail(fake_ks.FakeKeystoneClient):
             def delete_trust(self, trust_id):
                 raise Exception("Shouldn't delete")
 
@@ -266,7 +306,7 @@ class StackTest(common.HeatTestCase):
         mock_kcp.assert_called_once_with()
 
     def test_delete_trust_nested(self):
-        class FakeKeystoneClientFail(fakes.FakeKeystoneClient):
+        class FakeKeystoneClientFail(fake_ks.FakeKeystoneClient):
             def delete_trust(self, trust_id):
                 raise Exception("Shouldn't delete")
 
@@ -295,7 +335,7 @@ class StackTest(common.HeatTestCase):
                          self.stack.state)
 
     def test_delete_trust_fail(self):
-        class FakeKeystoneClientFail(fakes.FakeKeystoneClient):
+        class FakeKeystoneClientFail(fake_ks.FakeKeystoneClient):
             def delete_trust(self, trust_id):
                 raise kc_exceptions.Forbidden("Denied!")
 
@@ -314,13 +354,12 @@ class StackTest(common.HeatTestCase):
         self.assertEqual(2, mock_kcp.call_count)
 
         db_s = stack_object.Stack.get_by_id(self.ctx, stack_id)
-        self.assertIsNotNone(db_s)
-        self.assertEqual((stack.Stack.DELETE, stack.Stack.FAILED),
+        self.assertIsNone(db_s)
+        self.assertEqual((stack.Stack.DELETE, stack.Stack.COMPLETE),
                          self.stack.state)
-        self.assertIn('Error deleting trust', self.stack.status_reason)
 
     def test_delete_deletes_project(self):
-        fkc = fakes.FakeKeystoneClient()
+        fkc = fake_ks.FakeKeystoneClient()
         fkc.delete_stack_domain_project = mock.Mock()
 
         mock_kcp = self.patchobject(keystone.KeystoneClientPlugin, '_create',
@@ -433,8 +472,8 @@ class StackTest(common.HeatTestCase):
     def test_delete_stack_with_resource_log_is_clear(self):
         debug_logger = self.useFixture(
             fixtures.FakeLogger(level=logging.DEBUG,
-                                format="%(levelname)8s [%(name)s] %("
-                                       "message)s"))
+                                format="%(levelname)8s [%(name)s] "
+                                       "%(message)s"))
         tmpl = {'HeatTemplateFormatVersion': '2012-12-12',
                 'Resources': {'AResource': {'Type': 'GenericResourceType'}}}
         self.stack = stack.Stack(self.ctx, 'delete_log_test',
@@ -449,7 +488,7 @@ class StackTest(common.HeatTestCase):
 
     def test_stack_user_project_id_delete_fail(self):
 
-        class FakeKeystoneClientFail(fakes.FakeKeystoneClient):
+        class FakeKeystoneClientFail(fake_ks.FakeKeystoneClient):
             def delete_stack_domain_project(self, project_id):
                 raise kc_exceptions.Forbidden("Denied!")
 

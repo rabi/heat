@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,13 +11,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
+
+from heat.common import context
 from heat.engine import resource
 from heat.tests import common
 from heat.tests.convergence.framework import fake_resource
 from heat.tests.convergence.framework import processes
 from heat.tests.convergence.framework import scenario
 from heat.tests.convergence.framework import testutils
-from oslo_config import cfg
 
 
 class ScenarioTest(common.HeatTestCase):
@@ -28,15 +29,13 @@ class ScenarioTest(common.HeatTestCase):
 
     def setUp(self):
         super(ScenarioTest, self).setUp()
+        self.patchobject(context, 'StoredContext')
         resource._register_class('OS::Heat::TestResource',
                                  fake_resource.TestResource)
         self.procs = processes.Processes()
         po = self.patch("heat.rpc.worker_client.WorkerClient.check_resource")
         po.side_effect = self.procs.worker.check_resource
         cfg.CONF.set_default('convergence_engine', True)
-
-    def tearDown(self):
-        super(ScenarioTest, self).tearDown()
 
     def test_scenario(self):
         self.procs.clear()

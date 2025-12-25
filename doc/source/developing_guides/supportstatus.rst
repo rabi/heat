@@ -107,6 +107,14 @@ object from documentation and from result of :code:`resource-type-list` CLI
 command, if object is resource. Also, :code:`resource-type-show` command with
 such resource will raise `NotSupported` exception.
 
+The purpose of hiding, rather than removing, obsolete resources or properties
+is to ensure that users can continue to operate existing stacks - replacing or
+removing the offending resources, or deleting the entire stack. Steps should be
+taken to ensure that these operations can succeed, e.g. by replacing a hidden
+resource type's implementation with one that is equivalent to
+``OS::Heat::None`` when the underlying API no longer exists, supplying a
+*substitute_class* for a resource type, or adding a property translation rule.
+
 Using Support Status during code writing
 ----------------------------------------
 When adding new objects or adding objects instead of some old (e.g. property
@@ -201,7 +209,7 @@ status should be moved to *previous_status*, e.g.:
 
     support.SupportStatus(
         status=support.HIDDEN,
-        version='5.0.0',
+        version='6.0.0',
         message=_('Some message'),
         previous_status=support.SupportStatus(
             status=support.DEPRECATED,
@@ -258,9 +266,17 @@ must overload `translation_rules` method, which should return a list of
 
 .. code-block:: python
 
-   def translation_rules(self):
-        return [properties.TranslationRule(
-            self.properties,
-            properties.TranslationRule.REPLACE,
+   def translation_rules(self, properties):
+        rules = [
+          translation.TranslationRule(
+            properties,
+            translation.TranslationRule.REPLACE,
             translation_path=[self.NETWORKS, self.NETWORK_ID],
-            value_name=self.NETWORK_UUID)]
+            value_name=self.NETWORK_UUID),
+          translation.TranslationRule(
+            properties,
+            translation.TranslationRule.RESOLVE,
+            translation_path=[self.FLAVOR],
+            client_plugin=self.client_plugin('nova'),
+            finder='find_flavor_by_name_or_id')]
+        return rules

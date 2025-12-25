@@ -12,15 +12,14 @@
 #    under the License.
 
 from oslo_log import log as logging
-
-from heat.common.i18n import _LE
-
-LOG = logging.getLogger(__name__)
-
 from zaqarclient.queues.v2 import client as zaqarclient
 from zaqarclient.transport import errors as zaqar_errors
 
+from heat.common.i18n import _
 from heat.engine.clients import client_plugin
+from heat.engine import constraints
+
+LOG = logging.getLogger(__name__)
 
 CLIENT_NAME = 'zaqar'
 
@@ -34,14 +33,13 @@ class ZaqarClientPlugin(client_plugin.ClientPlugin):
     DEFAULT_TTL = 3600
 
     def _create(self):
-        return self.create_for_tenant(
-            self.context.tenant_id,
-            self.context.keystone_session.get_token())
+        return zaqarclient.Client(version=2,
+                                  session=self.context.keystone_session)
 
     def create_for_tenant(self, tenant_id, token):
         con = self.context
         if token is None:
-            LOG.error(_LE("Zaqar connection failed, no auth_token!"))
+            LOG.error("Zaqar connection failed, no auth_token!")
             return None
 
         opts = {
@@ -54,7 +52,6 @@ class ZaqarClientPlugin(client_plugin.ClientPlugin):
                      'options': opts}
         conf = {'auth_opts': auth_opts}
         endpoint = self.url_for(service_type=self.MESSAGING)
-
         return zaqarclient.Client(url=endpoint, conf=conf, version=2)
 
     def create_from_signed_url(self, project_id, paths, expires, methods,
@@ -75,6 +72,15 @@ class ZaqarClientPlugin(client_plugin.ClientPlugin):
     def is_not_found(self, ex):
         return isinstance(ex, zaqar_errors.ResourceNotFound)
 
+    def get_queue(self, queue_name):
+        if not isinstance(queue_name, str):
+            raise TypeError(_('Queue name must be a string'))
+        if not (0 < len(queue_name) <= 64):
+            raise ValueError(_('Queue name length must be 1-64'))
+        # Queues are created automatically starting with v1.1 of the Zaqar API,
+        # so any queue name is valid for the purposes of constraint validation.
+        return queue_name
+
 
 class ZaqarEventSink(object):
 
@@ -88,3 +94,8 @@ class ZaqarEventSink(object):
         queue = zaqar.queue(self._target, auto_create=False)
         ttl = self._ttl if self._ttl is not None else zaqar_plugin.DEFAULT_TTL
         queue.post({'body': event, 'ttl': ttl})
+
+
+class QueueConstraint(constraints.BaseCustomConstraint):
+    resource_client_name = CLIENT_NAME
+    resource_getter_name = 'get_queue'

@@ -15,7 +15,6 @@ import collections
 
 from oslo_config import cfg
 from oslo_serialization import jsonutils
-import six
 import yaml
 
 from heat.common import exception
@@ -45,20 +44,20 @@ class yaml_dumper(_yaml_dumper_base):
         return self.represent_dict(data.items())
 
 
-yaml_loader.add_constructor(u'tag:yaml.org,2002:str',
+yaml_loader.add_constructor('tag:yaml.org,2002:str',
                             yaml_loader._construct_yaml_str)
 # Unquoted dates like 2013-05-23 in yaml files get loaded as objects of type
 # datetime.data which causes problems in API layer when being processed by
 # openstack.common.jsonutils. Therefore, make unicode string out of timestamps
 # until jsonutils can handle dates.
-yaml_loader.add_constructor(u'tag:yaml.org,2002:timestamp',
+yaml_loader.add_constructor('tag:yaml.org,2002:timestamp',
                             yaml_loader._construct_yaml_str)
 
 yaml_dumper.add_representer(collections.OrderedDict,
                             yaml_dumper.represent_ordered_dict)
 
 
-def simple_parse(tmpl_str):
+def simple_parse(tmpl_str, tmpl_url=None):
     try:
         tpl = jsonutils.loads(tmpl_str)
     except ValueError:
@@ -71,8 +70,11 @@ def simple_parse(tmpl_str):
             try:
                 tpl = yaml.load(tmpl_str, Loader=yaml.SafeLoader)
             except yaml.YAMLError as yea:
-                yea = six.text_type(yea)
-                msg = _('Error parsing template: %s') % yea
+                if tmpl_url is None:
+                    tmpl_url = '[root stack]'
+                yea = str(yea)
+                msg = _('Error parsing template %(tmpl)s '
+                        '%(yea)s') % {'tmpl': tmpl_url, 'yea': yea}
                 raise ValueError(msg)
         else:
             if tpl is None:
@@ -99,7 +101,7 @@ def validate_template_limit(contain_str):
         raise exception.RequestLimitExceeded(message=msg)
 
 
-def parse(tmpl_str):
+def parse(tmpl_str, tmpl_url=None):
     """Takes a string and returns a dict containing the parsed structure.
 
     This includes determination of whether the string is using the
@@ -108,9 +110,9 @@ def parse(tmpl_str):
 
     # TODO(ricolin): Move this validation to api side.
     # Validate nested stack template.
-    validate_template_limit(six.text_type(tmpl_str))
+    validate_template_limit(str(tmpl_str))
 
-    tpl = simple_parse(tmpl_str)
+    tpl = simple_parse(tmpl_str, tmpl_url)
     # Looking for supported version keys in the loaded template
     if not ('HeatTemplateFormatVersion' in tpl
             or 'heat_template_version' in tpl
@@ -133,7 +135,7 @@ def convert_json_to_yaml(json_str):
     def top_level_items(tpl):
         yield ("HeatTemplateFormatVersion", '2012-12-12')
 
-        for k, v in six.iteritems(tpl):
+        for k, v in tpl.items():
             if k != 'AWSTemplateFormatVersion':
                 yield k, v
 

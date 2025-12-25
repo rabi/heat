@@ -14,7 +14,6 @@ import copy
 import json
 
 from heatclient import exc
-import six
 import yaml
 
 from heat_integrationtests.functional import functional_base
@@ -41,9 +40,6 @@ outputs:
   all_values:
     value: {get_attr: [random_group, value]}
 '''
-
-    def setUp(self):
-        super(ResourceGroupTest, self).setUp()
 
     def test_resource_group_zero_novalidate(self):
         # Nested resources should be validated only when size > 0
@@ -75,7 +71,7 @@ resources:
             environment=env
         )
 
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
 
         # Check we created an empty nested stack
@@ -85,16 +81,18 @@ resources:
 
         # Prove validation works for non-zero create/update
         template_two_nested = self.template.replace("count: 0", "count: 2")
-        expected_err = "Value 'BAD' is not an integer"
+        expected_err = ("resources.random_group<nested_stack>.resources."
+                        "0<provider.yaml>.resources.random: : "
+                        "Value 'BAD' is not an integer")
         ex = self.assertRaises(exc.HTTPBadRequest, self.update_stack,
                                stack_identifier, template_two_nested,
                                environment=env, files=files)
-        self.assertIn(expected_err, six.text_type(ex))
+        self.assertIn(expected_err, str(ex))
 
         ex = self.assertRaises(exc.HTTPBadRequest, self.stack_create,
                                template=template_two_nested,
                                environment=env, files=files)
-        self.assertIn(expected_err, six.text_type(ex))
+        self.assertIn(expected_err, str(ex))
 
     def _validate_resources(self, stack_identifier, expected_count):
         resources = self.list_group_resources(stack_identifier,
@@ -118,7 +116,7 @@ resources:
         create_template = self.template.replace("count: 0", "count: 2")
         stack_identifier = self.stack_create(template=create_template,
                                              environment=env)
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
 
         # validate count, type and name of resources in a resource group.
@@ -131,6 +129,60 @@ resources:
         outputs.append(validate_output(stack, 'random2', 30))
         self.assertEqual(outputs, self._stack_output(stack, 'all_values'))
 
+    def test_create_nested_groups_with_timeout(self):
+        parent_template = '''
+heat_template_version: rocky
+resources:
+  parent_group:
+    type: OS::Heat::ResourceGroup
+    update_policy:
+      batch_create: { max_batch_size: 1, pause_time: 1 }
+    properties:
+      count: 2
+      resource_def:
+        type: child.yaml
+'''
+        child_template = '''
+heat_template_version: rocky
+resources:
+  child_group:
+    type: OS::Heat::ResourceGroup
+    update_policy:
+      batch_create: { max_batch_size: 1, pause_time: 1 }
+    properties:
+      count: 2
+      resource_def:
+        type: value.yaml
+'''
+        value_template = '''
+heat_template_version: rocky
+resources:
+  value:
+    type: OS::Heat::Value
+    properties:
+      type: string
+      value: 'test'
+'''
+        files = {
+            'child.yaml': child_template,
+            'value.yaml': value_template,
+        }
+        stack_identifier = self.stack_create(
+            template=parent_template,
+            files=files,
+            timeout=10,  # in minutes
+        )
+
+        resources = self.client.resources.list(
+            stack_identifier, nested_depth=2, with_detail=True)
+        timeouts = set()
+        for res in resources:
+            if res.resource_type == "OS::Heat::ResourceGroup":
+                nested_stack = self.client.stacks.get(res.physical_resource_id)
+                timeouts.add(nested_stack.timeout_mins)
+
+        self.assertEqual({10}, timeouts)
+
     def test_update_increase_decrease_count(self):
         # create stack with resource group count 2
         env = {'resource_registry':
@@ -138,7 +190,7 @@ resources:
         create_template = self.template.replace("count: 0", "count: 2")
         stack_identifier = self.stack_create(template=create_template,
                                              environment=env)
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
         # verify that the resource group has 2 resources
         self._validate_resources(stack_identifier, 2)
@@ -170,15 +222,15 @@ resources:
 
         # create stack with resource group, initial count 5
         stack_identifier = self.stack_create(template=rp_template)
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
         group_resources = self.list_group_resources(stack_identifier,
                                                     'random_group')
-        expected_resources = {u'0': u'OS::Heat::RandomString',
-                              u'1': u'OS::Heat::RandomString',
-                              u'2': u'OS::Heat::RandomString',
-                              u'3': u'OS::Heat::RandomString',
-                              u'4': u'OS::Heat::RandomString'}
+        expected_resources = {'0': 'OS::Heat::RandomString',
+                              '1': 'OS::Heat::RandomString',
+                              '2': 'OS::Heat::RandomString',
+                              '3': 'OS::Heat::RandomString',
+                              '4': 'OS::Heat::RandomString'}
         self.assertEqual(expected_resources, group_resources)
 
         # Remove three, specifying the middle resources to be removed
@@ -188,11 +240,11 @@ resources:
         self.update_stack(stack_identifier, update_template)
         group_resources = self.list_group_resources(stack_identifier,
                                                     'random_group')
-        expected_resources = {u'0': u'OS::Heat::RandomString',
-                              u'4': u'OS::Heat::RandomString',
-                              u'5': u'OS::Heat::RandomString',
-                              u'6': u'OS::Heat::RandomString',
-                              u'7': u'OS::Heat::RandomString'}
+        expected_resources = {'0': 'OS::Heat::RandomString',
+                              '4': 'OS::Heat::RandomString',
+                              '5': 'OS::Heat::RandomString',
+                              '6': 'OS::Heat::RandomString',
+                              '7': 'OS::Heat::RandomString'}
         self.assertEqual(expected_resources, group_resources)
 
     def test_props_update(self):
@@ -203,7 +255,7 @@ resources:
         template_one = self.template.replace("count: 0", "count: 1")
         stack_identifier = self.stack_create(template=template_one,
                                              environment=env)
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
 
         initial_nested_ident = self.group_nested_identifier(stack_identifier,
@@ -235,7 +287,7 @@ resources:
         template_one = self.template.replace("count: 0", "count: 2")
         stack_identifier = self.stack_create(template=template_one,
                                              environment=env)
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
 
         initial_nested_ident = self.group_nested_identifier(stack_identifier,
@@ -297,7 +349,7 @@ outputs:
         stack_identifier = self.stack_create(template=template_one,
                                              environment=env,
                                              files=files1)
-        self.assertEqual({u'random_group': u'OS::Heat::ResourceGroup'},
+        self.assertEqual({'random_group': 'OS::Heat::ResourceGroup'},
                          self.list_resources(stack_identifier))
         self.assertEqual(files1, self.client.stacks.files(stack_identifier))
 
@@ -322,6 +374,37 @@ outputs:
         stack1 = self.client.stacks.get(stack_identifier)
         updated_rand = self._stack_output(stack1, 'random1')
         self.assertNotEqual(initial_rand, updated_rand)
+
+    def test_validation(self):
+        resource_group = '''
+heat_template_version: 2016-10-14
+
+parameters:
+  the_count:
+    type: number
+
+resources:
+
+  the_group:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count: {get_param: the_count}
+      resource_def:
+        type: OS::Heat::RandomString
+'''
+        ret = self.client.stacks.validate(template=resource_group)
+        expected = {'Description': 'No description',
+                    'Environment': {'event_sinks': [],
+                                    'parameter_defaults': {},
+                                    'parameters': {},
+                                    'resource_registry': {'resources': {}}},
+                    'Parameters': {
+                        'the_count': {'Description': '',
+                                      'Label': 'the_count',
+                                      'NoEcho': 'false',
+                                      'Type': 'Number'}}}
+
+        self.assertEqual(expected, ret)
 
 
 class ResourceGroupTestNullParams(functional_base.FunctionalTestsBase):
@@ -377,9 +460,6 @@ outputs:
         )),
     ]
 
-    def setUp(self):
-        super(ResourceGroupTestNullParams, self).setUp()
-
     def test_create_pass_zero_parameter(self):
         templ = self.template.replace('type: empty',
                                       'type: %s' % self.p_type)
@@ -416,9 +496,6 @@ outputs:
   test1:
     value: {get_attr: [group1, resource.1.value]}
 '''
-
-    def setUp(self):
-        super(ResourceGroupAdoptTest, self).setUp()
 
     def _yaml_to_json(self, yaml_templ):
         return yaml.safe_load(yaml_templ)
@@ -488,9 +565,6 @@ resources:
       fail: true
       wait_secs: 2
 '''
-
-    def setUp(self):
-        super(ResourceGroupErrorResourceTest, self).setUp()
 
     def test_fail(self):
         stack_identifier = self.stack_create(
@@ -590,6 +664,36 @@ resources:
                                    updated=0,
                                    created=10,
                                    deleted=10)
+
+    def test_resource_group_update_replace_template_changed(self):
+        """Test rolling update(replace)with child template path changed.
+
+        Simple rolling update replace with child template path changed.
+        """
+
+        nested_templ = '''
+heat_template_version: "2013-05-23"
+resources:
+  oops:
+    type: OS::Heat::TestResource
+'''
+
+        create_template = yaml.safe_load(copy.deepcopy(self.template))
+        grp = create_template['resources']['random_group']
+        grp['properties']['resource_def'] = {'type': '/opt/provider.yaml'}
+        files = {'/opt/provider.yaml': nested_templ}
+
+        policy = grp['update_policy']['rolling_update']
+        policy['min_in_service'] = '1'
+        policy['max_batch_size'] = '3'
+        stack_identifier = self.stack_create(template=create_template,
+                                             files=files)
+        update_template = create_template.copy()
+        grp = update_template['resources']['random_group']
+        grp['properties']['resource_def'] = {'type': '/opt1/provider.yaml'}
+        files = {'/opt1/provider.yaml': nested_templ}
+
+        self.update_stack(stack_identifier, update_template, files=files)
 
     def test_resource_group_update_scaledown(self):
         """Test rolling update with scaledown.

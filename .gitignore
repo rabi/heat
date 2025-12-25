@@ -9,6 +9,7 @@ tags
 heat-test.db
 heat.sqlite
 .venv
+.stestr/*
 AUTHORS
 ChangeLog
 templates/cloudformation-examples
@@ -21,8 +22,20 @@ cover
 .pydevproject
 doc/source/api/
 etc/heat/heat.conf.sample
+.idea
 # integration tests requirements are auto-generated from stub file
 heat_integrationtests/requirements.txt
+heat_integrationtests/heat_integrationtests.conf.sample
+
+# generated policy file
+etc/heat/policy.yaml.sample
+
+# sample policy file included in docs
+doc/source/_static/heat.policy.yaml.sample
 
 # Files created by releasenotes build
 releasenotes/build
+releasenotes/notes/reno.cache
+
+# sample config included in docs
+doc/source/_static/heat.conf.sample

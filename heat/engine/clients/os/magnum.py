@@ -11,8 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from magnumclient.common.apiclient import exceptions as mc_exc
+from magnumclient import exceptions as mc_exc
 from magnumclient.v1 import client as magnum_client
+from oslo_config import cfg
 
 from heat.common import exception
 from heat.engine.clients import client_plugin
@@ -30,7 +31,9 @@ class MagnumClientPlugin(client_plugin.ClientPlugin):
         args = {
             'interface': interface,
             'service_type': self.CONTAINER,
-            'session': self.context.keystone_session
+            'session': self.context.keystone_session,
+            'connect_retries': cfg.CONF.client_retry_limit,
+            'region_name': self._get_region_name()
         }
         client = magnum_client.Client(**args)
         return client
@@ -44,15 +47,22 @@ class MagnumClientPlugin(client_plugin.ClientPlugin):
     def is_conflict(self, ex):
         return isinstance(ex, mc_exc.Conflict)
 
-    def get_baymodel(self, value):
+    def _get_rsrc_name_or_id(self, value, entity, entity_msg):
+        entity_client = getattr(self.client(), entity)
         try:
-            self.client().baymodels.get(value)
+            return entity_client.get(value).uuid
         except mc_exc.NotFound:
-            raise exception.EntityNotFound(entity='BayModel',
+            # Magnum cli will find the value either is name or id,
+            # so no need to call list() here.
+            raise exception.EntityNotFound(entity=entity_msg,
                                            name=value)
 
+    def get_cluster_template(self, value):
+        return self._get_rsrc_name_or_id(value, entity='cluster_templates',
+                                         entity_msg='ClusterTemplate')
 
-class BaymodelConstraint(constraints.BaseCustomConstraint):
+
+class ClusterTemplateConstraint(constraints.BaseCustomConstraint):
 
     resource_client_name = CLIENT_NAME
-    resource_getter_name = 'get_baymodel'
+    resource_getter_name = 'get_cluster_template'

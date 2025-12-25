@@ -13,16 +13,16 @@
 
 """Routines for configuring Heat."""
 import os
+import socket
 
-from eventlet.green import socket
 from oslo_config import cfg
+from oslo_db import options as oslo_db_ops
 from oslo_log import log as logging
 from oslo_middleware import cors
 from osprofiler import opts as profiler
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.common import wsgi
 
 
@@ -39,16 +39,15 @@ service_opts = [
     cfg.IntOpt('periodic_interval',
                default=60,
                help=_('Seconds between running periodic tasks.')),
-    cfg.StrOpt('heat_metadata_server_url',
+    cfg.URIOpt('heat_metadata_server_url',
+               schemes=['http', 'https'],
                help=_('URL of the Heat metadata server. '
                       'NOTE: Setting this is only needed if you require '
                       'instances to use a different endpoint than in the '
                       'keystone catalog')),
-    cfg.StrOpt('heat_waitcondition_server_url',
+    cfg.URIOpt('heat_waitcondition_server_url',
+               schemes=['http', 'https'],
                help=_('URL of the Heat waitcondition server.')),
-    cfg.StrOpt('heat_watch_server_url',
-               default="",
-               help=_('URL of the Heat CloudWatch server.')),
     cfg.StrOpt('instance_connection_is_secure',
                default="0",
                help=_('Instance connection to CFN/CW API via https.')),
@@ -58,6 +57,13 @@ service_opts = [
                       'SSL is used.')),
     cfg.StrOpt('region_name_for_services',
                help=_('Default region name used to get services endpoints.')),
+    cfg.StrOpt('region_name_for_shared_services',
+               help=_('Region name for shared services endpoints.')),
+    cfg.ListOpt('shared_services_types',
+                default=['image', 'volumev3'],
+                help=_('The shared services located in the other region.'
+                       'Needs region_name_for_shared_services option to '
+                       'be set for this to take effect.')),
     cfg.StrOpt('heat_stack_user_role',
                default="heat_stack_user",
                help=_('Keystone role for heat template-defined users.')),
@@ -83,10 +89,22 @@ service_opts = [
     cfg.IntOpt('max_nested_stack_depth',
                default=5,
                help=_('Maximum depth allowed when using nested stacks.')),
+    cfg.FloatOpt('template_fetch_timeout',
+                 default=60,
+                 min=0,
+                 help=_('Timeout in seconds for template download.')),
     cfg.IntOpt('num_engine_workers',
+               min=1,
                help=_('Number of heat-engine processes to fork and run. '
                       'Will default to either to 4 or number of CPUs on '
-                      'the host, whichever is greater.'))]
+                      'the host, whichever is greater.')),
+    cfg.StrOpt('server_keystone_endpoint_type',
+               choices=['', 'public', 'internal', 'admin'],
+               default='',
+               help=_('If set, is used to control which authentication '
+                      'endpoint is used by user-controlled servers to make '
+                      'calls back to Heat. '
+                      'If unset www_authenticate_uri is used.'))]
 
 engine_opts = [
     cfg.ListOpt('plugin_dirs',
@@ -102,6 +120,11 @@ engine_opts = [
     cfg.StrOpt('deferred_auth_method',
                choices=['password', 'trusts'],
                default='trusts',
+               deprecated_for_removal=True,
+               deprecated_reason='Stored password based deferred auth is '
+                                 'broken when used with keystone v3 and '
+                                 'is not supported.',
+               deprecated_since='9.0.0',
                help=_('Select deferred auth method, '
                       'stored password or trusts.')),
     cfg.StrOpt('reauthentication_auth_method',
@@ -110,10 +133,18 @@ engine_opts = [
                help=_('Allow reauthentication on token expiry, such that'
                       ' long-running tasks may complete. Note this defeats'
                       ' the expiry of any provided user tokens.')),
-    cfg.IntOpt('stale_token_duration',
-               default=30,
-               help=_('Gap, in seconds, to determine whether the given token '
-                      'is about to expire.'),),
+    cfg.BoolOpt('allow_trusts_redelegation',
+                default=False,
+                help=_('Create trusts with redelegation enabled. '
+                       'This option is only used when '
+                       'reauthentication_auth_method is set to "trusts". '
+                       'Note that enabling this option does have '
+                       'security implications as all trusts created by Heat '
+                       'will use both impersonation and redelegation enabled. '
+                       'Enable it only when there are other services that '
+                       'need to create trusts from tokens Heat uses to '
+                       'access them, examples are Aodh and Heat in another '
+                       'region when configured to use trusts too.')),
     cfg.ListOpt('trusts_delegated_roles',
                 default=[],
                 help=_('Subset of trustor roles to be delegated to heat.'
@@ -124,9 +155,22 @@ engine_opts = [
                help=_('Maximum resources allowed per top-level stack. '
                       '-1 stands for unlimited.')),
     cfg.IntOpt('max_stacks_per_tenant',
-               default=100,
-               help=_('Maximum number of stacks any one tenant may have'
-                      ' active at one time.')),
+               default=512,
+               help=_('Maximum number of stacks any one tenant may have '
+                      'active at one time. -1 stands for unlimited.')),
+    cfg.IntOpt('max_software_configs_per_tenant',
+               default=4096,
+               help=_('Maximum number of software configs any one tenant may '
+                      'have active at one time. -1 stands for unlimited.')),
+    cfg.IntOpt('max_software_deployments_per_tenant',
+               default=4096,
+               help=_('Maximum number of software deployments any one tenant '
+                      'may have active at one time.'
+                      '-1 stands for unlimited.')),
+    cfg.IntOpt('max_snapshots_per_stack',
+               default=32,
+               help=_('Maximum number of snapshot any one stack may have '
+                      'active at one time. -1 stands for unlimited.')),
     cfg.IntOpt('action_retry_limit',
                default=5,
                help=_('Number of times to retry to bring a '
@@ -149,17 +193,39 @@ engine_opts = [
                default=10,
                help=_('Number of times to check whether an interface has '
                       'been attached or detached.')),
+    cfg.StrOpt('max_nova_api_microversion',
+               regex=r'^2\.\d+$',
+               help=_('Maximum nova API version for client plugin. With '
+                      'this limitation, any nova feature supported with '
+                      'microversion number above max_nova_api_microversion '
+                      'will not be available.')),
+    cfg.StrOpt('max_cinder_api_microversion',
+               regex=r'^3\.\d+$',
+               help=_('Maximum cinder API version for client plugin. With '
+                      'this limitation, any cinder feature supported with '
+                      'microversion number above max_cinder_api_microversion '
+                      'will not be available.')),
+    cfg.StrOpt('max_ironic_api_microversion',
+               regex=r'^1\.\d+$',
+               help=_('Maximum ironic API version for client plugin. With '
+                      'this limitation, any ironic feature supported with '
+                      'microversion number above '
+                      'max_ironic_api_microversion will not be available.')),
     cfg.IntOpt('event_purge_batch_size',
-               default=10,
+               min=1,
+               default=200,
                help=_("Controls how many events will be pruned whenever a "
-                      "stack's events exceed max_events_per_stack. Set this "
+                      "stack's events are purged. Set this "
                       "lower to keep more events at the expense of more "
                       "frequent purges.")),
     cfg.IntOpt('max_events_per_stack',
                default=1000,
-               help=_('Maximum events that will be available per stack. Older'
-                      ' events will be deleted when this is reached. Set to 0'
-                      ' for unlimited events per stack.')),
+               help=_('Rough number of maximum events that will be available '
+                      'per stack. Actual number of events can be a bit '
+                      'higher since purge checks take place randomly '
+                      '200/event_purge_batch_size percent of the time. '
+                      'Older events are deleted when events are purged. '
+                      'Set to 0 for unlimited events per stack.')),
     cfg.IntOpt('stack_action_timeout',
                default=3600,
                help=_('Timeout in seconds for stack action (ie. create or'
@@ -173,17 +239,22 @@ engine_opts = [
                default=2,
                help=_('RPC timeout for the engine liveness check that is used'
                       ' for stack locking.')),
-    cfg.BoolOpt('enable_cloud_watch_lite',
-                default=False,
-                help=_('Enable the legacy OS::Heat::CWLiteAlarm resource.')),
     cfg.BoolOpt('enable_stack_abandon',
                 default=False,
+                deprecated_for_removal=True,
+                deprecated_reason="Stack abandon is not supported by "
+                                  "convergence engine.",
                 help=_('Enable the preview Stack Abandon feature.')),
     cfg.BoolOpt('enable_stack_adopt',
                 default=False,
+                deprecated_for_removal=True,
+                deprecated_reason="Stack adopt is not supported by "
+                                  "convergence engine.",
                 help=_('Enable the preview Stack Adopt feature.')),
     cfg.BoolOpt('convergence_engine',
                 default=True,
+                deprecated_for_removal=True,
+                deprecated_reason='Legacy engine has been deprecated.',
                 help=_('Enables engine with convergence architecture. All '
                        'stacks with this option will be created using '
                        'convergence engine.')),
@@ -230,13 +301,24 @@ engine_opts = [
                       'credentials. ZAQAR_SIGNAL will create a dedicated '
                       'zaqar queue to be signaled using the provided keystone '
                       'credentials.')),
+    cfg.StrOpt('default_user_data_format',
+               choices=['HEAT_CFNTOOLS',
+                        'RAW',
+                        'SOFTWARE_CONFIG'],
+               default='HEAT_CFNTOOLS',
+               help=_('Template default for how the user_data should be '
+                      'formatted for the server. For HEAT_CFNTOOLS, the '
+                      'user_data is bundled as part of the heat-cfntools '
+                      'cloud-init boot configuration data. For RAW the '
+                      'user_data is passed to Nova unmodified. For '
+                      'SOFTWARE_CONFIG user_data is bundled as part of the '
+                      'software config data, and metadata is derived from any '
+                      'associated SoftwareDeployment resources.')),
     cfg.ListOpt('hidden_stack_tags',
-                default=['data-processing-cluster'],
+                default=[],
                 help=_('Stacks containing these tag names will be hidden. '
                        'Multiple tags should be given in a comma-delimited '
                        'list (eg. hidden_stack_tags=hide_me,me_too).')),
-    cfg.StrOpt('onready',
-               help=_('Deprecated.')),
     cfg.BoolOpt('stack_scheduler_hints',
                 default=False,
                 help=_('When this feature is enabled, scheduler hints'
@@ -259,11 +341,18 @@ engine_opts = [
                 default=False,
                 help=_('Encrypt template parameters that were marked as'
                        ' hidden and also all the resource properties before'
-                       ' storing them in database.'))]
+                       ' storing them in database.')),
+    cfg.FloatOpt('metadata_put_timeout',
+                 default=60,
+                 min=0,
+                 help=_('Timeout in seconds for metadata update for '
+                        'software deployment'))
+    ]
 
 rpc_opts = [
     cfg.StrOpt('host',
                default=socket.gethostname(),
+               sample_default='<Hostname>',
                help=_('Name of the engine node. '
                       'This can be an opaque identifier. '
                       'It is not necessarily a hostname, FQDN, '
@@ -319,16 +408,16 @@ clients_opts = [
                        "be verified."))]
 
 heat_client_opts = [
-    cfg.StrOpt('url',
-               default='',
+    cfg.URIOpt('url',
+               schemes=['http', 'https'],
                help=_('Optional heat url in format like'
-                      ' http://0.0.0.0:8004/v1/%(tenant_id)s.'))]
+                      ' http://127.0.0.1:8004/v1/%(tenant_id)s.'))]
 
 keystone_client_opts = [
-    cfg.StrOpt('auth_uri',
-               default='',
+    cfg.URIOpt('auth_uri',
+               schemes=['http', 'https'],
                help=_('Unversioned keystone url in format like'
-                      ' http://0.0.0.0:5000.'))]
+                      ' http://127.0.0.1:5000.'))]
 
 client_http_log_debug_opts = [
     cfg.BoolOpt('http_log_debug',
@@ -352,14 +441,21 @@ volumes_opts = [
                        "This is a temporary workaround until cinder-backup "
                        "service becomes discoverable, see LP#1334856."))]
 
+noauth_group = cfg.OptGroup('noauth')
+noauth_opts = [
+    cfg.StrOpt('token_response',
+               default='',
+               help=_("JSON file containing the content returned by the "
+                      "noauth middleware."))]
+
 
 def startup_sanity_check():
     if (not cfg.CONF.stack_user_domain_id and
             not cfg.CONF.stack_user_domain_name):
         # FIXME(shardy): Legacy fallback for folks using old heat.conf
         # files which lack domain configuration
-        LOG.warning(_LW('stack_user_domain_id or stack_user_domain_name not '
-                        'set in heat.conf falling back to using default'))
+        LOG.warning('stack_user_domain_id or stack_user_domain_name not '
+                    'set in heat.conf falling back to using default')
     else:
         domain_admin_user = cfg.CONF.stack_domain_admin
         domain_admin_password = cfg.CONF.stack_domain_admin_password
@@ -372,7 +468,7 @@ def startup_sanity_check():
     auth_key_len = len(cfg.CONF.auth_encryption_key)
     if auth_key_len in (16, 24):
         LOG.warning(
-            _LW('Please update auth_encryption_key to be 32 characters.'))
+            'Please update auth_encryption_key to be 32 characters.')
     elif auth_key_len != 32:
         raise exception.Error(_('heat.conf misconfigured, auth_encryption_key '
                                 'must be 32 characters'))
@@ -386,13 +482,12 @@ def list_opts():
     yield auth_password_group.name, auth_password_opts
     yield revision_group.name, revision_opts
     yield volumes_group.name, volumes_opts
-    yield profiler.list_opts()[0]
+    yield noauth_group.name, noauth_opts
     yield 'clients', default_clients_opts
 
-    for client in ('aodh', 'barbican', 'ceilometer', 'cinder', 'designate',
-                   'glance', 'heat', 'keystone', 'magnum', 'manila', 'mistral',
-                   'monasca', 'neutron', 'nova', 'sahara', 'senlin', 'swift',
-                   'trove', 'zaqar'
+    for client in ('aodh', 'barbican', 'cinder', 'designate', 'glance', 'heat',
+                   'keystone', 'magnum', 'manila', 'mistral', 'neutron',
+                   'nova', 'octavia', 'swift', 'trove', 'vitrage', 'zaqar'
                    ):
         client_specific_group = 'clients_' + client
         yield client_specific_group, clients_opts
@@ -401,12 +496,12 @@ def list_opts():
     yield 'clients_keystone', keystone_client_opts
     yield 'clients_nova', client_http_log_debug_opts
     yield 'clients_cinder', client_http_log_debug_opts
+    yield oslo_db_ops.list_opts()[0]
 
 
 cfg.CONF.register_group(paste_deploy_group)
 cfg.CONF.register_group(auth_password_group)
 cfg.CONF.register_group(revision_group)
-profiler.set_defaults(cfg.CONF)
 
 for group, opts in list_opts():
     cfg.CONF.register_opts(opts, group=group)
@@ -442,7 +537,7 @@ def load_paste_app(app_name=None):
 
     :param app_name: name of the application to load
 
-    :raises RuntimeError when config file cannot be located or application
+    :raises RuntimeError: when config file cannot be located or application
             cannot be loaded from config file
     """
     if app_name is None:
@@ -450,7 +545,7 @@ def load_paste_app(app_name=None):
 
     # append the deployment flavor to the application name,
     # in order to identify the appropriate paste pipeline
-    app_name += _get_deployment_flavor()
+    app_name_flavor = app_name + _get_deployment_flavor()
 
     conf_file = _get_deployment_config_file()
     if conf_file is None:
@@ -458,23 +553,25 @@ def load_paste_app(app_name=None):
                            cfg.CONF.paste_deploy['api_paste_config'])
 
     try:
-        app = wsgi.paste_deploy_app(conf_file, app_name, cfg.CONF)
-
-        # Log the options used when starting if we're in debug mode...
-        if cfg.CONF.debug:
-            cfg.CONF.log_opt_values(logging.getLogger(app_name),
-                                    logging.DEBUG)
-
-        return app
+        try:
+            app = wsgi.paste_deploy_app(conf_file, app_name_flavor, cfg.CONF)
+        except LookupError:
+            app = wsgi.paste_deploy_app(conf_file, app_name, cfg.CONF)
     except (LookupError, ImportError) as e:
-        raise RuntimeError(_("Unable to load %(app_name)s from "
-                             "configuration file %(conf_file)s."
-                             "\nGot: %(e)r") % {'app_name': app_name,
-                                                'conf_file': conf_file,
-                                                'e': e})
+        raise RuntimeError(
+            _("Unable to load %(app_name)s from configuration file "
+              "%(conf_file)s.\nGot: %(e)r") % {'app_name': app_name_flavor,
+                                               'conf_file': conf_file,
+                                               'e': e})
+
+    # Log the options used when starting if we're in debug mode...
+    if cfg.CONF.debug:
+        cfg.CONF.log_opt_values(logging.getLogger(app_name),
+                                logging.DEBUG)
+    return app
 
 
-def get_client_option(client, option):
+def get_client_option(client, option, fallback=True):
     # look for the option in the [clients_${client}] section
     # unknown options raise cfg.NoSuchOptError
     try:
@@ -482,9 +579,11 @@ def get_client_option(client, option):
         cfg.CONF.import_opt(option, 'heat.common.config',
                             group=group_name)
         v = getattr(getattr(cfg.CONF, group_name), option)
-        if v is not None:
+        if not fallback or v is not None:
             return v
     except cfg.NoSuchGroupError:
+        if not fallback:
+            raise
         pass  # do not error if the client is unknown
     # look for the option in the generic [clients] section
     cfg.CONF.import_opt(option, 'heat.common.config', group='clients')
@@ -508,23 +607,22 @@ def get_ssl_options(client):
 
 def set_config_defaults():
     """This method updates all configuration default values."""
-    # CORS Defaults
-    # TODO(krotscheck): Update with https://review.openstack.org/#/c/285368/
-    cfg.set_defaults(cors.CORS_OPTS,
-                     allow_headers=['X-Auth-Token',
-                                    'X-Identity-Status',
-                                    'X-Roles',
-                                    'X-Service-Catalog',
-                                    'X-User-Id',
-                                    'X-Tenant-Id',
-                                    'X-OpenStack-Request-ID'],
-                     expose_headers=['X-Auth-Token',
-                                     'X-Subject-Token',
-                                     'X-Service-Token',
-                                     'X-OpenStack-Request-ID'],
-                     allow_methods=['GET',
-                                    'PUT',
-                                    'POST',
-                                    'DELETE',
-                                    'PATCH']
-                     )
+    cors.set_defaults(
+        allow_headers=['X-Auth-Token',
+                       'X-Identity-Status',
+                       'X-Roles',
+                       'X-Service-Catalog',
+                       'X-User-Id',
+                       'X-Tenant-Id',
+                       'X-OpenStack-Request-ID'],
+        expose_headers=['X-Auth-Token',
+                        'X-Subject-Token',
+                        'X-Service-Token',
+                        'X-OpenStack-Request-ID'],
+        allow_methods=['GET',
+                       'PUT',
+                       'POST',
+                       'DELETE',
+                       'PATCH']
+    )
+    profiler.set_defaults(cfg.CONF)

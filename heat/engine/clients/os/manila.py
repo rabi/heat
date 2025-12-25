@@ -16,8 +16,9 @@ from heat.engine.clients import client_plugin
 from heat.engine import constraints
 from manilaclient import client as manila_client
 from manilaclient import exceptions
+from oslo_config import cfg
 
-MANILACLIENT_VERSION = "1"
+MANILACLIENT_VERSION = "2.13"
 CLIENT_NAME = 'manila'
 
 
@@ -25,14 +26,16 @@ class ManilaClientPlugin(client_plugin.ClientPlugin):
 
     exceptions_module = exceptions
 
-    service_types = [SHARE] = ['share']
+    service_types = [SHARE] = ['sharev2']
 
     def _create(self):
         endpoint_type = self._get_client_option(CLIENT_NAME, 'endpoint_type')
         args = {
             'endpoint_type': endpoint_type,
             'service_type': self.SHARE,
-            'session': self.context.keystone_session
+            'session': self.context.keystone_session,
+            'connect_retries': cfg.CONF.client_retry_limit,
+            'region_name': self._get_region_name()
         }
         client = manila_client.Client(MANILACLIENT_VERSION, **args)
         return client
@@ -59,7 +62,8 @@ class ManilaClientPlugin(client_plugin.ClientPlugin):
         :param resource_list: list of resources
         :param resource_type_name: name of resource type that will be used
                                    for exceptions
-        :raises EntityNotFound, NoUniqueMatch
+        :raises EntityNotFound: if cannot find resource by name
+        :raises NoUniqueMatch: if find more than one resource by ambiguous name
         :return: resource or generate an exception otherwise
         """
         search_result_by_id = [res for res in resource_list

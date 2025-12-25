@@ -20,13 +20,13 @@ config_id_url:
   description: |
     The UUID of the configuration.
   in: path
-  required: false
+  required: true
   type: string
 deployment_id_url:
   description: |
     The UUID of the deployment.
   in: path
-  required: false
+  required: true
   type: string
 deployment_server_id_url:
   description: |
@@ -40,25 +40,32 @@ event_id_url:
     The UUID of the event that is related to the
     resource in the stack.
   in: path
-  required: false
+  required: true
   type: string
 output_key_url:
   description: |
     The key of a stack output.
   in: path
-  required: false
+  required: true
+  type: string
+resource_name_or_physical_id_url:
+  description: |
+    The name of a resource in the stack, or the ID of its underlying physical
+    resource.
+  in: path
+  required: true
   type: string
 resource_name_url:
   description: |
     The name of a resource in the stack.
   in: path
-  required: false
+  required: true
   type: string
 snapshot_id_url:
   description: |
     The UUID of the snapshot.
   in: path
-  required: false
+  required: true
   type: string
 stack_id_url:
   description: |
@@ -76,7 +83,7 @@ stack_name_url:
   description: |
     The name of a stack.
   in: path
-  required: false
+  required: true
   type: string
 template_version_url:
   description: |
@@ -108,7 +115,7 @@ deployment_server_id_query:
 global_tenant:
   description: |
     Set to ``true`` to include stacks from all tenants (projects) in the stack
-    list. Specify policy requirements in the Orchestration ``policy.json``
+    list. Specify policy requirements in the Orchestration ``policy.yaml``
     file.
   in: query
   required: false
@@ -424,6 +431,13 @@ cancel_update:
   in: body
   required: true
   type: string
+cancel_without_rollback:
+  description: |
+    Specify the ``cancel_without_rollback`` action in
+    the request body..
+  in: body
+  required: true
+  type: string
 capabilities:
   description: |
     List of stack capabilities for stack.
@@ -469,6 +483,14 @@ config_name:
   in: body
   required: true
   type: string
+converge:
+  description: |
+    Set to ``true`` to force the stack to observe the reality
+    before update.
+  in: body
+  required: false
+  default: false
+  type: boolean
 created_at:
   description: |
     The date and time when the service engine was created.
@@ -624,6 +646,12 @@ engine_status:
   in: body
   required: true
   type: string
+Environment:
+  description: |
+    Environment for the stack, where multiple environment files are provided this will be the merged result.
+  in: body
+  required: false
+  type: object
 environment:
   description: |
     A JSON environment for the stack.
@@ -710,7 +738,7 @@ files:
     value provides the contents of the file. The following code shows
     the general structure of this parameter.
 
-    .. code-block:: json
+    .. code-block:: none
 
        { ...
            "files": {
@@ -727,7 +755,7 @@ files:
     map with the path to the file as the name and the file contents as
     the value. So, a simple example looks like this:
 
-    .. code-block:: json
+    .. code-block:: none
 
        {
           "files": {
@@ -759,6 +787,12 @@ files:
   in: body
   required: false
   type: object
+files_container:
+  description: |
+    Name of the container in swift that has child templates and environment files.
+  in: body
+  required: false
+  type: string
 function_description:
   description: |
     The textual description about the usage of the template function.
@@ -921,7 +955,7 @@ ParameterGroups:
   type: array
 Parameters:
   description: |
-    Key and value pairs that contain CFN template parameters.
+    Parameter schema in CFN format.
   in: body
   required: true
   type: object
@@ -936,7 +970,7 @@ parameters:
     In the example, ``a`` and ``b`` would be the names of two
     parameters defined in the template.
 
-    .. code-block:: json
+    .. code-block:: none
 
        { ...
            "parameters": {
@@ -975,7 +1009,7 @@ parameters:
     map with the path to the file as the name and the file contents as
     the value. So, a simple example looks like this:
 
-    .. code-block:: json
+    .. code-block:: none
 
        {
           "files": {
@@ -1335,7 +1369,7 @@ stack_name:
     A name for the stack. The value must be unique within a project.
     The name must start with an ASCII letter and can contain ASCII letters,
     digits, underscores, periods, and hyphens. Specifically, the name must
-    match the ``^[a-zA-Z][a-zA-Z0-9_.-]*$`` regular expression.
+    match the ``^[a-zA-Z][a-zA-Z0-9_.-]{0,254}$`` regular expression.
 
     When you delete or abandon a stack, its name will not become available
     for reuse until the deletion completes successfully.
@@ -1347,7 +1381,7 @@ stack_name_request:
     A name for the stack. The value must be unique within a project.
     The name must start with an ASCII letter and can contain ASCII letters,
     digits, underscores, periods, and hyphens. Specifically, the name must
-    match the ``^[a-zA-Z][a-zA-Z0-9_.-]*$`` regular expression.
+    match the ``^[a-zA-Z][a-zA-Z0-9_.-]{0,254}$`` regular expression.
 
     When you delete or abandon a stack, its name will not become available
     for reuse until the deletion completes successfully.
@@ -1402,7 +1436,7 @@ stack_tags:
     The stack tags.
   in: body
   required: true
-  type: string
+  type: array
 stack_template:
   description: |
     The template used to create the stack.
@@ -1456,7 +1490,7 @@ template:
     The content of the string is a JSON- or YAML-formatted Orchestration
     template. For example:
 
-    .. code-block:: json
+    .. code-block:: none
 
        "template": {
            "heat_template_version": "2013-05-23",
@@ -1476,7 +1510,7 @@ template_description:
   required: true
   type: string
 template_functions:
-  descriptions: |
+  description: |
     A list of template function descriptors.
   in: body
   required: true

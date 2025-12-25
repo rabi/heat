@@ -19,7 +19,8 @@ set -ex
 HEAT_PRIVATE_SUBNET_CIDR=10.0.5.0/24
 
 # create a heat specific private network (default 'private' network has ipv6 subnet)
-source $DEST/devstack/openrc demo demo
-openstack network create heat-net
-neutron subnet-create --name heat-subnet heat-net $HEAT_PRIVATE_SUBNET_CIDR
-openstack router add subnet router1 heat-subnet
+source $TOP_DIR/openrc demo demo
+
+openstack network show heat-net || openstack network create heat-net
+subnet_id=$((openstack subnet show heat-subnet || openstack subnet create heat-subnet --network heat-net --subnet-range $HEAT_PRIVATE_SUBNET_CIDR) | grep " id " | awk '{print $4}')
+openstack router show router1 -c interfaces_info | grep -q $subnet_id || openstack router add subnet router1 $subnet_id

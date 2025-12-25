@@ -11,6 +11,8 @@
       License for the specific language governing permissions and limitations
       under the License.
 
+:tocdepth: 2
+
 Contributed Heat Resource Types
 ===============================
 
@@ -19,34 +21,14 @@ Contributed Heat Resource Types
 .. contribrespages:: OS::
 
 
-Rackspace Cloud Resource Types
-------------------------------
-
-.. rubric:: These resources are not enabled by default.
-
-The resources in this module are for using Heat with the Rackspace
-Cloud. These resources either allow using Rackspace services that don't
-have equivalent services in OpenStack or account for differences between
-a generic OpenStack deployment and the Rackspace Cloud.
-
-Rackspace resources depend on the dev branch of
-`pyrax <https://github.com/rackspace/pyrax/tree/dev>`_ to work
-properly. More information about them can be found in the
-`RACKSPACE_README
-<https://git.openstack.org/cgit/openstack/heat/tree/contrib/rackspace/README.md>`_.
-
-
-.. contribrespages:: Rackspace::
-
-
 DockerInc Resource
 ------------------
 
 .. rubric:: This resource is not enabled by default.
 
 This plugin enables the use of  Docker containers in a Heat template and
-requires the `docker-py <https://pypi.python.org/pypi/docker-py>`_
+requires the `docker-py <https://pypi.org/project/docker-py>`_
 package. You can find more information in the `DOCKER_README
-<https://git.openstack.org/cgit/openstack/heat/tree/contrib/heat_docker/README.md>`_.
+<https://opendev.org/openstack/heat/src/branch/master/contrib/heat_docker/README.md>`_.
 
 .. contribrespages:: DockerInc::

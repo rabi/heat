@@ -22,30 +22,32 @@ from heat.engine import support
 class KeystoneRoleAssignmentMixin(object):
     """Implements role assignments between user/groups and project/domain.
 
-    heat_template_version: 2013-05-23
+    For example::
 
-    parameters:
-      ... Group or User parameters
-      group_role:
-        type: string
-        description: role
-      group_role_domain:
-        type: string
-        description: group role domain
-      group_role_project:
-        type: string
-        description: group role project
+        heat_template_version: 2013-05-23
 
-    resources:
-      admin_group:
-        type: OS::Keystone::Group OR OS::Keystone::User
-        properties:
-          ... Group or User properties
-          roles:
-            - role: {get_param: group_role}
-              domain: {get_param: group_role_domain}
-            - role: {get_param: group_role}
-              project: {get_param: group_role_project}
+        parameters:
+          ... Group or User parameters
+          group_role:
+            type: string
+            description: role
+          group_role_domain:
+            type: string
+            description: group role domain
+          group_role_project:
+            type: string
+            description: group role project
+
+        resources:
+          admin_group:
+            type: OS::Keystone::Group OR OS::Keystone::User
+            properties:
+              ... Group or User properties
+              roles:
+                - role: {get_param: group_role}
+                  domain: {get_param: group_role_domain}
+                - role: {get_param: group_role}
+                  project: {get_param: group_role_project}
     """
 
     PROPERTIES = (
@@ -123,35 +125,39 @@ class KeystoneRoleAssignmentMixin(object):
                     user=user_id
                 )
 
-    def _remove_role_assignments_from_group(self, group_id, role_assignments):
+    def _remove_role_assignments_from_group(self, group_id, role_assignments,
+                                            current_assignments):
         for role_assignment in self._normalize_to_id(role_assignments):
-            if role_assignment.get(self.PROJECT) is not None:
-                self.client().roles.revoke(
-                    role=role_assignment.get(self.ROLE),
-                    project=role_assignment.get(self.PROJECT),
-                    group=group_id
-                )
-            elif role_assignment.get(self.DOMAIN) is not None:
-                self.client().roles.revoke(
-                    role=role_assignment.get(self.ROLE),
-                    domain=role_assignment.get(self.DOMAIN),
-                    group=group_id
-                )
+            if role_assignment in current_assignments:
+                if role_assignment.get(self.PROJECT) is not None:
+                    self.client().roles.revoke(
+                        role=role_assignment.get(self.ROLE),
+                        project=role_assignment.get(self.PROJECT),
+                        group=group_id
+                    )
+                elif role_assignment.get(self.DOMAIN) is not None:
+                    self.client().roles.revoke(
+                        role=role_assignment.get(self.ROLE),
+                        domain=role_assignment.get(self.DOMAIN),
+                        group=group_id
+                    )
 
-    def _remove_role_assignments_from_user(self, user_id, role_assignments):
+    def _remove_role_assignments_from_user(self, user_id, role_assignments,
+                                           current_assignments):
         for role_assignment in self._normalize_to_id(role_assignments):
-            if role_assignment.get(self.PROJECT) is not None:
-                self.client().roles.revoke(
-                    role=role_assignment.get(self.ROLE),
-                    project=role_assignment.get(self.PROJECT),
-                    user=user_id
-                )
-            elif role_assignment.get(self.DOMAIN) is not None:
-                self.client().roles.revoke(
-                    role=role_assignment.get(self.ROLE),
-                    domain=role_assignment.get(self.DOMAIN),
-                    user=user_id
-                )
+            if role_assignment in current_assignments:
+                if role_assignment.get(self.PROJECT) is not None:
+                    self.client().roles.revoke(
+                        role=role_assignment.get(self.ROLE),
+                        project=role_assignment.get(self.PROJECT),
+                        user=user_id
+                    )
+                elif role_assignment.get(self.DOMAIN) is not None:
+                    self.client().roles.revoke(
+                        role=role_assignment.get(self.ROLE),
+                        domain=role_assignment.get(self.DOMAIN),
+                        user=user_id
+                    )
 
     def _normalize_to_id(self, role_assignment_prps):
         role_assignments = []
@@ -272,26 +278,33 @@ class KeystoneRoleAssignmentMixin(object):
                         new_role_assignments)
 
             if len(removed_role_assignments) > 0:
+                current_assignments = self.parse_list_assignments(
+                    user_id=user_id, group_id=group_id)
                 if user_id is not None:
                     self._remove_role_assignments_from_user(
                         user_id,
-                        removed_role_assignments)
+                        removed_role_assignments,
+                        current_assignments)
                 elif group_id is not None:
                     self._remove_role_assignments_from_group(
                         group_id,
-                        removed_role_assignments)
+                        removed_role_assignments,
+                        current_assignments)
 
     def delete_assignment(self, user_id=None, group_id=None):
-        self._stored_properties_data
         if self.properties[self.ROLES] is not None:
+            current_assignments = self.parse_list_assignments(
+                user_id=user_id, group_id=group_id)
             if user_id is not None:
                 self._remove_role_assignments_from_user(
                     user_id,
-                    (self.properties[self.ROLES]))
+                    (self.properties[self.ROLES]),
+                    current_assignments)
             elif group_id is not None:
                 self._remove_role_assignments_from_group(
                     group_id,
-                    (self.properties[self.ROLES]))
+                    (self.properties[self.ROLES]),
+                    current_assignments)
 
     def validate_assignment_properties(self):
         if self.properties.get(self.ROLES) is not None:
@@ -307,6 +320,30 @@ class KeystoneRoleAssignmentMixin(object):
                     msg = _('Either project or domain must be specified for'
                             ' role %s') % role_assignment.get(self.ROLE)
                     raise exception.StackValidationFailed(message=msg)
+
+    def parse_list_assignments(self, user_id=None, group_id=None):
+        """Method used for get_live_state implementation in other resources."""
+        assignments = []
+        roles = []
+        if user_id is not None:
+            assignments = self.client().role_assignments.list(user=user_id)
+        elif group_id is not None:
+            assignments = self.client().role_assignments.list(group=group_id)
+        for assignment in assignments:
+            values = assignment.to_dict()
+            if not values.get('role') or not values.get('role').get('id'):
+                continue
+            role = {
+                self.ROLE: values['role']['id'],
+                self.DOMAIN: (values.get('scope') and
+                              values['scope'].get('domain') and
+                              values['scope'].get('domain').get('id')),
+                self.PROJECT: (values.get('scope') and
+                               values['scope'].get('project') and
+                               values['scope'].get('project').get('id')),
+            }
+            roles.append(role)
+        return roles
 
 
 class KeystoneUserRoleAssignment(resource.Resource,
@@ -341,9 +378,6 @@ class KeystoneUserRoleAssignment(resource.Resource,
     properties_schema.update(
         KeystoneRoleAssignmentMixin.mixin_properties_schema)
 
-    def __init__(self, *args, **kwargs):
-        super(KeystoneUserRoleAssignment, self).__init__(*args, **kwargs)
-
     def client(self):
         return super(KeystoneUserRoleAssignment, self).client().client
 
@@ -363,7 +397,8 @@ class KeystoneUserRoleAssignment(resource.Resource,
         self.update_assignment(user_id=self.user_id, prop_diff=prop_diff)
 
     def handle_delete(self):
-        self.delete_assignment(user_id=self.user_id)
+        with self.client_plugin().ignore_not_found:
+            self.delete_assignment(user_id=self.user_id)
 
     def validate(self):
         super(KeystoneUserRoleAssignment, self).validate()
@@ -402,9 +437,6 @@ class KeystoneGroupRoleAssignment(resource.Resource,
     properties_schema.update(
         KeystoneRoleAssignmentMixin.mixin_properties_schema)
 
-    def __init__(self, *args, **kwargs):
-        super(KeystoneGroupRoleAssignment, self).__init__(*args, **kwargs)
-
     def client(self):
         return super(KeystoneGroupRoleAssignment, self).client().client
 
@@ -424,7 +456,8 @@ class KeystoneGroupRoleAssignment(resource.Resource,
         self.update_assignment(group_id=self.group_id, prop_diff=prop_diff)
 
     def handle_delete(self):
-        self.delete_assignment(group_id=self.group_id)
+        with self.client_plugin().ignore_not_found:
+            self.delete_assignment(group_id=self.group_id)
 
     def validate(self):
         super(KeystoneGroupRoleAssignment, self).validate()

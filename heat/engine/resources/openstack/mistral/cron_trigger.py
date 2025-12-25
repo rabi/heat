@@ -15,7 +15,6 @@ from oslo_log import log as logging
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -73,7 +72,7 @@ class CronTrigger(resource.Resource):
             schema={
                 WORKFLOW_NAME: properties.Schema(
                     properties.Schema.STRING,
-                    _('Name of the workflow.'),
+                    _('Name or ID of the workflow.'),
                     required=True,
                     constraints=[
                         constraints.CustomConstraint('mistral.workflow')
@@ -122,19 +121,23 @@ class CronTrigger(resource.Resource):
 
     def handle_create(self):
         workflow = self.properties.get(self.WORKFLOW)
+        name = self._cron_trigger_name()
+        identifier = workflow[self.WORKFLOW_NAME]
+
         args = {
-            'name': self._cron_trigger_name(),
             'pattern': self.properties.get(self.PATTERN),
-            'workflow_name': workflow.get(self.WORKFLOW_NAME),
             'workflow_input': workflow.get(self.WORKFLOW_INPUT),
             'first_time': self.properties.get(self.FIRST_TIME),
             'count': self.properties.get(self.COUNT)
         }
 
-        cron_trigger = self.client().cron_triggers.create(**args)
+        cron_trigger = self.client().cron_triggers.create(name, identifier,
+                                                          **args)
         self.resource_id_set(cron_trigger.name)
 
     def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
         trigger = self.client().cron_triggers.get(self.resource_id)
         if name == self.NEXT_EXECUTION_TIME:
             return trigger.next_execution_time
@@ -150,9 +153,9 @@ class CronTrigger(resource.Resource):
         # changed after
         # https://blueprints.launchpad.net/mistral/+spec/mistral-cron-trigger-life-cycle
         # will be merged.
-        LOG.warning(_LW("get_live_state isn't implemented for this type of "
-                        "resource due to specific behaviour of cron trigger "
-                        "in mistral."))
+        LOG.warning("get_live_state isn't implemented for this type of "
+                    "resource due to specific behaviour of cron trigger "
+                    "in mistral.")
         return {}
 
 

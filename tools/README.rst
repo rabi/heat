@@ -1,7 +1,7 @@
 Files in this directory are general developer tools or examples of how
 to do certain activities.
 
-If you're running on Fedora, see the instructions at http://docs.openstack.org/developer/heat/getting_started/on_fedora.html
+If you're running on Fedora, see the instructions at https://docs.openstack.org/heat/latest/getting_started/on_fedora.html
 
 Tools
 =====
@@ -17,11 +17,22 @@ cfn-json2yaml
 Package lists
 =============
 
-Lists of Linux packages to install in order to successfully run heat's
-unit test suit on a clean new Linux distribution.
+To test that every Linux package is installed that is necessary to
+successfully run heat's unit test suit on a clean new Linux distribution
+run ``tox -e bindep``. This will report missing dependencies (based on
+bindep.txt in heat repository).
 
-test-requires-deb
-  list of DEB packages as of Ubuntu 14.04 Trusty
+Review dashboards
+=================
 
-test-requires-rpm
-  list of RPM packages as of Fedora 20
+Generate gerrit review URL for heat. This can pop up some patches
+that might requires reviews. You can generate it with following
+command under `gerrit-dash-creator` repo
+( https://opendev.org/openstack/gerrit-dash-creator )
+
+    $ ./gerrit-dash-creator heat.dash
+
+The sample of heat.dash can be found under ./dashboards/
+
+Get the output URL and add it to your gerrit menu
+(at ``https://review.opendev.org/#/settings/preferences``).

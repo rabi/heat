@@ -27,7 +27,8 @@ class InstanceGroupTest(functional_base.FunctionalTestsBase):
   "Parameters" : {"size": {"Type": "String", "Default": "1"},
                   "AZ": {"Type": "String", "Default": "nova"},
                   "image": {"Type": "String"},
-                  "flavor": {"Type": "String"}},
+                  "flavor": {"Type": "String"},
+                  "user_data": {"Type": "String", "Default": "jsconfig data"}},
   "Resources": {
     "JobServerGroup": {
       "Type": "OS::Heat::InstanceGroup",
@@ -45,7 +46,7 @@ class InstanceGroupTest(functional_base.FunctionalTestsBase):
         "ImageId"           : {"Ref": "image"},
         "InstanceType"      : {"Ref": "flavor"},
         "SecurityGroups"    : [ "sg-1" ],
-        "UserData"          : "jsconfig data"
+        "UserData"          : {"Ref": "user_data"}
       }
     }
   },
@@ -69,12 +70,10 @@ parameters:
 
 resources:
   random1:
-    type: OS::Heat::RandomString
-    properties:
-      salt: {get_param: ImageId}
+    type: OS::Heat::TestResource
 outputs:
   PublicIp:
-    value: {get_attr: [random1, value]}
+    value: {get_attr: [random1, output]}
 '''
 
     # This is designed to fail.
@@ -89,24 +88,16 @@ parameters:
 
 resources:
   random1:
-    type: OS::Heat::RandomString
-    depends_on: waiter
-  ready_poster:
-    type: AWS::CloudFormation::WaitConditionHandle
-  waiter:
-    type: AWS::CloudFormation::WaitCondition
+    type: OS::Heat::TestResource
     properties:
-      Handle: {Ref: ready_poster}
-      Timeout: 1
+      fail: true
 outputs:
   PublicIp:
-    value: {get_attr: [random1, value]}
+    value: {get_attr: [random1, output]}
 '''
 
     def setUp(self):
         super(InstanceGroupTest, self).setUp()
-        if not self.conf.image_ref:
-            raise self.skipException("No image configured to test")
         if not self.conf.minimal_image_ref:
             raise self.skipException("No minimal image configured to test")
         if not self.conf.instance_type:
@@ -141,7 +132,7 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         files = {'provider.yaml': self.instance_template}
         env = {'resource_registry': {'AWS::EC2::Instance': 'provider.yaml'},
                'parameters': {'size': 4,
-                              'image': self.conf.image_ref,
+                              'image': self.conf.minimal_image_ref,
                               'flavor': self.conf.instance_type}}
         stack_identifier = self.stack_create(template=self.template,
                                              files=files, environment=env)
@@ -158,7 +149,7 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         files = {'provider.yaml': self.instance_template}
         env = {'resource_registry': {'AWS::EC2::Instance': 'provider.yaml'},
                'parameters': {'size': 2,
-                              'image': self.conf.image_ref,
+                              'image': self.conf.minimal_image_ref,
                               'flavor': self.conf.instance_type}}
 
         stack_identifier = self.stack_create(template=self.template,
@@ -170,7 +161,7 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         # Increase min size to 5
         env2 = {'resource_registry': {'AWS::EC2::Instance': 'provider.yaml'},
                 'parameters': {'size': 5,
-                               'image': self.conf.image_ref,
+                               'image': self.conf.minimal_image_ref,
                                'flavor': self.conf.instance_type}}
         self.update_stack(stack_identifier, self.template,
                           environment=env2, files=files)
@@ -187,7 +178,7 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         env = {'resource_registry':
                {'AWS::EC2::Instance': 'provider.yaml'},
                'parameters': {'size': 1,
-                              'image': self.conf.image_ref,
+                              'image': self.conf.minimal_image_ref,
                               'flavor': self.conf.instance_type}}
 
         stack_identifier = self.stack_create(template=self.template,
@@ -200,8 +191,9 @@ class InstanceGroupBasicTest(InstanceGroupTest):
                 {'AWS::EC2::Instance': 'provider.yaml'},
                 'parameters': {'size': '2',
                                'AZ': 'wibble',
-                               'image': self.conf.image_ref,
-                               'flavor': self.conf.instance_type}}
+                               'image': self.conf.minimal_image_ref,
+                               'flavor': self.conf.instance_type,
+                               'user_data': 'new data'}}
         self.update_stack(stack_identifier, self.template,
                           environment=env2, files=files)
 
@@ -219,7 +211,7 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         files = {'provider.yaml': self.bad_instance_template}
         env = {'resource_registry': {'AWS::EC2::Instance': 'provider.yaml'},
                'parameters': {'size': 2,
-                              'image': self.conf.image_ref,
+                              'image': self.conf.minimal_image_ref,
                               'flavor': self.conf.instance_type}}
 
         self.client.stacks.create(
@@ -242,7 +234,16 @@ class InstanceGroupBasicTest(InstanceGroupTest):
 
         nested_ident = self.assert_resource_is_a_stack(stack_identifier,
                                                        'JobServerGroup')
-        self._assert_instance_state(nested_ident, 0, 2)
+        # Check at least one resource is in *_FAILED as there is a
+        # chance that before other leaf resources are processed, stack
+        # is marked as failed and traversal is set to empty string,
+        # so that all other workers processing resources bail out
+        # and the traversal gets cancelled.
+        for res in self.client.resources.list(nested_ident):
+            if res.resource_status.endswith('CREATE_FAILED'):
+                break
+        else:
+            self.fail('No resource in CREATE_FAILED')
 
     def test_update_instance_error_causes_group_error(self):
         """Test update failing a resource in the instance group.
@@ -254,7 +255,7 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         files = {'provider.yaml': self.instance_template}
         env = {'resource_registry': {'AWS::EC2::Instance': 'provider.yaml'},
                'parameters': {'size': 2,
-                              'image': self.conf.image_ref,
+                              'image': self.conf.minimal_image_ref,
                               'flavor': self.conf.instance_type}}
 
         stack_identifier = self.stack_create(template=self.template,
@@ -271,8 +272,6 @@ class InstanceGroupBasicTest(InstanceGroupTest):
         nested_ident = self.assert_resource_is_a_stack(stack_identifier,
                                                        'JobServerGroup')
         self._assert_instance_state(nested_ident, 2, 0)
-        initial_list = [res.resource_name
-                        for res in self.client.resources.list(nested_ident)]
 
         env['parameters']['size'] = 3
         files2 = {'provider.yaml': self.bad_instance_template}
@@ -285,20 +284,18 @@ class InstanceGroupBasicTest(InstanceGroupTest):
             environment=env
         )
         self._wait_for_stack_status(stack_identifier, 'UPDATE_FAILED')
-
         nested_ident = self.assert_resource_is_a_stack(stack_identifier,
                                                        'JobServerGroup')
-        # assert that there are 3 bad instances
-        # 2 resources should be in update failed, and one create failed.
+        # Check at least one resource is in *_FAILED as there is a
+        # chance that before other leaf resources are processed, stack
+        # is marked as failed and traversal is set to empty string,
+        # so that all other workers processing resources bail out
+        # and the traversal gets cancelled.
         for res in self.client.resources.list(nested_ident):
-            if res.resource_name in initial_list:
-                self._wait_for_resource_status(nested_ident,
-                                               res.resource_name,
-                                               'UPDATE_FAILED')
-            else:
-                self._wait_for_resource_status(nested_ident,
-                                               res.resource_name,
-                                               'CREATE_FAILED')
+            if res.resource_status.endswith('_FAILED'):
+                break
+        else:
+            self.fail('No resource in *_FAILED')
 
 
 class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
@@ -323,8 +320,8 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         size = 5
         env = {'resource_registry': {'AWS::EC2::Instance': 'provider.yaml'},
                'parameters': {'size': size,
-                              'image': self.conf.image_ref,
-                              'flavor': self.conf.instance_type}}
+                              'image': self.conf.minimal_image_ref,
+                              'flavor': self.conf.minimal_instance_type}}
         stack_name = self._stack_rand_name()
         stack_identifier = self.stack_create(
             stack_name=stack_name,
@@ -394,7 +391,7 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         policy['MinInstancesInService'] = '1'
         policy['MaxBatchSize'] = '3'
         config = updt_template['Resources']['JobServerConfig']
-        config['Properties']['ImageId'] = self.conf.minimal_image_ref
+        config['Properties']['UserData'] = 'new data'
 
         self.update_instance_group(updt_template,
                                    num_updates_expected_on_updt=5,
@@ -414,7 +411,7 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         policy['MinInstancesInService'] = '4'
         policy['MaxBatchSize'] = '4'
         config = updt_template['Resources']['JobServerConfig']
-        config['Properties']['ImageId'] = self.conf.minimal_image_ref
+        config['Properties']['UserData'] = 'new data'
 
         self.update_instance_group(updt_template,
                                    num_updates_expected_on_updt=2,
@@ -430,7 +427,7 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         policy['MinInstancesInService'] = '0'
         policy['MaxBatchSize'] = '20'
         config = updt_template['Resources']['JobServerConfig']
-        config['Properties']['ImageId'] = self.conf.minimal_image_ref
+        config['Properties']['UserData'] = 'new data'
 
         self.update_instance_group(updt_template,
                                    num_updates_expected_on_updt=5,
@@ -447,7 +444,7 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         policy['MaxBatchSize'] = '2'
         policy['PauseTime'] = 'PT0S'
         config = updt_template['Resources']['JobServerConfig']
-        config['Properties']['ImageId'] = self.conf.minimal_image_ref
+        config['Properties']['UserData'] = 'new data'
 
         self.update_instance_group(updt_template,
                                    num_updates_expected_on_updt=3,
@@ -469,7 +466,7 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         policy['MaxBatchSize'] = '3'
         policy['PauseTime'] = 'PT0S'
         config = updt_template['Resources']['JobServerConfig']
-        config['Properties']['InstanceType'] = 'm1.tiny'
+        config['Properties']['InstanceType'] = self.conf.instance_type
 
         self.update_instance_group(updt_template,
                                    num_updates_expected_on_updt=5,
@@ -491,7 +488,7 @@ class InstanceGroupUpdatePolicyTest(InstanceGroupTest):
         policy['MaxBatchSize'] = '4'
         policy['PauseTime'] = 'PT0S'
         config = updt_template['Resources']['JobServerConfig']
-        config['Properties']['InstanceType'] = 'm1.tiny'
+        config['Properties']['InstanceType'] = self.conf.instance_type
 
         self.update_instance_group(updt_template,
                                    num_updates_expected_on_updt=2,

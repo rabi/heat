@@ -60,6 +60,8 @@ class TableFromText(Table):
         table += tgroup
 
         col_widths = self.get_column_widths(max_cols)
+        if isinstance(col_widths, tuple):
+            col_widths = col_widths[1]
         tgroup.extend(nodes.colspec(colwidth=col_width) for
                       col_width in col_widths)
 

@@ -14,10 +14,8 @@
 import collections
 import json
 import os
+from unittest import mock
 import uuid
-
-import mock
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -34,6 +32,7 @@ from heat.engine import rsrc_defn
 from heat.engine import stack as parser
 from heat.engine import support
 from heat.engine import template
+from heat.objects import stack as stack_object
 from heat.tests import common
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
@@ -271,9 +270,14 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                   "DummyResource2")
         temp_res = template_resource.TemplateResource('test_t_res',
                                                       definition, stack)
-        nested = mock.Mock()
-        nested.outputs = {'Blarg': {'Value': 'fluffy'}}
-        temp_res._nested = nested
+        temp_res.resource_id = 'dummy_id'
+        temp_res.nested_identifier = mock.Mock()
+        temp_res.nested_identifier.return_value = {'foo': 'bar'}
+
+        temp_res._rpc_client = mock.MagicMock()
+        output = {'outputs': [{'output_key': 'Blarg',
+                               'output_value': 'fluffy'}]}
+        temp_res._rpc_client.show_stack.return_value = [output]
         self.assertRaises(exception.InvalidTemplateAttribute,
                           temp_res.FnGetAtt, 'Foo')
 
@@ -305,13 +309,17 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                   "DummyResource")
         temp_res = template_resource.TemplateResource('test_t_res',
                                                       definition, stack)
+        temp_res.resource_id = 'dummy_id'
+        temp_res.nested_identifier = mock.Mock()
+        temp_res.nested_identifier.return_value = {'foo': 'bar'}
+
+        temp_res._rpc_client = mock.MagicMock()
+        output = {'outputs': [{'output_key': 'Foo', 'output_value': None,
+                               'output_error': 'it is all bad'}]}
+        temp_res._rpc_client.show_stack.return_value = [output]
+        temp_res._rpc_client.list_stack_resources.return_value = []
         self.assertIsNone(temp_res.validate())
-        nested = mock.Mock()
-        nested.outputs = {'Foo': {'Value': 'not-this',
-                                  'error_msg': 'it is all bad'}}
-        nested.output.return_value = None
-        temp_res._nested = nested
-        self.assertRaises(exception.InvalidTemplateAttribute,
+        self.assertRaises(exception.TemplateOutputError,
                           temp_res.FnGetAtt, 'Foo')
 
     def test_properties_normal(self):
@@ -432,7 +440,7 @@ class ProviderTemplateTest(common.HeatTestCase):
                                temp_res.validate)
         self.assertEqual("Property Foo type mismatch between facade "
                          "DummyResource (Map) and provider (String)",
-                         six.text_type(ex))
+                         str(ex))
 
     def test_properties_list_with_none(self):
         provider = {
@@ -571,7 +579,7 @@ class ProviderTemplateTest(common.HeatTestCase):
         temp_res = template_resource.TemplateResource('test_t_res',
                                                       definition, stack)
         self.assertEqual('test_resource.template',
-                         temp_res.template_name)
+                         temp_res.template_url)
 
     def test_resource_info_special(self):
         provider = {
@@ -606,7 +614,7 @@ class ProviderTemplateTest(common.HeatTestCase):
         temp_res = template_resource.TemplateResource('foo',
                                                       definition, stack)
         self.assertEqual('foo.template',
-                         temp_res.template_name)
+                         temp_res.template_url)
 
     def test_get_error_for_invalid_template_name(self):
         # assertion: if the name matches {.yaml|.template} and is valid
@@ -617,7 +625,7 @@ class ProviderTemplateTest(common.HeatTestCase):
         ex = self.assertRaises(exception.NotFound, env.get_class,
                                'OS::ResourceType', 'fred')
         self.assertIn('Could not fetch remote template "some_magic.yaml"',
-                      six.text_type(ex))
+                      str(ex))
 
     def test_metadata_update_called(self):
         provider = {
@@ -658,11 +666,7 @@ class ProviderTemplateTest(common.HeatTestCase):
         minimal_temp = json.dumps({'HeatTemplateFormatVersion': '2012-12-12',
                                    'Parameters': {},
                                    'Resources': {}})
-        self.m.StubOutWithMock(urlfetch, "get")
-        urlfetch.get(test_templ_name,
-                     allowed_schemes=('file',)).AndReturn(minimal_temp)
-        self.m.ReplayAll()
-
+        mock_get = self.patchobject(urlfetch, "get", return_value=minimal_temp)
         env_str = {'resource_registry': {'resources': {'fred': {
             "OS::ResourceType": test_templ_name}}}}
         global_env = environment.Environment({}, user_env=False)
@@ -675,7 +679,8 @@ class ProviderTemplateTest(common.HeatTestCase):
         self.assertTrue(issubclass(cls, template_resource.TemplateResource))
         self.assertTrue(hasattr(cls, "properties_schema"))
         self.assertTrue(hasattr(cls, "attributes_schema"))
-        self.m.VerifyAll()
+        mock_get.assert_called_once_with(test_templ_name,
+                                         allowed_schemes=('file',))
 
     def test_template_as_resource(self):
         """Test that resulting resource has the right prop and attrib schema.
@@ -693,12 +698,8 @@ class ProviderTemplateTest(common.HeatTestCase):
         with open(path) as test_templ_file:
             test_templ = test_templ_file.read()
         self.assertTrue(test_templ, "Empty test template")
-        self.m.StubOutWithMock(urlfetch, "get")
-        urlfetch.get(test_templ_name,
-                     allowed_schemes=('http', 'https')).AndReturn(test_templ)
+        mock_get = self.patchobject(urlfetch, "get", return_value=test_templ)
         parsed_test_templ = template_format.parse(test_templ)
-        self.m.ReplayAll()
-
         stack = parser.Stack(utils.dummy_context(), 'test_stack',
                              template.Template(empty_template),
                              stack_id=str(uuid.uuid4()))
@@ -716,7 +717,6 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                   properties)
         templ_resource = resource.Resource("test_templ_resource", definition,
                                            stack)
-        self.m.VerifyAll()
         self.assertIsInstance(templ_resource,
                               template_resource.TemplateResource)
         for prop in parsed_test_templ.get("Parameters", {}):
@@ -731,12 +731,14 @@ class ProviderTemplateTest(common.HeatTestCase):
             stack.env.user_env_as_dict()["resource_registry"])
         self.assertNotIn('WordPress_Single_Instance.yaml',
                          resources.global_env().registry._registry)
+        mock_get.assert_called_once_with(test_templ_name,
+                                         allowed_schemes=('http', 'https'))
 
     def test_persisted_unregistered_provider_templates(self):
         """Test that templates are registered correctly.
 
         Test that templates persisted in the database prior to
-        https://review.openstack.org/#/c/79953/1 are registered correctly.
+        https://review.opendev.org/#/c/79953/1 are registered correctly.
         """
         env = {'resource_registry': {'http://example.com/test.template': None,
                                      'resources': {}}}
@@ -758,11 +760,7 @@ class ProviderTemplateTest(common.HeatTestCase):
         minimal_temp = json.dumps({'HeatTemplateFormatVersion': '2012-12-12',
                                    'Parameters': {},
                                    'Resources': {}})
-        self.m.StubOutWithMock(urlfetch, "get")
-        urlfetch.get(test_templ_name,
-                     allowed_schemes=('http', 'https',
-                                      'file')).AndReturn(minimal_temp)
-        self.m.ReplayAll()
+        mock_get = self.patchobject(urlfetch, "get", return_value=minimal_temp)
 
         definition = rsrc_defn.ResourceDefinition('test_t_res',
                                                   'Test::Frodo')
@@ -770,7 +768,9 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                       definition,
                                                       stack)
         self.assertIsNone(temp_res.validate())
-        self.m.VerifyAll()
+        mock_get.assert_called_once_with(test_templ_name,
+                                         allowed_schemes=('http', 'https',
+                                                          'file',))
 
     def test_user_template_not_retrieved_by_file(self):
         # make sure that a TemplateResource defined in the user environment
@@ -805,13 +805,9 @@ class ProviderTemplateTest(common.HeatTestCase):
                              template.Template(empty_template),
                              stack_id=str(uuid.uuid4()))
 
-        self.m.StubOutWithMock(urlfetch, "get")
-        urlfetch.get(test_templ_name,
-                     allowed_schemes=('http', 'https',
-                                      'file')
-                     ).AndRaise(urlfetch.URLFetchError(
-                         _('Failed to retrieve template')))
-        self.m.ReplayAll()
+        mock_get = self.patchobject(urlfetch, "get",
+                                    side_effect=urlfetch.URLFetchError(
+                                        _('Failed to retrieve template')))
 
         definition = rsrc_defn.ResourceDefinition('test_t_res',
                                                   'Test::Frodo')
@@ -819,7 +815,9 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                       definition,
                                                       stack)
         self.assertRaises(exception.StackValidationFailed, temp_res.validate)
-        self.m.VerifyAll()
+        mock_get.assert_called_once_with(test_templ_name,
+                                         allowed_schemes=('http', 'https',
+                                                          'file',))
 
     def test_user_template_retrieve_fail(self):
         # make sure that a TemplateResource defined in the user environment
@@ -835,12 +833,9 @@ class ProviderTemplateTest(common.HeatTestCase):
                              template.Template(empty_template, env=env),
                              stack_id=str(uuid.uuid4()))
 
-        self.m.StubOutWithMock(urlfetch, "get")
-        urlfetch.get(test_templ_name,
-                     allowed_schemes=('http', 'https')
-                     ).AndRaise(urlfetch.URLFetchError(
-                         _('Failed to retrieve template')))
-        self.m.ReplayAll()
+        mock_get = self.patchobject(urlfetch, "get",
+                                    side_effect=urlfetch.URLFetchError(
+                                        _('Failed to retrieve template')))
 
         definition = rsrc_defn.ResourceDefinition('test_t_res',
                                                   'Test::Flippy')
@@ -848,7 +843,8 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                       definition,
                                                       stack)
         self.assertRaises(exception.StackValidationFailed, temp_res.validate)
-        self.m.VerifyAll()
+        mock_get.assert_called_once_with(test_templ_name,
+                                         allowed_schemes=('http', 'https',))
 
     def test_user_template_retrieve_fail_ext(self):
         # make sure that a TemplateResource defined in the user environment
@@ -864,15 +860,12 @@ class ProviderTemplateTest(common.HeatTestCase):
                              template.Template(empty_template, env=env),
                              stack_id=str(uuid.uuid4()))
 
-        self.m.ReplayAll()
-
         definition = rsrc_defn.ResourceDefinition('test_t_res',
                                                   'Test::Flippy')
         temp_res = template_resource.TemplateResource('test_t_res',
                                                       definition,
                                                       stack)
         self.assertRaises(exception.StackValidationFailed, temp_res.validate)
-        self.m.VerifyAll()
 
     def test_incorrect_template_provided_with_url(self):
         wrong_template = '''
@@ -887,11 +880,8 @@ class ProviderTemplateTest(common.HeatTestCase):
                              template.Template(empty_template, env=env),
                              stack_id=str(uuid.uuid4()))
 
-        self.m.StubOutWithMock(urlfetch, "get")
-        urlfetch.get(test_templ_name,
-                     allowed_schemes=('http', 'https')
-                     ).AndReturn(wrong_template)
-        self.m.ReplayAll()
+        mock_get = self.patchobject(urlfetch, "get",
+                                    return_value=wrong_template)
 
         definition = rsrc_defn.ResourceDefinition('test_t_res',
                                                   'Test::Tmpl')
@@ -900,9 +890,10 @@ class ProviderTemplateTest(common.HeatTestCase):
                                                       stack)
         err = self.assertRaises(exception.StackValidationFailed,
                                 temp_res.validate)
-        self.assertIn('Error parsing template: ', six.text_type(err))
-
-        self.m.VerifyAll()
+        self.assertIn('Error parsing template http://heatr/bad_tmpl.yaml',
+                      str(err))
+        mock_get.assert_called_once_with(test_templ_name,
+                                         allowed_schemes=('http', 'https',))
 
 
 class TemplateDataTest(common.HeatTestCase):
@@ -932,6 +923,7 @@ class TemplateDataTest(common.HeatTestCase):
 
     def test_template_data_in_update_without_template_file(self):
         self.res.action = self.res.UPDATE
+        self.res.resource_id = 'dummy_id'
         self.res.nested = mock.MagicMock()
         self.res.get_template_file = mock.Mock(
             side_effect=exception.NotFound(
@@ -941,12 +933,12 @@ class TemplateDataTest(common.HeatTestCase):
 
     def test_template_data_in_create_without_template_file(self):
         self.res.action = self.res.CREATE
-        self.res.nested = mock.MagicMock()
+        self.res.resource_id = None
         self.res.get_template_file = mock.Mock(
             side_effect=exception.NotFound(
                 msg_fmt='Could not fetch remote template '
                         '"test_resource.template": file not found'))
-        self.assertEqual('{}', self.res.template_data())
+        self.assertRaises(exception.NotFound, self.res.template_data)
 
 
 class TemplateResourceCrudTest(common.HeatTestCase):
@@ -981,6 +973,10 @@ class TemplateResourceCrudTest(common.HeatTestCase):
                                                       self.defn, self.stack)
         self.assertIsNone(self.res.validate())
 
+        self.patchobject(stack_object.Stack, 'get_status',
+                         return_value=('CREATE', 'COMPLETE',
+                                       'Created', 'Sometime'))
+
     def test_handle_create(self):
         self.res.create_with_template = mock.Mock(return_value=None)
 
@@ -1009,11 +1005,11 @@ class TemplateResourceCrudTest(common.HeatTestCase):
     def test_handle_delete(self):
         self.res.rpc_client = mock.MagicMock()
         self.res.id = 55
-        self.res.uuid = six.text_type(uuid.uuid4())
-        self.res.resource_id = six.text_type(uuid.uuid4())
+        self.res.uuid = str(uuid.uuid4())
+        self.res.resource_id = str(uuid.uuid4())
         self.res.action = self.res.CREATE
         self.res.nested = mock.MagicMock()
-        ident = identifier.HeatIdentifier(self.ctx.tenant_id,
+        ident = identifier.HeatIdentifier(self.ctx.project_id,
                                           self.res.physical_resource_name(),
                                           self.res.resource_id)
         self.res.nested().identifier.return_value = ident
@@ -1021,4 +1017,5 @@ class TemplateResourceCrudTest(common.HeatTestCase):
         rpcc = self.res.rpc_client.return_value
         rpcc.delete_stack.assert_called_once_with(
             self.ctx,
-            self.res.nested().identifier())
+            self.res.nested().identifier(),
+            cast=False)

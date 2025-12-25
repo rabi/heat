@@ -11,13 +11,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import abc
 import collections
 import itertools
 
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils import strutils
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -41,10 +41,10 @@ class Schema(constr.Schema):
 
     KEYS = (
         TYPE, DESCRIPTION, DEFAULT, SCHEMA, CONSTRAINTS, HIDDEN,
-        LABEL, IMMUTABLE
+        LABEL, IMMUTABLE, TAGS,
     ) = (
         'Type', 'Description', 'Default', 'Schema', 'Constraints', 'NoEcho',
-        'Label', 'Immutable'
+        'Label', 'Immutable', 'Tags',
     )
 
     PARAMETER_KEYS = PARAMETER_KEYS
@@ -58,7 +58,8 @@ class Schema(constr.Schema):
     )
 
     def __init__(self, data_type, description=None, default=None, schema=None,
-                 constraints=None, hidden=False, label=None, immutable=False):
+                 constraints=None, hidden=False, label=None, immutable=False,
+                 tags=None):
         super(Schema, self).__init__(data_type=data_type,
                                      description=description,
                                      default=default,
@@ -68,6 +69,7 @@ class Schema(constr.Schema):
                                      label=label,
                                      immutable=immutable)
         self.hidden = hidden
+        self.tags = tags
 
     # Schema class validates default value for lists assuming list type. For
     # comma delimited list string supported in parameters Schema class, the
@@ -84,8 +86,7 @@ class Schema(constr.Schema):
                         message=_('Default must be a comma-delimited list '
                                   'string: %s') % err)
             elif self.type == self.LIST and isinstance(self.default, list):
-                default_value = [(six.text_type(x))
-                                 for x in self.default]
+                default_value = [(str(x)) for x in self.default]
             try:
                 self.validate_constraints(default_value, context,
                                           [constr.CustomConstraint])
@@ -128,6 +129,11 @@ class Schema(constr.Schema):
                 message=_("Missing parameter type for parameter: %s") %
                 param_name)
 
+        if not isinstance(schema_dict.get(cls.TAGS, []), list):
+            raise exception.InvalidSchemaError(
+                message=_("Tags property should be a list for parameter: %s") %
+                param_name)
+
     @classmethod
     def from_dict(cls, param_name, schema_dict):
         """Return a Parameter Schema object from a legacy schema dictionary.
@@ -164,9 +170,8 @@ class Schema(constr.Schema):
                                               'false')).lower() == 'true',
                    label=schema_dict.get(LABEL))
 
-    def validate_value(self, value, context=None, template=None):
-        super(Schema, self).validate_constraints(value, context=context,
-                                                 template=template)
+    def validate_value(self, value, context=None):
+        super(Schema, self).validate_constraints(value, context)
 
     def __getitem__(self, key):
         if key == self.TYPE:
@@ -177,7 +182,6 @@ class Schema(constr.Schema):
             return super(Schema, self).__getitem__(key)
 
 
-@six.python_2_unicode_compatible
 class Parameter(object):
     """A template parameter."""
 
@@ -203,7 +207,9 @@ class Parameter(object):
         else:
             raise ValueError(_('Invalid Parameter type "%s"') % schema.type)
 
-        return ParamClass(name, schema, value)
+        return super(Parameter, cls).__new__(ParamClass)
+
+    __slots__ = ('name', 'schema', 'user_value', 'user_default')
 
     def __init__(self, name, schema, value=None):
         """Initialise the parameter.
@@ -216,7 +222,7 @@ class Parameter(object):
         self.user_value = value
         self.user_default = None
 
-    def validate(self, validate_value=True, context=None, template=None):
+    def validate(self, validate_value=True, context=None):
         """Validates the parameter.
 
         This method validates if the parameter's schema is valid,
@@ -232,16 +238,16 @@ class Parameter(object):
                 return
 
             if self.user_value is not None:
-                self._validate(self.user_value, context, template)
+                self._validate(self.user_value, context)
             elif self.has_default():
-                self._validate(self.default(), context, template)
+                self._validate(self.default(), context)
             else:
                 raise exception.UserParameterMissing(key=self.name)
         except exception.StackValidationFailed as ex:
-            msg = err_msg % dict(name=self.name, exp=six.text_type(ex))
+            msg = err_msg % dict(name=self.name, exp=str(ex))
             raise exception.StackValidationFailed(message=msg)
         except exception.InvalidSchemaError as ex:
-            msg = err_msg % dict(name=self.name, exp=six.text_type(ex))
+            msg = err_msg % dict(name=self.name, exp=str(ex))
             raise exception.InvalidSchemaError(message=msg)
 
     def value(self):
@@ -273,6 +279,10 @@ class Parameter(object):
         """Return the label or param name."""
         return self.schema.label or self.name
 
+    def tags(self):
+        """Return the tags associated with the parameter"""
+        return self.schema.tags or []
+
     def has_default(self):
         """Return whether the parameter has a default value."""
         return (self.schema.default is not None or
@@ -287,17 +297,23 @@ class Parameter(object):
     def set_default(self, value):
         self.user_default = value
 
+    @classmethod
+    def _value_as_text(cls, value):
+        return str(value)
+
     def __str__(self):
         """Return a string representation of the parameter."""
         value = self.value()
         if self.hidden():
-            return six.text_type('******')
+            return str('******')
         else:
-            return six.text_type(value)
+            return self._value_as_text(value)
 
 
 class NumberParam(Parameter):
     """A template parameter of type "Number"."""
+
+    __slots__ = tuple()
 
     def __int__(self):
         """Return an integer representation of the parameter."""
@@ -307,12 +323,12 @@ class NumberParam(Parameter):
         """Return a float representation of the parameter."""
         return float(super(NumberParam, self).value())
 
-    def _validate(self, val, context, template=None):
+    def _validate(self, val, context):
         try:
             Schema.str_to_num(val)
-        except ValueError as ex:
-            raise exception.StackValidationFailed(message=six.text_type(ex))
-        self.schema.validate_value(val, context=context, template=template)
+        except (ValueError, TypeError) as ex:
+            raise exception.StackValidationFailed(message=str(ex))
+        self.schema.validate_value(val, context)
 
     def value(self):
         return Schema.str_to_num(super(NumberParam, self).value())
@@ -321,12 +337,14 @@ class NumberParam(Parameter):
 class BooleanParam(Parameter):
     """A template parameter of type "Boolean"."""
 
-    def _validate(self, val, context, template=None):
+    __slots__ = tuple()
+
+    def _validate(self, val, context):
         try:
             strutils.bool_from_string(val, strict=True)
         except ValueError as ex:
-            raise exception.StackValidationFailed(message=six.text_type(ex))
-        self.schema.validate_value(val, context=context, template=template)
+            raise exception.StackValidationFailed(message=str(ex))
+        self.schema.validate_value(val, context)
 
     def value(self):
         if self.user_value is not None:
@@ -339,8 +357,10 @@ class BooleanParam(Parameter):
 class StringParam(Parameter):
     """A template parameter of type "String"."""
 
-    def _validate(self, val, context, template=None):
-        self.schema.validate_value(val, context=context, template=template)
+    __slots__ = tuple()
+
+    def _validate(self, val, context):
+        self.schema.validate_value(val, context=context)
 
     def value(self):
         return self.schema.to_schema_type(super(StringParam, self).value())
@@ -349,38 +369,42 @@ class StringParam(Parameter):
 class ParsedParameter(Parameter):
     """A template parameter with cached parsed value."""
 
+    __slots__ = ('_parsed',)
+
     def __init__(self, name, schema, value=None):
         super(ParsedParameter, self).__init__(name, schema, value)
-        self._update_parsed()
+        self._parsed = None
 
-    def set_default(self, value):
-        super(ParsedParameter, self).set_default(value)
-        self._update_parsed()
-
-    def _update_parsed(self):
-        if self.has_value():
-            if self.user_value is not None:
-                self.parsed = self.parse(self.user_value)
+    @property
+    def parsed(self):
+        if self._parsed is None:
+            if self.has_value():
+                if self.user_value is not None:
+                    self._parsed = self.parse(self.user_value)
+                else:
+                    self._parsed = self.parse(self.default())
             else:
-                self.parsed = self.parse(self.default())
+                self._parsed = self.default_parsed()
+        return self._parsed
 
 
-class CommaDelimitedListParam(ParsedParameter, collections.Sequence):
+class CommaDelimitedListParam(ParsedParameter, collections.abc.Sequence):
     """A template parameter of type "CommaDelimitedList"."""
 
-    def __init__(self, name, schema, value=None):
-        self.parsed = []
-        super(CommaDelimitedListParam, self).__init__(name, schema, value)
+    __slots__ = tuple()
+
+    def default_parsed(self):
+        return []
 
     def parse(self, value):
         # only parse when value is not already a list
         if isinstance(value, list):
-            return [(six.text_type(x)) for x in value]
+            return [(str(x)) for x in value]
         try:
             return param_utils.delim_string_to_list(value)
         except (KeyError, AttributeError) as err:
             message = _('Value must be a comma-delimited list string: %s')
-            raise ValueError(message % six.text_type(err))
+            raise ValueError(message % str(err))
         return value
 
     def value(self):
@@ -397,30 +421,30 @@ class CommaDelimitedListParam(ParsedParameter, collections.Sequence):
         """Return an item from the list."""
         return self.parsed[index]
 
-    def __str__(self):
-        if self.hidden():
-            return super(CommaDelimitedListParam, self).__str__()
-        return ",".join(self.value())
+    @classmethod
+    def _value_as_text(cls, value):
+        return ",".join(value)
 
-    def _validate(self, val, context, template=None):
+    def _validate(self, val, context):
         try:
             parsed = self.parse(val)
         except ValueError as ex:
-            raise exception.StackValidationFailed(message=six.text_type(ex))
-        self.schema.validate_value(parsed, context=context, template=template)
+            raise exception.StackValidationFailed(message=str(ex))
+        self.schema.validate_value(parsed, context)
 
 
 class JsonParam(ParsedParameter):
     """A template parameter who's value is map or list."""
 
-    def __init__(self, name, schema, value=None):
-        self.parsed = {}
-        super(JsonParam, self).__init__(name, schema, value)
+    __slots__ = tuple()
+
+    def default_parsed(self):
+        return {}
 
     def parse(self, value):
         try:
             val = value
-            if not isinstance(val, six.string_types):
+            if not isinstance(val, str):
                 # turn off oslo_serialization's clever to_primitive()
                 val = jsonutils.dumps(val, default=None)
             if val:
@@ -445,31 +469,24 @@ class JsonParam(ParsedParameter):
     def __len__(self):
         return len(self.parsed)
 
-    def __str__(self):
-        if self.hidden():
-            return super(JsonParam, self).__str__()
-        return encodeutils.safe_decode(jsonutils.dumps(self.value()))
+    @classmethod
+    def _value_as_text(cls, value):
+        return encodeutils.safe_decode(jsonutils.dumps(value))
 
-    def _validate(self, val, context, template=None):
+    def _validate(self, val, context):
         try:
             parsed = self.parse(val)
         except ValueError as ex:
-            raise exception.StackValidationFailed(message=six.text_type(ex))
-        self.schema.validate_value(parsed, context=context, template=template)
+            raise exception.StackValidationFailed(message=str(ex))
+        self.schema.validate_value(parsed, context)
 
 
-class Parameters(collections.Mapping):
+class Parameters(collections.abc.Mapping, metaclass=abc.ABCMeta):
     """Parameters of a stack.
 
     The parameters of a stack, with type checking, defaults, etc. specified by
     the stack's template.
     """
-
-    PSEUDO_PARAMETERS = (
-        PARAM_STACK_ID, PARAM_STACK_NAME, PARAM_REGION
-    ) = (
-        'AWS::StackId', 'AWS::StackName', 'AWS::Region'
-    )
 
     def __init__(self, stack_identifier, tmpl, user_params=None,
                  param_defaults=None):
@@ -491,7 +508,7 @@ class Parameters(collections.Mapping):
 
         schemata = self.tmpl.param_schemata()
         user_parameters = (user_parameter(si) for si in
-                           six.iteritems(schemata))
+                           schemata.items())
         pseudo_parameters = self._pseudo_parameters(stack_identifier)
 
         self.params = dict((p.name,
@@ -512,8 +529,8 @@ class Parameters(collections.Mapping):
         """
         self._validate_user_parameters()
 
-        for param in six.itervalues(self.params):
-            param.validate(validate_value, context, self.tmpl)
+        for param in self.params.values():
+            param.validate(validate_value, context)
 
     def __contains__(self, key):
         """Return whether the specified parameter exists."""
@@ -538,7 +555,7 @@ class Parameters(collections.Mapping):
         function) and return the resulting dictionary.
         """
         return dict((n, func(p))
-                    for n, p in six.iteritems(self.params) if filter_func(p))
+                    for n, p in self.params.items() if filter_func(p))
 
     def set_stack_id(self, stack_identifier):
         """Set the StackId pseudo parameter value."""
@@ -554,30 +571,9 @@ class Parameters(collections.Mapping):
             if param not in schemata:
                 raise exception.UnknownUserParameter(key=param)
 
+    @abc.abstractmethod
     def _pseudo_parameters(self, stack_identifier):
-        stack_id = (stack_identifier.arn()
-                    if stack_identifier is not None else 'None')
-        stack_name = stack_identifier and stack_identifier.stack_name
-
-        yield Parameter(self.PARAM_STACK_ID,
-                        Schema(Schema.STRING, _('Stack ID'),
-                               default=str(stack_id)))
-        if stack_name:
-            yield Parameter(self.PARAM_STACK_NAME,
-                            Schema(Schema.STRING, _('Stack Name'),
-                                   default=stack_name))
-            yield Parameter(self.PARAM_REGION,
-                            Schema(Schema.STRING,
-                                   default='ap-southeast-1',
-                                   constraints=[
-                                       constr.AllowedValues(['us-east-1',
-                                                             'us-west-1',
-                                                             'us-west-2',
-                                                             'sa-east-1',
-                                                             'eu-west-1',
-                                                             'ap-southeast-1',
-                                                             'ap-northeast-1']
-                                                            )]))
+        pass
 
     def immutable_params_modified(self, new_parameters, input_params):
         # A parameter must have been present in the old stack for its

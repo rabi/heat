@@ -12,14 +12,10 @@
 
 import os
 
-from ceilometerclient import client as ceilometer_client
-from cinderclient import client as cinder_client
-from heat.common.i18n import _
 from heatclient import client as heat_client
-from keystoneauth1 import exceptions as kc_exceptions
 from keystoneauth1.identity.generic import password
 from keystoneauth1 import session
-from neutronclient.v2_0 import client as neutron_client
+from keystoneclient.v3 import client as kc_v3
 from novaclient import client as nova_client
 from swiftclient import client as swift_client
 
@@ -62,30 +58,22 @@ class ClientManager(object):
     calling various OpenStack APIs.
     """
 
-    CINDERCLIENT_VERSION = '2'
-    HEATCLIENT_VERSION = '1'
+    HEAT_API_VERSION = '1'
+    KEYSTONE_API_VERSION = '3'
     NOVA_API_VERSION = '2.1'
-    CEILOMETER_VERSION = '2'
 
     def __init__(self, conf, admin_credentials=False):
         self.conf = conf
         self.admin_credentials = admin_credentials
 
-        if self.conf.auth_url.find('/v'):
-            self.auth_version = self.conf.auth_url.split('/v')[1]
-        else:
-            raise ValueError(_('Incorrectly specified auth_url config: no '
-                               'version found.'))
         self.insecure = self.conf.disable_ssl_certificate_validation
         self.ca_file = self.conf.ca_file
 
         self.identity_client = self._get_identity_client()
+        self.keystone_client = self._get_keystone_client()
         self.orchestration_client = self._get_orchestration_client()
         self.compute_client = self._get_compute_client()
-        self.network_client = self._get_network_client()
-        self.volume_client = self._get_volume_client()
         self.object_client = self._get_object_client()
-        self.metering_client = self._get_metering_client()
 
     def _username(self):
         if self.admin_credentials:
@@ -97,45 +85,43 @@ class ClientManager(object):
             return self.conf.admin_password
         return self.conf.password
 
-    def _tenant_name(self):
+    def _project_name(self):
         if self.admin_credentials:
-            return self.conf.admin_tenant_name
-        return self.conf.tenant_name
+            return self.conf.admin_project_name
+        return self.conf.project_name
 
     def _get_orchestration_client(self):
         endpoint = os.environ.get('HEAT_URL')
         if os.environ.get('OS_NO_CLIENT_AUTH') == 'True':
-            token = None
+            session = None
         else:
-            token = self.identity_client.auth_token
-        try:
-            if endpoint is None:
-                endpoint = self.identity_client.get_endpoint_url(
-                    'orchestration', self.conf.region)
-        except kc_exceptions.EndpointNotFound:
-            return None
-        else:
-            return heat_client.Client(
-                self.HEATCLIENT_VERSION,
-                endpoint,
-                token=token,
-                username=self._username(),
-                password=self._password())
+            session = self.identity_client.session
+
+        return heat_client.Client(
+            self.HEAT_API_VERSION,
+            endpoint,
+            session=session,
+            endpoint_type='publicURL',
+            service_type='orchestration',
+            region_name=self.conf.region,
+            username=self._username(),
+            password=self._password())
 
     def _get_identity_client(self):
+        user_domain_id = self.conf.user_domain_id
+        project_domain_id = self.conf.project_domain_id
         user_domain_name = self.conf.user_domain_name
         project_domain_name = self.conf.project_domain_name
         kwargs = {
             'username': self._username(),
             'password': self._password(),
-            'tenant_name': self._tenant_name(),
-            'auth_url': self.conf.auth_url
+            'project_name': self._project_name(),
+            'auth_url': self.conf.auth_url,
+            'user_domain_id': user_domain_id,
+            'project_domain_id': project_domain_id,
+            'user_domain_name': user_domain_name,
+            'project_domain_name': project_domain_name
         }
-        # keystone v2 can't ignore domain details
-        if self.auth_version == '3':
-            kwargs.update({
-                'user_domain_name': user_domain_name,
-                'project_domain_name': project_domain_name})
         auth = password.Password(**kwargs)
         if self.insecure:
             verify_cert = False
@@ -144,69 +130,30 @@ class ClientManager(object):
 
         return KeystoneWrapperClient(auth, verify_cert)
 
-    def _get_compute_client(self):
+    def _get_keystone_client(self):
+        # Create our default Keystone client to use in testing
+        return kc_v3.Client(
+            session=self.identity_client.session,
+            interface='publicURL',
+            region_name=self.conf.region)
 
-        region = self.conf.region
+    def _get_compute_client(self):
         # Create our default Nova client to use in testing
         return nova_client.Client(
             self.NOVA_API_VERSION,
             session=self.identity_client.session,
             service_type='compute',
             endpoint_type='publicURL',
-            region_name=region,
-            no_cache=True,
-            insecure=self.insecure,
-            cacert=self.ca_file,
-            http_log_debug=True)
-
-    def _get_network_client(self):
-
-        return neutron_client.Client(
-            session=self.identity_client.session,
-            endpoint_type='publicURL',
-            insecure=self.insecure,
-            ca_cert=self.ca_file)
-
-    def _get_volume_client(self):
-        region = self.conf.region
-        endpoint_type = 'publicURL'
-        return cinder_client.Client(
-            self.CINDERCLIENT_VERSION,
-            session=self.identity_client.session,
-            region_name=region,
-            endpoint_type=endpoint_type,
-            insecure=self.insecure,
-            cacert=self.ca_file,
+            region_name=self.conf.region,
+            os_cache=False,
             http_log_debug=True)
 
     def _get_object_client(self):
-        # swiftclient does not support keystone sessions yet
         args = {
-            'auth_version': self.auth_version,
-            'tenant_name': self._tenant_name(),
-            'user': self._username(),
-            'key': self.conf.password,
-            'authurl': self.conf.auth_url,
-            'os_options': {'endpoint_type': 'publicURL'},
-            'insecure': self.insecure,
-            'cacert': self.ca_file,
+            'auth_version': self.KEYSTONE_API_VERSION,
+            'session': self.identity_client.session,
+            'os_options': {'endpoint_type': 'publicURL',
+                           'region_name': self.conf.region,
+                           'service_type': 'object-store'},
         }
         return swift_client.Connection(**args)
-
-    def _get_metering_client(self):
-        try:
-            endpoint = self.identity_client.get_endpoint_url('metering',
-                                                             self.conf.region)
-        except kc_exceptions.EndpointNotFound:
-            return None
-        else:
-            args = {
-                'session': self.identity_client.session,
-                'insecure': self.insecure,
-                'cacert': self.ca_file,
-                'region_name': self.conf.region,
-                'endpoint_type': 'publicURL',
-                'service_type': 'metering',
-            }
-            return ceilometer_client.Client(self.CEILOMETER_VERSION,
-                                            endpoint, **args)

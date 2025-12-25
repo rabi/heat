@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from heat.engine import constraints
 from heat.engine import properties
@@ -31,13 +31,12 @@ keystone_project_template = {
                 'description': 'Test project',
                 'domain': 'default',
                 'enabled': 'True',
-                'parent': 'my_father'
+                'parent': 'my_father',
+                'tags': ['label', 'insignia']
             }
         }
     }
 }
-
-RESOURCE_TYPE = 'OS::Keystone::Project'
 
 
 class KeystoneProjectTest(common.HeatTestCase):
@@ -73,7 +72,11 @@ class KeystoneProjectTest(common.HeatTestCase):
         value = mock.MagicMock()
         project_id = '477e8273-60a7-4c41-b683-fdb0bc7cd151'
         value.id = project_id
-
+        value.name = 'test_project_1'
+        value.domain_id = 'default'
+        value.enabled = True
+        value.parent_id = 'my_father'
+        value.is_domain = False
         return value
 
     def test_project_handle_create(self):
@@ -97,6 +100,9 @@ class KeystoneProjectTest(common.HeatTestCase):
         self.assertEqual(
             'my_father',
             self.test_project.properties.get(project.KeystoneProject.PARENT))
+        self.assertEqual(
+            ['label', 'insignia'],
+            self.test_project.properties.get(project.KeystoneProject.TAGS))
 
         self.test_project.handle_create()
 
@@ -106,7 +112,8 @@ class KeystoneProjectTest(common.HeatTestCase):
             description='Test project',
             domain='default',
             enabled=True,
-            parent='my_father')
+            parent='my_father',
+            tags=['label', 'insignia'])
 
         # validate physical resource id
         self.assertEqual(mock_project.id, self.test_project.resource_id)
@@ -245,7 +252,10 @@ class KeystoneProjectTest(common.HeatTestCase):
              project.KeystoneProject.ENABLED)),
             project.KeystoneProject.PARENT:
             (self._get_property_schema_value_default(
-             project.KeystoneProject.PARENT))
+             project.KeystoneProject.PARENT)),
+            project.KeystoneProject.TAGS:
+            (self._get_property_schema_value_default(
+             project.KeystoneProject.TAGS))
         }
 
         def _side_effect(key):
@@ -261,8 +271,7 @@ class KeystoneProjectTest(common.HeatTestCase):
         self.test_project.physical_resource_name.return_value = 'foo'
 
         # validate the properties
-        self.assertEqual(
-            None,
+        self.assertIsNone(
             self.test_project.properties.get(project.KeystoneProject.NAME))
         self.assertEqual(
             '',
@@ -285,7 +294,8 @@ class KeystoneProjectTest(common.HeatTestCase):
             description='',
             domain='default',
             enabled=True,
-            parent=None)
+            parent=None,
+            tags=[])
 
     def test_project_handle_update(self):
         self.test_project.resource_id = '477e8273-60a7-4c41-b683-fdb0bc7cd151'
@@ -294,7 +304,8 @@ class KeystoneProjectTest(common.HeatTestCase):
                      project.KeystoneProject.DESCRIPTION:
                      'Test Project updated',
                      project.KeystoneProject.ENABLED: False,
-                     project.KeystoneProject.DOMAIN: 'test_domain'}
+                     project.KeystoneProject.DOMAIN: 'test_domain',
+                     project.KeystoneProject.TAGS: ['tag1', 'tag2']}
 
         self.test_project.handle_update(json_snippet=None,
                                         tmpl_diff=None,
@@ -305,7 +316,8 @@ class KeystoneProjectTest(common.HeatTestCase):
             name=prop_diff[project.KeystoneProject.NAME],
             description=prop_diff[project.KeystoneProject.DESCRIPTION],
             enabled=prop_diff[project.KeystoneProject.ENABLED],
-            domain='test_domain'
+            domain='test_domain',
+            tags=prop_diff[project.KeystoneProject.TAGS]
         )
 
     def test_project_handle_update_default(self):
@@ -313,7 +325,8 @@ class KeystoneProjectTest(common.HeatTestCase):
 
         prop_diff = {project.KeystoneProject.DESCRIPTION:
                      'Test Project updated',
-                     project.KeystoneProject.ENABLED: False}
+                     project.KeystoneProject.ENABLED: False,
+                     project.KeystoneProject.TAGS: ['one', 'two']}
 
         self.test_project.handle_update(json_snippet=None,
                                         tmpl_diff=None,
@@ -326,7 +339,8 @@ class KeystoneProjectTest(common.HeatTestCase):
             name=None,
             description=prop_diff[project.KeystoneProject.DESCRIPTION],
             enabled=prop_diff[project.KeystoneProject.ENABLED],
-            domain='default'
+            domain='default',
+            tags=prop_diff[project.KeystoneProject.TAGS]
         )
 
     def test_project_handle_update_only_enabled(self):
@@ -342,7 +356,8 @@ class KeystoneProjectTest(common.HeatTestCase):
             name=None,
             description=None,
             enabled=prop_diff[project.KeystoneProject.ENABLED],
-            domain='default'
+            domain='default',
+            tags=['label', 'insignia']
         )
 
     def test_show_resource(self):
@@ -351,3 +366,50 @@ class KeystoneProjectTest(common.HeatTestCase):
         self.projects.get.return_value = project
         res = self.test_project._show_resource()
         self.assertEqual({'attr': 'val'}, res)
+
+    def test_get_live_state(self):
+        project = mock.Mock()
+        project.to_dict.return_value = {
+            "is_domain": False,
+            "description": "",
+            "links": {"self": "link"},
+            "enabled": True,
+            "id": "8cbb746917ee42f08a787e721552e738",
+            "parent_id": "default",
+            "domain_id": "default",
+            "name": "fake"
+        }
+        self.projects.get.return_value = project
+
+        reality = self.test_project.get_live_state(
+            self.test_project.properties)
+        expected = {
+            "description": "",
+            "enabled": True,
+            "domain": "default",
+            "name": "fake"
+        }
+        self.assertEqual(set(expected.keys()), set(reality.keys()))
+        for key in expected:
+            self.assertEqual(expected[key], reality[key])
+
+    def test_resolve_attributes(self):
+        mock_project = self._get_mock_project()
+        self.test_project.resource_id = mock_project['id']
+        self.projects.get.return_value = mock_project
+        self.assertEqual(
+            'test_project_1',
+            self.test_project._resolve_attribute(
+                project.KeystoneProject.NAME_ATTR))
+        self.assertEqual(
+            'my_father',
+            self.test_project._resolve_attribute(
+                project.KeystoneProject.PARENT_ATTR))
+        self.assertEqual(
+            'default',
+            self.test_project._resolve_attribute(
+                project.KeystoneProject.DOMAIN_ATTR))
+        self.assertTrue(self.test_project._resolve_attribute(
+            project.KeystoneProject.ENABLED_ATTR))
+        self.assertFalse(self.test_project._resolve_attribute(
+            project.KeystoneProject.IS_DOMAIN_ATTR))

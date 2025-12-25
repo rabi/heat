@@ -12,11 +12,12 @@
 #    under the License.
 
 import json
+from unittest import mock
 
-import mock
+from novaclient import exceptions
+from oslo_utils import excutils
 
 from heat.common import template_format
-from heat.engine.clients.os import nova
 from heat.engine import scheduler
 from heat.tests import common
 from heat.tests import utils
@@ -28,7 +29,9 @@ sg_template = {
             "type": "OS::Nova::ServerGroup",
             "properties": {
                 "name": "test",
-                "policies": ["anti-affinity"]
+                "policies": ["anti-affinity"],
+                "rules": {
+                    "max_server_per_host": 8}
             }
         }
     }
@@ -44,8 +47,6 @@ class FakeGroup(object):
 class NovaServerGroupTest(common.HeatTestCase):
     def setUp(self):
         super(NovaServerGroupTest, self).setUp()
-        self.patchobject(nova.NovaClientPlugin, 'has_extension',
-                         return_value=True)
 
     def _init_template(self, sg_template):
         template = template_format.parse(json.dumps(sg_template))
@@ -54,6 +55,23 @@ class NovaServerGroupTest(common.HeatTestCase):
         # create mock clients and objects
         nova = mock.MagicMock()
         self.sg.client = mock.MagicMock(return_value=nova)
+
+        class FakeNovaPlugin(object):
+
+            @excutils.exception_filter
+            def ignore_not_found(self, ex):
+                if not isinstance(ex, exceptions.NotFound):
+                    raise ex
+
+            def is_version_supported(self, version):
+                return True
+
+            def is_conflict(self, ex):
+                return False
+
+        self.patchobject(excutils.exception_filter, '__exit__')
+        self.patchobject(self.sg, 'client_plugin',
+                         return_value=FakeNovaPlugin())
         self.sg_mgr = nova.server_groups
 
     def _create_sg(self, name):
@@ -72,8 +90,8 @@ class NovaServerGroupTest(common.HeatTestCase):
             name = 'test'
             n = name
 
-            def fake_create(name, policies):
-                self.assertTrue(len(name) > 1)
+            def fake_create(name, policy, rules):
+                self.assertGreater(len(name), 1)
                 return FakeGroup(n)
             self.sg_mgr.create = fake_create
         scheduler.TaskRunner(self.sg.create)()
@@ -85,7 +103,9 @@ class NovaServerGroupTest(common.HeatTestCase):
         self._create_sg('test')
         expected_args = ()
         expected_kwargs = {'name': 'test',
-                           'policies': ["anti-affinity"],
+                           'policy': "anti-affinity",
+                           'rules': {
+                               'max_server_per_host': 8}
                            }
         self.sg_mgr.create.assert_called_once_with(*expected_args,
                                                    **expected_kwargs)
@@ -103,3 +123,21 @@ class NovaServerGroupTest(common.HeatTestCase):
         self.sg.client().server_groups = s_groups
         self.assertEqual({'server_gr': 'info'}, self.sg.FnGetAtt('show'))
         s_groups.get.assert_called_once_with('test')
+
+    def test_needs_replace_failed(self):
+        self._create_sg('test')
+        self.sg.state_set(self.sg.CREATE, self.sg.FAILED)
+        mock_show_resource = self.patchobject(self.sg, '_show_resource')
+        mock_show_resource.side_effect = [exceptions.NotFound(404), None]
+
+        self.sg.resource_id = None
+        self.assertTrue(self.sg.needs_replace_failed())
+        self.assertEqual(0, mock_show_resource.call_count)
+
+        self.sg.resource_id = 'sg_id'
+        self.assertTrue(self.sg.needs_replace_failed())
+        self.assertEqual(1, mock_show_resource.call_count)
+
+        mock_show_resource.return_value = None
+        self.assertFalse(self.sg.needs_replace_failed())
+        self.assertEqual(2, mock_show_resource.call_count)

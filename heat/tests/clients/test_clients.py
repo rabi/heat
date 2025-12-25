@@ -11,22 +11,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 from aodhclient import exceptions as aodh_exc
-from ceilometerclient import exc as ceil_exc
-from ceilometerclient.openstack.common.apiclient import exceptions as c_a_exc
 from cinderclient import exceptions as cinder_exc
 from glanceclient import exc as glance_exc
-from glanceclient.openstack.common.apiclient import exceptions as g_a_exc
 from heatclient import client as heatclient
 from heatclient import exc as heat_exc
 from keystoneauth1 import exceptions as keystone_exc
 from keystoneauth1.identity import generic
 from manilaclient import exceptions as manila_exc
-import mock
+from mistralclient.api import base as mistral_base
 from neutronclient.common import exceptions as neutron_exc
+from openstack import exceptions
 from oslo_config import cfg
-from saharaclient.api import base as sahara_base
-import six
 from swiftclient import exceptions as swift_exc
 from testtools import testcase
 from troveclient import client as troveclient
@@ -34,32 +32,29 @@ from zaqarclient.transport import errors as zaqar_exc
 
 from heat.common import exception
 from heat.engine import clients
+from heat.engine.clients import client_exception
 from heat.engine.clients import client_plugin
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.tests import common
 from heat.tests import fakes
 from heat.tests.openstack.nova import fakes as fakes_nova
-from heat.tests import utils
 
 
 class ClientsTest(common.HeatTestCase):
 
     def test_bad_cloud_backend(self):
         con = mock.Mock()
-        cfg.CONF.set_override('cloud_backend', 'some.weird.object',
-                              enforce_type=True)
+        cfg.CONF.set_override('cloud_backend', 'some.weird.object')
         exc = self.assertRaises(exception.Invalid, clients.Clients, con)
-        self.assertIn('Invalid cloud_backend setting in heat.conf detected',
-                      six.text_type(exc))
+        self.assertIn('Invalid cloud_backend setting', str(exc))
 
-        cfg.CONF.set_override('cloud_backend', 'heat.engine.clients.Clients',
-                              enforce_type=True)
+        cfg.CONF.set_override('cloud_backend', 'heat.engine.clients.Clients')
         exc = self.assertRaises(exception.Invalid, clients.Clients, con)
-        self.assertIn('Invalid cloud_backend setting in heat.conf detected',
-                      six.text_type(exc))
+        self.assertIn('Invalid cloud_backend setting', str(exc))
 
     def test_clients_get_heat_url(self):
         con = mock.Mock()
-        con.tenant_id = "b363706f891f48019483f8bd6503c54b"
+        con.project_id = "b363706f891f48019483f8bd6503c54b"
         c = clients.Clients(con)
         con.clients = c
 
@@ -77,7 +72,7 @@ class ClientsTest(common.HeatTestCase):
         obj._get_client_option.return_value = result
         self.assertEqual(result, obj.get_heat_url())
 
-    def _client_cfn_url(self):
+    def _client_cfn_url(self, use_uwsgi=False, use_ipv6=False):
         con = mock.Mock()
         c = clients.Clients(con)
         con.clients = c
@@ -85,16 +80,21 @@ class ClientsTest(common.HeatTestCase):
         obj._get_client_option = mock.Mock()
         obj._get_client_option.return_value = None
         obj.url_for = mock.Mock(name="url_for")
-        obj.url_for.return_value = "http://0.0.0.0:8000/v1/"
+        if use_ipv6:
+            if use_uwsgi:
+                obj.url_for.return_value = "http://[::1]/heat-api-cfn/v1/"
+            else:
+                obj.url_for.return_value = "http://[::1]:8000/v1/"
+        else:
+            if use_uwsgi:
+                obj.url_for.return_value = "http://0.0.0.0/heat-api-cfn/v1/"
+            else:
+                obj.url_for.return_value = "http://0.0.0.0:8000/v1/"
         return obj
 
     def test_clients_get_heat_cfn_url(self):
         obj = self._client_cfn_url()
         self.assertEqual("http://0.0.0.0:8000/v1/", obj.get_heat_cfn_url())
-
-    def test_clients_get_watch_server_url(self):
-        obj = self._client_cfn_url()
-        self.assertEqual("http://0.0.0.0:8003/v1/", obj.get_watch_server_url())
 
     def test_clients_get_heat_cfn_metadata_url(self):
         obj = self._client_cfn_url()
@@ -103,7 +103,7 @@ class ClientsTest(common.HeatTestCase):
 
     def test_clients_get_heat_cfn_metadata_url_conf(self):
         cfg.CONF.set_override('heat_metadata_server_url',
-                              'http://server.test:123', enforce_type=True)
+                              'http://server.test:123')
         obj = self._client_cfn_url()
         self.assertEqual("http://server.test:123/v1/",
                          obj.get_cfn_metadata_server_url())
@@ -113,7 +113,7 @@ class ClientsTest(common.HeatTestCase):
         self.stub_keystoneclient()
         con = mock.Mock()
         con.auth_url = "http://auth.example.com:5000/v2.0"
-        con.tenant_id = "b363706f891f48019483f8bd6503c54b"
+        con.project_id = "b363706f891f48019483f8bd6503c54b"
         con.auth_token = "3bcc3d3a03f44e3d8377f9247b0ad155"
         c = clients.Clients(con)
         con.clients = c
@@ -128,24 +128,23 @@ class ClientsTest(common.HeatTestCase):
     def test_clients_heat_no_auth_token(self, mock_call):
         con = mock.Mock()
         con.auth_url = "http://auth.example.com:5000/v2.0"
-        con.tenant_id = "b363706f891f48019483f8bd6503c54b"
+        con.project_id = "b363706f891f48019483f8bd6503c54b"
         con.auth_token = None
         con.auth_plugin = fakes.FakeAuth(auth_token='anewtoken')
-        self.stub_keystoneclient(context=con)
         c = clients.Clients(con)
         con.clients = c
 
         obj = c.client_plugin('heat')
         obj.url_for = mock.Mock(name="url_for")
         obj.url_for.return_value = "url_from_keystone"
-        self.assertEqual('anewtoken', c.client('keystone').auth_token)
+        self.assertEqual('url_from_keystone', obj.get_heat_url())
 
     @mock.patch.object(heatclient, 'Client')
     def test_clients_heat_cached(self, mock_call):
         self.stub_auth()
         con = mock.Mock()
         con.auth_url = "http://auth.example.com:5000/v2.0"
-        con.tenant_id = "b363706f891f48019483f8bd6503c54b"
+        con.project_id = "b363706f891f48019483f8bd6503c54b"
         con.auth_token = "3bcc3d3a03f44e3d8377f9247b0ad155"
         con.trust_id = None
         c = clients.Clients(con)
@@ -176,7 +175,7 @@ class ClientPluginTest(common.HeatTestCase):
     def test_get_client_option(self):
         con = mock.Mock()
         con.auth_url = "http://auth.example.com:5000/v2.0"
-        con.tenant_id = "b363706f891f48019483f8bd6503c54b"
+        con.project_id = "b363706f891f48019483f8bd6503c54b"
         con.auth_token = "3bcc3d3a03f44e3d8377f9247b0ad155"
         c = clients.Clients(con)
         con.clients = c
@@ -184,11 +183,11 @@ class ClientPluginTest(common.HeatTestCase):
         plugin = FooClientsPlugin(con)
 
         cfg.CONF.set_override('ca_file', '/tmp/bar',
-                              group='clients_heat', enforce_type=True)
+                              group='clients_heat')
         cfg.CONF.set_override('ca_file', '/tmp/foo',
-                              group='clients', enforce_type=True)
+                              group='clients')
         cfg.CONF.set_override('endpoint_type', 'internalURL',
-                              group='clients', enforce_type=True)
+                              group='clients')
 
         # check heat group
         self.assertEqual('/tmp/bar',
@@ -235,7 +234,7 @@ class ClientPluginTest(common.HeatTestCase):
 
     @mock.patch.object(generic, "Token", name="v3_token")
     def test_get_missing_service_catalog(self, mock_v3):
-        class FakeKeystone(fakes.FakeKeystoneClient):
+        class FakeKeystone(fake_ks.FakeKeystoneClient):
             def __init__(self):
                 super(FakeKeystone, self).__init__()
                 self.client = self
@@ -263,7 +262,7 @@ class ClientPluginTest(common.HeatTestCase):
 
     @mock.patch.object(generic, "Token", name="v3_token")
     def test_endpoint_not_found(self, mock_v3):
-        class FakeKeystone(fakes.FakeKeystoneClient):
+        class FakeKeystone(fake_ks.FakeKeystoneClient):
             def __init__(self):
                 super(FakeKeystone, self).__init__()
                 self.client = self
@@ -298,42 +297,6 @@ class ClientPluginTest(common.HeatTestCase):
 
         self.assertRaises(TypeError, client_plugin.ClientPlugin, c)
 
-    def test_create_client_on_token_expiration(self):
-        cfg.CONF.set_override('reauthentication_auth_method', 'trusts',
-                              enforce_type=True)
-        con = utils.dummy_context()
-        auth_ref = mock.Mock()
-        self.patchobject(con.auth_plugin, 'get_auth_ref',
-                         return_value=auth_ref)
-        auth_ref.will_expire_soon.return_value = False
-        plugin = FooClientsPlugin(con)
-        plugin._create = mock.Mock()
-        plugin.client()
-        self.assertEqual(1, plugin._create.call_count)
-        plugin.client()
-        self.assertEqual(1, plugin._create.call_count)
-        auth_ref.will_expire_soon.return_value = True
-        plugin.client()
-        self.assertEqual(2, plugin._create.call_count)
-
-    def test_create_client_on_invalidate(self):
-        cfg.CONF.set_override('reauthentication_auth_method', 'trusts',
-                              enforce_type=True)
-        con = utils.dummy_context()
-        auth_ref = mock.Mock()
-        self.patchobject(con.auth_plugin, 'get_auth_ref',
-                         return_value=auth_ref)
-        auth_ref.will_expire_soon.return_value = False
-        plugin = FooClientsPlugin(con)
-        plugin._create = mock.Mock()
-        plugin.client()
-        self.assertEqual(1, plugin._create.call_count)
-        plugin.client()
-        self.assertEqual(1, plugin._create.call_count)
-        plugin.invalidate()
-        plugin.client()
-        self.assertEqual(2, plugin._create.call_count)
-
 
 class TestClientPluginsInitialise(common.HeatTestCase):
 
@@ -341,7 +304,7 @@ class TestClientPluginsInitialise(common.HeatTestCase):
     def test_create_all_clients(self):
         con = mock.Mock()
         con.auth_url = "http://auth.example.com:5000/v2.0"
-        con.tenant_id = "b363706f891f48019483f8bd6503c54b"
+        con.project_id = "b363706f891f48019483f8bd6503c54b"
         con.auth_token = "3bcc3d3a03f44e3d8377f9247b0ad155"
         c = clients.Clients(con)
         con.clients = c
@@ -366,67 +329,13 @@ class TestClientPluginsInitialise(common.HeatTestCase):
             self.assertEqual({}, plugin._client_instances)
             self.assertTrue(clients.has_client(plugin_name))
             self.assertIsInstance(plugin.service_types, list)
-            self.assertTrue(len(plugin.service_types) >= 1,
-                            'service_types is not defined for plugin')
-
-    @mock.patch.object(client_plugin.ClientPlugin, 'invalidate')
-    def test_invalidate_all_clients(self, mock_invalidate):
-        plugin_types = clients._mgr.names()
-        con = mock.Mock()
-        c = clients.Clients(con)
-        con.clients = c
-        for plugin_name in plugin_types:
-            plugin = c.client_plugin(plugin_name)
-            self.assertIsNotNone(plugin)
-        c.invalidate_plugins()
-        # while client plugin is initialized and while client is invoked
-        # its being invalidated, so the count will be doubled
-        self.assertEqual(len(plugin_types) * 2, mock_invalidate.call_count)
+            self.assertGreaterEqual(len(plugin.service_types), 1,
+                                    'service_types is not defined for plugin')
 
 
 class TestIsNotFound(common.HeatTestCase):
 
     scenarios = [
-        ('ceilometer_not_found', dict(
-            is_not_found=True,
-            is_over_limit=False,
-            is_client_exception=True,
-            is_conflict=False,
-            plugin='ceilometer',
-            exception=lambda: ceil_exc.HTTPNotFound(details='gone'),
-        )),
-        ('ceilometer_not_found_apiclient', dict(
-            is_not_found=True,
-            is_over_limit=False,
-            is_client_exception=True,
-            is_conflict=False,
-            plugin='ceilometer',
-            exception=lambda: c_a_exc.NotFound(details='gone'),
-        )),
-        ('ceilometer_exception', dict(
-            is_not_found=False,
-            is_over_limit=False,
-            is_client_exception=False,
-            is_conflict=False,
-            plugin='ceilometer',
-            exception=lambda: Exception()
-        )),
-        ('ceilometer_overlimit', dict(
-            is_not_found=False,
-            is_over_limit=True,
-            is_client_exception=True,
-            is_conflict=False,
-            plugin='ceilometer',
-            exception=lambda: ceil_exc.HTTPOverLimit(details='over'),
-        )),
-        ('ceilometer_conflict', dict(
-            is_not_found=False,
-            is_over_limit=False,
-            is_client_exception=True,
-            is_conflict=True,
-            plugin='ceilometer',
-            exception=lambda: ceil_exc.HTTPConflict(),
-        )),
         ('aodh_not_found', dict(
             is_not_found=True,
             is_over_limit=False,
@@ -490,7 +399,7 @@ class TestIsNotFound(common.HeatTestCase):
             is_client_exception=True,
             is_conflict=False,
             plugin='glance',
-            exception=lambda: g_a_exc.NotFound(),
+            exception=lambda: client_exception.EntityMatchNotFound(),
         )),
         ('glance_not_found_2', dict(
             is_not_found=True,
@@ -522,15 +431,7 @@ class TestIsNotFound(common.HeatTestCase):
             is_client_exception=True,
             is_conflict=True,
             plugin='glance',
-            exception=lambda: g_a_exc.Conflict(),
-        )),
-        ('glance_conflict_1', dict(
-            is_not_found=False,
-            is_over_limit=False,
-            is_client_exception=True,
-            is_conflict=True,
-            plugin='glance',
-            exception=lambda: glance_exc.Conflict(),
+            exception=lambda: glance_exc.HTTPConflict(),
         )),
         ('heat_not_found', dict(
             is_not_found=True,
@@ -709,6 +610,15 @@ class TestIsNotFound(common.HeatTestCase):
             plugin='nova',
             exception=lambda: fakes_nova.fake_exception(409),
         )),
+        ('openstack_not_found', dict(
+            is_not_found=True,
+            is_over_limit=False,
+            is_client_exception=True,
+            is_conflict=False,
+            is_unprocessable_entity=False,
+            plugin='openstack',
+            exception=lambda: exceptions.ResourceNotFound,
+        )),
         ('swift_not_found', dict(
             is_not_found=True,
             is_over_limit=False,
@@ -778,41 +688,6 @@ class TestIsNotFound(common.HeatTestCase):
             exception=lambda: troveclient.exceptions.Conflict(
                 message='Conflict'),
         )),
-        ('sahara_not_found', dict(
-            is_not_found=True,
-            is_over_limit=False,
-            is_client_exception=True,
-            is_conflict=False,
-            plugin='sahara',
-            exception=lambda: sahara_base.APIException(
-                error_message='gone1', error_code=404),
-        )),
-        ('sahara_exception', dict(
-            is_not_found=False,
-            is_over_limit=False,
-            is_client_exception=False,
-            is_conflict=False,
-            plugin='sahara',
-            exception=lambda: Exception()
-        )),
-        ('sahara_overlimit', dict(
-            is_not_found=False,
-            is_over_limit=True,
-            is_client_exception=True,
-            is_conflict=False,
-            plugin='sahara',
-            exception=lambda: sahara_base.APIException(
-                error_message='over1', error_code=413),
-        )),
-        ('sahara_conflict', dict(
-            is_not_found=False,
-            is_over_limit=False,
-            is_client_exception=True,
-            is_conflict=True,
-            plugin='sahara',
-            exception=lambda: sahara_base.APIException(
-                error_message='conflict1', error_code=409),
-        )),
         ('zaqar_not_found', dict(
             is_not_found=True,
             is_over_limit=False,
@@ -852,6 +727,22 @@ class TestIsNotFound(common.HeatTestCase):
             is_conflict=True,
             plugin='manila',
             exception=lambda: manila_exc.Conflict(),
+        )),
+        ('mistral_not_found1', dict(
+            is_not_found=True,
+            is_over_limit=False,
+            is_client_exception=False,
+            is_conflict=False,
+            plugin='mistral',
+            exception=lambda: mistral_base.APIException(404),
+        )),
+        ('mistral_not_found2', dict(
+            is_not_found=True,
+            is_over_limit=False,
+            is_client_exception=False,
+            is_conflict=False,
+            plugin='mistral',
+            exception=lambda: keystone_exc.NotFound(),
         )),
     ]
 

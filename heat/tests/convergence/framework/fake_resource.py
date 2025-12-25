@@ -16,13 +16,17 @@ from heat.engine import attributes
 from heat.engine import properties
 from heat.engine import resource
 
+from oslo_log import log as logging
+
+LOG = logging.getLogger(__name__)
+
 
 class TestResource(resource.Resource):
 
     PROPERTIES = (
-        A, C, CA, rA, rB
+        A, B, C, CA, rA, rB
     ) = (
-        'a', 'c', 'ca', '!a', '!b'
+        'a', 'b', 'c', 'ca', '!a', '!b'
     )
 
     ATTRIBUTES = (
@@ -36,6 +40,12 @@ class TestResource(resource.Resource):
             properties.Schema.STRING,
             _('Fake property a.'),
             default='a',
+            update_allowed=True
+        ),
+        B: properties.Schema(
+            properties.Schema.STRING,
+            _('Fake property b.'),
+            default='b',
             update_allowed=True
         ),
         C: properties.Schema(
@@ -76,12 +86,16 @@ class TestResource(resource.Resource):
     }
 
     def handle_create(self):
+        LOG.info('Creating resource %s with properties %s',
+                 self.name, dict(self.properties))
         for prop in self.properties.props.keys():
             self.data_set(prop, self.properties.get(prop), redact=False)
 
         self.resource_id_set(self.physical_resource_name())
 
     def handle_update(self, json_snippet=None, tmpl_diff=None, prop_diff=None):
+        LOG.info('Updating resource %s with prop_diff %s',
+                 self.name, prop_diff)
         for prop in prop_diff:
             if '!' in prop:
                 raise resource.UpdateReplace(self.name)

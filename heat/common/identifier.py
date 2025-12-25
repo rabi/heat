@@ -15,12 +15,12 @@ import collections
 import re
 
 from oslo_utils import encodeutils
-from six.moves.urllib import parse as urlparse
+from urllib import parse as urlparse
 
 from heat.common.i18n import _
 
 
-class HeatIdentifier(collections.Mapping):
+class HeatIdentifier(collections.abc.Mapping):
 
     FIELDS = (
         TENANT, STACK_NAME, STACK_ID, PATH
@@ -100,7 +100,7 @@ class HeatIdentifier(collections.Mapping):
 
     def arn_url_path(self):
         """Return an ARN quoted correctly for use in a URL."""
-        return '/' + urlparse.quote(self.arn(), '')
+        return '/' + urlparse.quote(self.arn())
 
     def url_path(self):
         """Return a URL-encoded path segment of a URL.

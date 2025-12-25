@@ -32,16 +32,18 @@ class Subnet(neutron.NeutronResource):
     CIDR, or from "allocation pools" that can be specified by the user.
     """
 
+    entity = 'subnet'
+
     PROPERTIES = (
         NETWORK_ID, NETWORK, SUBNETPOOL, PREFIXLEN, CIDR,
         VALUE_SPECS, NAME, IP_VERSION, DNS_NAMESERVERS, GATEWAY_IP,
         ENABLE_DHCP, ALLOCATION_POOLS, TENANT_ID, HOST_ROUTES,
-        IPV6_RA_MODE, IPV6_ADDRESS_MODE,
+        IPV6_RA_MODE, IPV6_ADDRESS_MODE, SEGMENT, TAGS,
     ) = (
         'network_id', 'network', 'subnetpool', 'prefixlen', 'cidr',
         'value_specs', 'name', 'ip_version', 'dns_nameservers', 'gateway_ip',
         'enable_dhcp', 'allocation_pools', 'tenant_id', 'host_routes',
-        'ipv6_ra_mode', 'ipv6_address_mode',
+        'ipv6_ra_mode', 'ipv6_address_mode', 'segment', 'tags',
     )
 
     _ALLOCATION_POOL_KEYS = (
@@ -234,6 +236,30 @@ class Subnet(neutron.NeutronResource):
             ],
             support_status=support.SupportStatus(version='2015.1')
         ),
+        SEGMENT: properties.Schema(
+            properties.Schema.STRING,
+            _('The name/ID of the segment to associate.'),
+            constraints=[
+                constraints.CustomConstraint('neutron.segment')
+            ],
+            update_allowed=True,
+            support_status=support.SupportStatus(
+                version='11.0.0',
+                status=support.SUPPORTED,
+                message=_('Update allowed since version 11.0.0.'),
+                previous_status=support.SupportStatus(
+                    version='9.0.0',
+                    status=support.SUPPORTED
+                )
+            )
+        ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('The tags to be added to the subnet.'),
+            schema=properties.Schema(properties.Schema.STRING),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='9.0.0')
+        ),
     }
 
     attributes_schema = {
@@ -280,6 +306,7 @@ class Subnet(neutron.NeutronResource):
     }
 
     def translation_rules(self, props):
+        client_plugin = self.client_plugin()
         return [
             translation.TranslationRule(
                 props,
@@ -290,17 +317,24 @@ class Subnet(neutron.NeutronResource):
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.NETWORK],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='network'
+                entity=client_plugin.RES_TYPE_NETWORK
             ),
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.SUBNETPOOL],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='subnetpool'
+                entity=client_plugin.RES_TYPE_SUBNET_POOL
+            ),
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                [self.SEGMENT],
+                client_plugin=self.client_plugin('openstack'),
+                finder='find_network_segment'
             )
         ]
 
@@ -321,10 +355,10 @@ class Subnet(neutron.NeutronResource):
         subnetpool = self.properties[self.SUBNETPOOL]
         prefixlen = self.properties[self.PREFIXLEN]
         cidr = self.properties[self.CIDR]
-        if subnetpool and cidr:
+        if subnetpool is not None and cidr:
             raise exception.ResourcePropertyConflict(self.SUBNETPOOL,
                                                      self.CIDR)
-        if not subnetpool and not cidr:
+        if subnetpool is None and not cidr:
             raise exception.PropertyUnspecifiedError(self.SUBNETPOOL,
                                                      self.CIDR)
         if prefixlen and cidr:
@@ -355,11 +389,20 @@ class Subnet(neutron.NeutronResource):
             self.properties,
             self.physical_resource_name())
         props['network_id'] = props.pop(self.NETWORK)
+        if self.SEGMENT in props and props[self.SEGMENT]:
+            props['segment_id'] = props.pop(self.SEGMENT)
+
+        tags = props.pop(self.TAGS, [])
+
         if self.SUBNETPOOL in props and props[self.SUBNETPOOL]:
             props['subnetpool_id'] = props.pop('subnetpool')
         self._null_gateway_ip(props)
+
         subnet = self.client().create_subnet({'subnet': props})['subnet']
         self.resource_id_set(subnet['id'])
+
+        if tags:
+            self.set_tags(tags)
 
     def handle_delete(self):
         try:
@@ -369,8 +412,18 @@ class Subnet(neutron.NeutronResource):
         else:
             return True
 
-    def _show_resource(self):
-        return self.client().show_subnet(self.resource_id)['subnet']
+    def _validate_segment_update_supported(self):
+        # TODO(hjensas): Validation to ensure the subnet-segmentid-writable
+        # extension is available.
+        # https://storyboard.openstack.org/#!/story/2002189
+        # Current segment id must be None
+        if self.properties[self.SEGMENT] is not None:
+            msg = _('Updating the subnet segment assciation only allowed '
+                    'when the current segment_id is None. The subnet is '
+                    'currently associated with segment. In this state update')
+            raise exception.ResourceActionNotSupported(action=msg)
+        else:
+            return True
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         if prop_diff:
@@ -378,10 +431,15 @@ class Subnet(neutron.NeutronResource):
             if (self.ALLOCATION_POOLS in prop_diff and
                     prop_diff[self.ALLOCATION_POOLS] is None):
                 prop_diff[self.ALLOCATION_POOLS] = []
+            if (self.SEGMENT in prop_diff and prop_diff[self.SEGMENT] and
+                    self._validate_segment_update_supported()):
+                prop_diff['segment_id'] = prop_diff.pop(self.SEGMENT)
 
             # If the new value is '', set to None
             self._null_gateway_ip(prop_diff)
-
+            if self.TAGS in prop_diff:
+                tags = prop_diff.pop(self.TAGS)
+                self.set_tags(tags)
             self.client().update_subnet(
                 self.resource_id, {'subnet': prop_diff})
 

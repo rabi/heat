@@ -10,18 +10,17 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
-import uuid
+from urllib import parse
 
 from keystoneclient.contrib.ec2 import utils as ec2_utils
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-from six.moves.urllib import parse as urlparse
+from oslo_utils import timeutils
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
+from heat.common import password_gen
 from heat.engine.clients.os import swift
 from heat.engine.resources import stack_user
 
@@ -95,6 +94,9 @@ class SignalResponder(stack_user.StackUser):
         return self.properties.get(
             self.SIGNAL_TRANSPORT) == self.ZAQAR_SIGNAL
 
+    def _get_region_name(self):
+        return self.client_plugin('heat')._get_region_name()
+
     def _get_heat_signal_credentials(self):
         """Return OpenStack credentials that can be used to send a signal.
 
@@ -103,16 +105,19 @@ class SignalResponder(stack_user.StackUser):
         """
         if self._get_user_id() is None:
             if self.password is None:
-                self.password = uuid.uuid4().hex
+                self.password = password_gen.generate_openstack_password()
             self._create_user()
-        return {'auth_url': self.keystone().v3_endpoint,
+        return {'auth_url': self.keystone().server_keystone_endpoint_url(
+                fallback_endpoint=self.keystone().v3_endpoint),
                 'username': self.physical_resource_name(),
                 'user_id': self._get_user_id(),
                 'password': self.password,
                 'project_id': self.stack.stack_user_project_id,
-                'domain_id': self.keystone().stack_domain_id}
+                'domain_id': self.keystone().stack_domain_id,
+                'region_name': self._get_region_name()}
 
-    def _get_ec2_signed_url(self, signal_type=SIGNAL):
+    def _get_ec2_signed_url(self, signal_type=SIGNAL,
+                            never_expire=False):
         """Create properly formatted and pre-signed URL.
 
         This uses the created user for the credentials.
@@ -121,10 +126,6 @@ class SignalResponder(stack_user.StackUser):
 
         :param signal_type: either WAITCONDITION or SIGNAL.
         """
-        stored = self.data().get('ec2_signed_url')
-        if stored is not None:
-            return stored
-
         access_key = self.data().get('access_key')
         secret_key = self.data().get('secret_key')
 
@@ -139,8 +140,8 @@ class SignalResponder(stack_user.StackUser):
             secret_key = self.data().get('secret_key')
 
             if not access_key or not secret_key:
-                LOG.warning(_LW('Cannot generate signed url, '
-                                'unable to create keypair'))
+                LOG.warning('Cannot generate signed url, '
+                            'unable to create keypair')
                 return
 
         config_url = cfg.CONF.heat_waitcondition_server_url
@@ -151,7 +152,7 @@ class SignalResponder(stack_user.StackUser):
             endpoint = heat_client_plugin.get_heat_cfn_url()
             signal_url = ''.join([endpoint, signal_type])
 
-        host_url = urlparse.urlparse(signal_url)
+        host_url = parse.urlparse(signal_url)
 
         path = self.identifier().arn_url_path()
 
@@ -159,25 +160,25 @@ class SignalResponder(stack_user.StackUser):
         # processing in the CFN API (ec2token.py) has an unquoted path, so we
         # need to calculate the signature with the path component unquoted, but
         # ensure the actual URL contains the quoted version...
-        unquoted_path = urlparse.unquote(host_url.path + path)
+        unquoted_path = parse.unquote(host_url.path + path)
+        params = {'SignatureMethod': 'HmacSHA256',
+                  'SignatureVersion': '2',
+                  'AWSAccessKeyId': access_key}
+        if not never_expire:
+            params['Timestamp'] = timeutils.utcnow().strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
         request = {'host': host_url.netloc.lower(),
                    'verb': SIGNAL_VERB[signal_type],
                    'path': unquoted_path,
-                   'params': {'SignatureMethod': 'HmacSHA256',
-                              'SignatureVersion': '2',
-                              'AWSAccessKeyId': access_key,
-                              'Timestamp':
-                              self.created_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                              }}
+                   'params': params}
         # Sign the request
         signer = ec2_utils.Ec2Signer(secret_key)
         request['params']['Signature'] = signer.generate(request)
 
-        qs = urlparse.urlencode(request['params'])
+        qs = parse.urlencode(request['params'])
         url = "%s%s?%s" % (signal_url.lower(),
                            path, qs)
 
-        self.data_set('ec2_signed_url', url)
         return url
 
     def _delete_ec2_signed_url(self):
@@ -201,13 +202,11 @@ class SignalResponder(stack_user.StackUser):
             return
 
         url = self.client_plugin('heat').get_heat_url()
-        host_url = urlparse.urlparse(url)
         path = self.identifier().url_path()
         if project_id is not None:
             path = project_id + path[path.find('/'):]
 
-        url = urlparse.urlunsplit(
-            (host_url.scheme, host_url.netloc, 'v1/%s/signal' % path, '', ''))
+        url = parse.urljoin(url, '%s/signal' % path)
 
         self.data_set('heat_signal_url', url)
         return url
@@ -286,7 +285,7 @@ class SignalResponder(stack_user.StackUser):
 
         if self._get_user_id() is None:
             if self.password is None:
-                self.password = uuid.uuid4().hex
+                self.password = password_gen.generate_openstack_password()
             self._create_user()
 
         queue_id = self.physical_resource_name()
@@ -342,12 +341,12 @@ class SignalResponder(stack_user.StackUser):
             container = swift_client.get_container(self.stack.id)
         except Exception as exc:
             self.client_plugin('swift').ignore_not_found(exc)
-            LOG.debug("Swift container %s was not found" % self.stack.id)
+            LOG.debug("Swift container %s was not found", self.stack.id)
             return
 
         index = container[1]
         if not index:  # Swift objects were deleted by user
-            LOG.debug("Swift objects in container %s were not found" %
+            LOG.debug("Swift objects in container %s were not found",
                       self.stack.id)
             return
 
@@ -394,6 +393,7 @@ class SignalResponder(stack_user.StackUser):
             queue = zaqar.queue(self._get_zaqar_signal_queue_id())
         except Exception as ex:
             self.client_plugin('zaqar').ignore_not_found(ex)
+            return
         messages = list(queue.pop())
         for message in messages:
             self.signal(details=message.body)

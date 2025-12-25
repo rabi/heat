@@ -19,11 +19,9 @@
 import sys
 
 from oslo_log import log as logging
-import six
-from six import reraise as raise_
+from oslo_utils import excutils
 
 from heat.common.i18n import _
-from heat.common.i18n import _LE
 
 _FATAL_EXCEPTION_FORMAT_ERRORS = False
 
@@ -38,7 +36,6 @@ ERROR_CODE_MAP = {
 }
 
 
-@six.python_2_unicode_compatible
 class HeatException(Exception):
     """Base Heat Exception.
 
@@ -55,28 +52,28 @@ class HeatException(Exception):
     # YYY - Specific error code for a given exception.
     error_code = None
 
+    safe = True
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
+        if self.error_code in ERROR_CODE_MAP:
+            self.msg_fmt = ERROR_CODE_MAP[self.error_code]
+
         try:
-            if self.error_code in ERROR_CODE_MAP:
-                self.msg_fmt = ERROR_CODE_MAP[self.error_code]
-
             self.message = self.msg_fmt % kwargs
-
-            if self.error_code:
-                self.message = 'HEAT-E%s %s' % (self.error_code, self.message)
         except KeyError:
-            exc_info = sys.exc_info()
-            # kwargs doesn't match a variable in the message
-            # log the issue and the kwargs
-            LOG.exception(_LE('Exception in string format operation'))
-            for name, value in six.iteritems(kwargs):
-                LOG.error(_LE("%(name)s: %(value)s"),
-                          {'name': name, 'value': value})  # noqa
+            with excutils.save_and_reraise_exception(
+                    reraise=_FATAL_EXCEPTION_FORMAT_ERRORS):
+                # kwargs doesn't match a variable in the message
+                # log the issue and the kwargs
+                LOG.exception('Exception in string format operation')
+                for name, value in kwargs.items():
+                    LOG.error("%(name)s: %(value)s",
+                              {'name': name, 'value': value})  # noqa
 
-            if _FATAL_EXCEPTION_FORMAT_ERRORS:
-                raise_(exc_info[0], exc_info[1], exc_info[2])
+        if self.error_code:
+            self.message = 'HEAT-E%s %s' % (self.error_code, self.message)
 
     def __str__(self):
         return self.message
@@ -90,7 +87,14 @@ class MissingCredentialError(HeatException):
 
 
 class AuthorizationFailure(HeatException):
-    msg_fmt = _("Authorization failed.")
+    msg_fmt = _("Authorization failed.%(failure_reason)s")
+
+    def __init__(self, failure_reason=""):
+        if failure_reason != "":
+            # Add a space to make message more readable
+            failure_reason = " " + failure_reason
+        super(AuthorizationFailure, self).__init__(
+            failure_reason=failure_reason)
 
 
 class NotAuthenticated(HeatException):
@@ -140,8 +144,13 @@ class ImmutableParameterModified(HeatException):
 
 
 class InvalidMergeStrategyForParam(HeatException):
-    msg_fmt = _("Invalid merge strategy %(strategy)s for "
-                "parameter %(param)s.")
+    msg_fmt = _("Invalid merge strategy '%(strategy)s' for "
+                "parameter '%(param)s'.")
+
+
+class ConflictingMergeStrategyForParam(HeatException):
+    msg_fmt = _("Conflicting merge strategy '%(strategy)s' for "
+                "parameter '%(param)s' in file '%(env_file)s'.")
 
 
 class InvalidTemplateAttribute(HeatException):
@@ -152,6 +161,15 @@ class InvalidTemplateAttribute(HeatException):
 class InvalidTemplateReference(HeatException):
     msg_fmt = _('The specified reference "%(resource)s" (in %(key)s)'
                 ' is incorrect.')
+
+
+class TemplateOutputError(HeatException):
+    msg_fmt = _('Error in %(resource)s output %(attribute)s: %(message)s')
+
+
+class InvalidEncryptionKey(HeatException):
+    msg_fmt = _('Can not decrypt data with the auth_encryption_key'
+                ' in heat config.')
 
 
 class InvalidExternalResourceDependency(HeatException):
@@ -178,6 +196,11 @@ class PhysicalResourceNameAmbiguity(HeatException):
         "Multiple physical resources were found with name (%(name)s).")
 
 
+class PhysicalResourceIDAmbiguity(HeatException):
+    msg_fmt = _(
+        "Multiple resources were found with the physical ID (%(phys_id)s).")
+
+
 class InvalidTenant(HeatException):
     msg_fmt = _("Searching Tenant %(target)s "
                 "from Tenant %(actual)s forbidden.")
@@ -196,7 +219,7 @@ class HeatExceptionWithPath(HeatException):
         if path is not None:
             if isinstance(path, list):
                 self.path = path
-            elif isinstance(path, six.string_types):
+            elif isinstance(path, str):
                 self.path = [path]
 
         result_path = ''
@@ -215,18 +238,35 @@ class HeatExceptionWithPath(HeatException):
             message=self.error_message
         )
 
-    def error(self):
-        return self.error
-
-    def path(self):
-        return self.path
-
-    def error_message(self):
-        return self.error_message
-
 
 class StackValidationFailed(HeatExceptionWithPath):
-    pass
+    def __init__(self, error=None, path=None, message=None,
+                 resource=None):
+        if path is None:
+            path = []
+        elif isinstance(path, str):
+            path = [path]
+
+        if resource is not None and not path:
+            path = [resource.stack.t.get_section_name(
+                resource.stack.t.RESOURCES), resource.name]
+        if isinstance(error, Exception):
+            if isinstance(error, StackValidationFailed):
+                str_error = error.error
+                message = error.error_message
+                path = path + error.path
+                # This is a hack to avoid the py3 (chained exception)
+                # json serialization circular reference error from
+                # oslo.messaging.
+                self.args = error.args
+            else:
+                str_error = str(type(error).__name__)
+                message = str(error)
+        else:
+            str_error = error
+
+        super(StackValidationFailed, self).__init__(error=str_error, path=path,
+                                                    message=message)
 
 
 class InvalidSchemaError(HeatException):
@@ -268,11 +308,6 @@ class ClientNotAvailable(HeatException):
     msg_fmt = _("The client (%(client_name)s) is not available.")
 
 
-class WatchRuleNotFound(EntityNotFound):
-    """Keep this for AWS compatibility."""
-    msg_fmt = _("The Watch Rule (%(watch_name)s) could not be found.")
-
-
 class ResourceFailure(HeatExceptionWithPath):
     def __init__(self, exception_or_error, resource, action=None):
         self.resource = resource
@@ -293,12 +328,12 @@ class ResourceFailure(HeatExceptionWithPath):
                 path = exception_or_error.path
             else:
                 self.exc = exception_or_error
-                error = six.text_type(type(self.exc).__name__)
-                message = six.text_type(self.exc)
+                error = str(type(self.exc).__name__)
+                message = str(self.exc)
                 path = res_path
         else:
             self.exc = None
-            res_failed = 'Resource %s failed: ' % action.upper()
+            res_failed = 'Resource %s failed: ' % self.action.upper()
             if res_failed in exception_or_error:
                 (error, message, new_path) = self._from_status_reason(
                     exception_or_error)
@@ -380,7 +415,7 @@ class UpdateReplace(Exception):
     """Raised when resource update requires replacement."""
     def __init__(self, resource_name='Unknown'):
         msg = _("The Resource %s requires replacement.") % resource_name
-        super(Exception, self).__init__(six.text_type(msg))
+        super(Exception, self).__init__(str(msg))
 
 
 class ResourceUnknownStatus(HeatException):
@@ -405,7 +440,7 @@ class ResourceInError(HeatException):
 class UpdateInProgress(Exception):
     def __init__(self, resource_name='Unknown'):
         msg = _("The resource %s is already being updated.") % resource_name
-        super(Exception, self).__init__(six.text_type(msg))
+        super(Exception, self).__init__(str(msg))
 
 
 class HTTPExceptionDisguise(Exception):
@@ -413,6 +448,8 @@ class HTTPExceptionDisguise(Exception):
 
     They can be handled by the webob fault application in the wsgi pipeline.
     """
+
+    safe = True
 
     def __init__(self, exception):
         self.exc = exception
@@ -445,6 +482,10 @@ class RequestLimitExceeded(HeatException):
     msg_fmt = _('Request limit exceeded: %(message)s')
 
 
+class DownloadLimitExceeded(HeatException):
+    msg_fmt = _('Permissible download limit exceeded: %(message)s')
+
+
 class StackResourceLimitExceeded(HeatException):
     msg_fmt = _('Maximum resources per stack exceeded.')
 
@@ -452,6 +493,11 @@ class StackResourceLimitExceeded(HeatException):
 class ActionInProgress(HeatException):
     msg_fmt = _("Stack %(stack_name)s already has an action (%(action)s) "
                 "in progress.")
+
+
+class ActionNotComplete(HeatException):
+    msg_fmt = _("Stack %(stack_name)s has an action (%(action)s) "
+                "in progress or failed state.")
 
 
 class StopActionFailed(HeatException):
@@ -518,3 +564,11 @@ class InvalidServiceVersion(HeatException):
 class InvalidTemplateVersions(HeatException):
     msg_fmt = _('A template version alias %(version)s was added for a '
                 'template class that has no official YYYY-MM-DD version.')
+
+
+class UnableToAutoAllocateNetwork(HeatException):
+    msg_fmt = _('Unable to automatically allocate a network: %(message)s')
+
+
+class CircularDependencyException(HeatException):
+    msg_fmt = _("Circular Dependency Found: %(cycle)s")

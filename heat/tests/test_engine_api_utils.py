@@ -13,18 +13,20 @@
 
 import datetime as dt
 import json
+from unittest import mock
 import uuid
 
-import mock
 from oslo_utils import timeutils
-import six
 
 from heat.common import exception
 from heat.common import template_format
 from heat.common import timeutils as heat_timeutils
+from heat.db import api as db_api
+from heat.db import models
 from heat.engine import api
+from heat.engine.cfn import parameters as cfn_param
 from heat.engine import event
-from heat.engine import parameters
+from heat.engine import parent_rsrc
 from heat.engine import stack as parser
 from heat.engine import template
 from heat.objects import event as event_object
@@ -42,7 +44,8 @@ class FormatTest(common.HeatTestCase):
         tmpl = template.Template({
             'HeatTemplateFormatVersion': '2012-12-12',
             'Resources': {
-                'generic1': {'Type': 'GenericResourceType'},
+                'generic1': {'Type': 'GenericResourceType',
+                             'Properties': {'k1': 'v1'}},
                 'generic2': {
                     'Type': 'GenericResourceType',
                     'DependsOn': 'generic1'},
@@ -54,15 +57,19 @@ class FormatTest(common.HeatTestCase):
         self.stack = parser.Stack(self.context, 'test_stack',
                                   tmpl, stack_id=str(uuid.uuid4()))
 
-    def _dummy_event(self):
+    def _dummy_event(self, res_properties=None):
         resource = self.stack['generic1']
+        ev_uuid = 'abc123yc-9f88-404d-a85b-531529456xyz'
         ev = event.Event(self.context, self.stack, 'CREATE',
                          'COMPLETE', 'state changed',
                          'z3455xyc-9f88-404d-a85b-5315293e67de',
-                         resource.properties, resource.name, resource.type(),
-                         uuid='abc123yc-9f88-404d-a85b-531529456xyz')
-        event_id = ev.store()
-        return event_object.Event.get_by_id(self.context, event_id)
+                         resource._rsrc_prop_data_id,
+                         resource._stored_properties_data,
+                         resource.name, resource.type(),
+                         uuid=ev_uuid)
+        ev.store()
+        return event_object.Event.get_all_by_stack(
+            self.context, self.stack.id, filters={'uuid': ev_uuid})[0]
 
     def test_format_stack_resource(self):
         self.stack.created_time = datetime(2015, 8, 3, 17, 5, 1)
@@ -280,7 +287,8 @@ class FormatTest(common.HeatTestCase):
 
     def test_format_stack_resource_with_parent_stack(self):
         res = self.stack['generic1']
-        res.stack.parent_resource_name = 'foobar'
+        res.stack.defn._parent_info = parent_rsrc.ParentResourceProxy(
+            self.stack.context, 'foobar', None)
 
         formatted = api.format_stack_resource(res, False)
         self.assertEqual('foobar', formatted[rpc_api.RES_PARENT_RESOURCE])
@@ -311,6 +319,35 @@ class FormatTest(common.HeatTestCase):
             'stack_name': 'test_stack',
             'tenant': 'test_tenant_id'
         }, event_id_formatted)
+
+    def test_format_event_prop_data(self):
+        resource = self.stack['generic1']
+        resource._update_stored_properties()
+        resource.store()
+        event = self._dummy_event(
+            res_properties=resource._stored_properties_data)
+        formatted = api.format_event(event, self.stack.identifier(),
+                                     include_rsrc_prop_data=True)
+        self.assertEqual({'k1': 'v1'}, formatted[rpc_api.EVENT_RES_PROPERTIES])
+
+    def test_format_event_legacy_prop_data(self):
+        event = self._dummy_event(res_properties=None)
+        # legacy location
+        with db_api.context_manager.writer.using(self.stack.context):
+            db_obj = self.stack.context.session.query(
+                models.Event).filter_by(id=event.id).first()
+            db_obj.update({'resource_properties': {'legacy_k1': 'legacy_v1'}})
+            db_obj.save(self.stack.context.session)
+        event_legacy = event_object.Event.get_all_by_stack(self.context,
+                                                           self.stack.id)[0]
+        formatted = api.format_event(event_legacy, self.stack.identifier())
+        self.assertEqual({'legacy_k1': 'legacy_v1'},
+                         formatted[rpc_api.EVENT_RES_PROPERTIES])
+
+    def test_format_event_empty_prop_data(self):
+        event = self._dummy_event(res_properties=None)
+        formatted = api.format_event(event, self.stack.identifier())
+        self.assertEqual({}, formatted[rpc_api.EVENT_RES_PROPERTIES])
 
     @mock.patch.object(api, 'format_stack_resource')
     def test_format_stack_preview(self, mock_fmt_resource):
@@ -362,7 +399,7 @@ class FormatTest(common.HeatTestCase):
             'outputs': [],
             'template_description': 'No description',
             'timeout_mins': None,
-            'tags': None,
+            'tags': [],
             'parameters': {
                 'AWS::Region': 'ap-southeast-1',
                 'AWS::StackId': aws_id,
@@ -428,6 +465,7 @@ class FormatTest(common.HeatTestCase):
         stack.status = 'COMPLETE'
         stack['generic'].action = 'CREATE'
         stack['generic'].status = 'COMPLETE'
+        stack._update_all_resource_data(False, True)
         info = api.format_stack_outputs(stack.outputs, resolve_value=True)
         expected = [{'description': 'No description given',
                      'output_error': 'The Referenced Attribute (generic Bar) '
@@ -471,6 +509,39 @@ class FormatTest(common.HeatTestCase):
 
         self.assertEqual(expected, sorted(info, key=lambda k: k['output_key'],
                                           reverse=True))
+
+    def test_format_stack_params_csv(self):
+        tmpl = template.Template({
+            'heat_template_version': '2013-05-23',
+            'parameters': {
+                'foo': {
+                    'type': 'comma_delimited_list',
+                    'default': ['bar', 'baz']
+                },
+            }
+        })
+        stack = parser.Stack(utils.dummy_context(), 'test_stack',
+                             tmpl, stack_id=str(uuid.uuid4()))
+        info = api.format_stack(stack)
+
+        self.assertEqual('bar,baz', info['parameters']['foo'])
+
+    def test_format_stack_params_json(self):
+        tmpl = template.Template({
+            'heat_template_version': '2013-05-23',
+            'parameters': {
+                'foo': {
+                    'type': 'json',
+                    'default': {'bar': 'baz'}
+                },
+            }
+        })
+        stack = parser.Stack(utils.dummy_context(), 'test_stack',
+                             tmpl, stack_id=str(uuid.uuid4()))
+        info = api.format_stack(stack)
+
+        # Should be '{"bar": "baz"}' NOT "{'bar': 'baz'}"
+        self.assertEqual('{"bar": "baz"}', info['parameters']['foo'])
 
 
 class FormatValidateParameterTest(common.HeatTestCase):
@@ -1006,7 +1077,7 @@ class FormatValidateParameterTest(common.HeatTestCase):
         t = template_format.parse(self.template % self.param)
         tmpl = template.Template(t)
 
-        tmpl_params = parameters.Parameters(None, tmpl)
+        tmpl_params = cfn_param.CfnParameters(None, tmpl)
         tmpl_params.validate(validate_value=False)
         param = tmpl_params.params[self.param_name]
         param_formated = api.format_validate_parameter(param)
@@ -1028,6 +1099,7 @@ class FormatSoftwareConfigDeploymentTest(common.HeatTestCase):
             'options': {},
             'config': '#!/bin/bash\n'
         }
+        config.tenant = str(uuid.uuid4())
         return config
 
     def _dummy_software_deployment(self):
@@ -1055,6 +1127,17 @@ class FormatSoftwareConfigDeploymentTest(common.HeatTestCase):
         self.assertEqual({}, result['options'])
         self.assertEqual(heat_timeutils.isotime(self.now),
                          result['creation_time'])
+        self.assertNotIn('project', result)
+
+        result = api.format_software_config(config, include_project=True)
+        self.assertIsNotNone(result)
+        self.assertEqual([{'name': 'bar'}], result['inputs'])
+        self.assertEqual([{'name': 'result'}], result['outputs'])
+        self.assertEqual([{'name': 'result'}], result['outputs'])
+        self.assertEqual({}, result['options'])
+        self.assertEqual(heat_timeutils.isotime(self.now),
+                         result['creation_time'])
+        self.assertIn('project', result)
 
     def test_format_software_config_none(self):
         self.assertIsNone(api.format_software_config(None))
@@ -1104,7 +1187,7 @@ class TestExtractArgs(common.HeatTestCase):
     def test_timeout_extract_negative(self):
         p = {'timeout_mins': '-100'}
         error = self.assertRaises(ValueError, api.extract_args, p)
-        self.assertIn('Invalid timeout value', six.text_type(error))
+        self.assertIn('Invalid timeout value', str(error))
 
     def test_timeout_extract_not_present(self):
         args = api.extract_args({})
@@ -1118,7 +1201,7 @@ class TestExtractArgs(common.HeatTestCase):
     def test_invalid_adopt_stack_data(self):
         params = {'adopt_stack_data': json.dumps("foo")}
         exc = self.assertRaises(ValueError, api.extract_args, params)
-        self.assertIn('Invalid adopt data', six.text_type(exc))
+        self.assertIn('Invalid adopt data', str(exc))
 
     def test_adopt_stack_data_extract_not_present(self):
         args = api.extract_args({})
@@ -1166,12 +1249,12 @@ class TestExtractArgs(common.HeatTestCase):
     def test_tags_extract_not_map(self):
         p = {'tags': {"foo": "bar"}}
         exc = self.assertRaises(ValueError, api.extract_args, p)
-        self.assertIn('Invalid tags, not a list: ', six.text_type(exc))
+        self.assertIn('Invalid tags, not a list: ', str(exc))
 
     def test_tags_extract_not_string(self):
         p = {'tags': ["tag1", 2]}
         exc = self.assertRaises(ValueError, api.extract_args, p)
-        self.assertIn('Invalid tag, "2" is not a string', six.text_type(exc))
+        self.assertIn('Invalid tag, "2" is not a string', str(exc))
 
     def test_tags_extract_over_limit(self):
         p = {'tags': ["tag1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1179,13 +1262,13 @@ class TestExtractArgs(common.HeatTestCase):
         exc = self.assertRaises(ValueError, api.extract_args, p)
         self.assertIn('Invalid tag, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is longer '
-                      'than 80 characters', six.text_type(exc))
+                      'than 80 characters', str(exc))
 
     def test_tags_extract_comma(self):
         p = {'tags': ["tag1", 'tag2,']}
         exc = self.assertRaises(ValueError, api.extract_args, p)
         self.assertIn('Invalid tag, "tag2," contains a comma',
-                      six.text_type(exc))
+                      str(exc))
 
 
 class TranslateFilterTest(common.HeatTestCase):

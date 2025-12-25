@@ -13,23 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
 
 from heat.db import api as db_api
 from heat.engine import check_resource
+from heat.engine import stack as parser
+from heat.engine import template as templatem
 from heat.engine import worker
+from heat.objects import stack as stack_objects
 from heat.rpc import worker_client as wc
 from heat.tests import common
 from heat.tests import utils
 
 
 class WorkerServiceTest(common.HeatTestCase):
-    def setUp(self):
-        super(WorkerServiceTest, self).setUp()
-
     def test_make_sure_rpc_version(self):
         self.assertEqual(
-            '1.3',
+            '1.4',
             worker.WorkerService.RPC_API_VERSION,
             ('RPC version is changed, please update this test to new version '
              'and make sure additional test cases are added for RPC APIs '
@@ -177,6 +177,49 @@ class WorkerServiceTest(common.HeatTestCase):
         mock_ccr.assert_has_calls(calls, any_order=True)
         self.assertTrue(mock_wc.called)
 
+    @mock.patch.object(worker, '_stop_traversal')
+    def test_stop_traversal_stops_nested_stack(self, mock_st):
+        mock_tgm = mock.Mock()
+        ctx = utils.dummy_context()
+        tmpl = templatem.Template.create_empty_template()
+        stack1 = parser.Stack(ctx, 'stack1', tmpl,
+                              current_traversal='123')
+        stack1.store()
+        stack2 = parser.Stack(ctx, 'stack2', tmpl,
+                              owner_id=stack1.id, current_traversal='456')
+        stack2.store()
+        _worker = worker.WorkerService('host-1', 'topic-1', 'engine-001',
+                                       mock_tgm)
+        _worker.stop_traversal(stack1)
+        self.assertEqual(2, mock_st.call_count)
+        call1, call2 = mock_st.call_args_list
+        call_args1, call_args2 = call1[0][0], call2[0][0]
+        self.assertEqual('stack1', call_args1.name)
+        self.assertEqual('stack2', call_args2.name)
+
+    @mock.patch.object(worker, '_stop_traversal')
+    def test_stop_nested_traversal_stops_deeply_nested_stack(self, mock_st):
+        mock_tgm = mock.Mock()
+        ctx = utils.dummy_context()
+        tmpl = templatem.Template.create_empty_template()
+        stack1 = parser.Stack(ctx, 'stack1', tmpl,
+                              current_traversal='123')
+        stack1.store()
+        stack2 = parser.Stack(ctx, 'stack2', tmpl,
+                              owner_id=stack1.id, current_traversal='456')
+        stack2.store()
+        stack3 = parser.Stack(ctx, 'stack3', tmpl,
+                              owner_id=stack2.id, current_traversal='789')
+        stack3.store()
+        _worker = worker.WorkerService('host-1', 'topic-1', 'engine-001',
+                                       mock_tgm)
+        _worker.stop_traversal(stack2)
+        self.assertEqual(2, mock_st.call_count)
+        call1, call2 = mock_st.call_args_list
+        call_args1, call_args2 = call1[0][0], call2[0][0]
+        self.assertEqual('stack2', call_args1.name)
+        self.assertEqual('stack3', call_args2.name)
+
     @mock.patch.object(worker, '_cancel_workers')
     @mock.patch.object(worker.WorkerService, 'stop_traversal')
     def test_stop_all_workers_when_stack_in_progress(self, mock_st, mock_cw):
@@ -189,7 +232,7 @@ class WorkerServiceTest(common.HeatTestCase):
         stack.id = 'stack_id'
         stack.rollback = mock.MagicMock()
         _worker.stop_all_workers(stack)
-        mock_st.assert_called_once_with(stack)
+        mock_st.assert_not_called()
         mock_cw.assert_called_once_with(stack, mock_tgm, 'engine-001',
                                         _worker._rpc_client)
         self.assertFalse(stack.rollback.called)
@@ -220,3 +263,13 @@ class WorkerServiceTest(common.HeatTestCase):
         mock_cw.assert_called_with(stack, mock_tgm, 'engine-001',
                                    _worker._rpc_client)
         self.assertFalse(stack.rollback.called)
+
+    @mock.patch.object(stack_objects.Stack, 'select_and_update')
+    def test_update_current_traversal(self, mock_sau):
+        stack = mock.MagicMock()
+        stack.current_traversal = 'some-thing'
+        old_trvsl = stack.current_traversal
+        worker._update_current_traversal(stack)
+        self.assertNotEqual(old_trvsl, stack.current_traversal)
+        mock_sau.assert_called_once_with(mock.ANY, stack.id, mock.ANY,
+                                         exp_trvsl=old_trvsl)

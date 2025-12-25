@@ -12,13 +12,11 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 import uuid
 
-import mock
-import mox
 from oslo_serialization import jsonutils as json
 from oslo_utils import timeutils
-import six
 
 from heat.common import identifier
 from heat.common import template_format
@@ -27,6 +25,7 @@ from heat.engine.clients.os import swift as swift_plugin
 from heat.engine import environment
 from heat.engine import resource
 from heat.engine.resources.openstack.heat import wait_condition_handle as h_wch
+from heat.engine import scheduler
 from heat.engine import stack as parser
 from heat.engine import template as tmpl
 from heat.objects import resource as resource_objects
@@ -108,7 +107,7 @@ resources:
         type: OS::Heat::UpdateWaitConditionHandle
 '''
 
-test_template_bad_waithandle = '''
+test_template_waithandle_bad_type = '''
 heat_template_version: 2013-05-23
 resources:
     wait_condition:
@@ -120,6 +119,20 @@ resources:
         type: OS::Heat::RandomString
 '''
 
+test_template_waithandle_bad_reference = '''
+heat_template_version: pike
+resources:
+    wait_condition:
+        type: OS::Heat::WaitCondition
+        properties:
+            handle: wait_handel
+            timeout: 5
+    wait_handle:
+        type: OS::Heat::WaitConditionHandle
+        properties:
+            signal_transport: NO_SIGNAL
+'''
+
 
 class HeatWaitConditionTest(common.HeatTestCase):
 
@@ -129,8 +142,9 @@ class HeatWaitConditionTest(common.HeatTestCase):
 
     def create_stack(self, stack_id=None,
                      template=test_template_heat_waitcondition_count,
-                     params={},
+                     params=None,
                      stub=True, stub_status=True):
+        params = params or {}
         temp = template_format.parse(template)
         template = tmpl.Template(temp,
                                  env=environment.Environment(params))
@@ -149,27 +163,20 @@ class HeatWaitConditionTest(common.HeatTestCase):
         if stub:
             id = identifier.ResourceIdentifier('test_tenant', stack.name,
                                                stack.id, '', 'wait_handle')
-            self.m.StubOutWithMock(h_wch.HeatWaitConditionHandle,
-                                   'identifier')
-            h_wch.HeatWaitConditionHandle.identifier(
-            ).MultipleTimes().AndReturn(id)
+            self.patchobject(h_wch.HeatWaitConditionHandle, 'identifier',
+                             return_value=id)
 
         if stub_status:
-            self.m.StubOutWithMock(h_wch.HeatWaitConditionHandle,
-                                   'get_status')
+            self.patchobject(h_wch.HeatWaitConditionHandle, 'get_status')
 
         return stack
 
     def test_post_complete_to_handle(self):
         self.stack = self.create_stack()
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS'])
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS',
-                                                              'SUCCESS'])
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS',
-                                                              'SUCCESS',
-                                                              'SUCCESS'])
-
-        self.m.ReplayAll()
+        mock_get_status = h_wch.HeatWaitConditionHandle.get_status
+        mock_get_status.side_effect = ([['SUCCESS'],
+                                        ['SUCCESS', 'SUCCESS'],
+                                        ['SUCCESS', 'SUCCESS', 'SUCCESS']])
 
         self.stack.create()
 
@@ -180,18 +187,14 @@ class HeatWaitConditionTest(common.HeatTestCase):
         r = resource_objects.Resource.get_by_name_and_stack(
             self.stack.context, 'wait_handle', self.stack.id)
         self.assertEqual('wait_handle', r.name)
-        self.m.VerifyAll()
+        self.assertEqual(3, mock_get_status.call_count)
 
     def test_post_failed_to_handle(self):
         self.stack = self.create_stack()
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS'])
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS',
-                                                              'SUCCESS'])
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS',
-                                                              'SUCCESS',
-                                                              'FAILURE'])
-
-        self.m.ReplayAll()
+        mock_get_status = h_wch.HeatWaitConditionHandle.get_status
+        mock_get_status.side_effect = ([['SUCCESS'],
+                                        ['SUCCESS', 'SUCCESS'],
+                                        ['SUCCESS', 'SUCCESS', 'FAILURE']])
 
         self.stack.create()
 
@@ -204,26 +207,31 @@ class HeatWaitConditionTest(common.HeatTestCase):
         r = resource_objects.Resource.get_by_name_and_stack(
             self.stack.context, 'wait_handle', self.stack.id)
         self.assertEqual('wait_handle', r.name)
-        self.m.VerifyAll()
+        self.assertEqual(3, mock_get_status.call_count)
 
-    def test_bad_wait_handle(self):
-        self.stack = self.create_stack(
-            template=test_template_bad_waithandle)
-        self.m.ReplayAll()
+    def _test_wait_handle_invalid(self, tmpl, handle_name):
+        self.stack = self.create_stack(template=tmpl)
         self.stack.create()
         rsrc = self.stack['wait_condition']
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
         reason = rsrc.status_reason
-        self.assertEqual(reason, 'ValueError: resources.wait_condition: '
-                                 'wait_handle is not a valid wait condition '
-                                 'handle.')
+        error_msg = ('ValueError: resources.wait_condition: '
+                     '%s is not a valid wait condition handle.') % handle_name
+        self.assertEqual(reason, error_msg)
+
+    def test_wait_handle_bad_type(self):
+        self._test_wait_handle_invalid(test_template_waithandle_bad_type,
+                                       'wait_handle')
+
+    def test_wait_handle_bad_reference(self):
+        self._test_wait_handle_invalid(
+            test_template_waithandle_bad_reference, 'wait_handel')
 
     def test_timeout(self):
         self.stack = self.create_stack()
 
         # Avoid the stack create exercising the timeout code at the same time
-        self.m.StubOutWithMock(self.stack, 'timeout_secs')
-        self.stack.timeout_secs().MultipleTimes().AndReturn(None)
+        self.stack.timeout_secs = mock.Mock(return_value=None)
 
         now = timeutils.utcnow()
         periods = [0, 0.001, 0.1, 4.1, 5.1]
@@ -235,8 +243,6 @@ class HeatWaitConditionTest(common.HeatTestCase):
         h_wch.HeatWaitConditionHandle.get_status(
         ).MultipleTimes().AndReturn([])
 
-        self.m.ReplayAll()
-
         self.stack.create()
 
         rsrc = self.stack['wait_condition']
@@ -245,28 +251,26 @@ class HeatWaitConditionTest(common.HeatTestCase):
         reason = rsrc.status_reason
         self.assertTrue(reason.startswith('WaitConditionTimeout:'))
 
-        self.m.VerifyAll()
-
     def _create_heat_wc_and_handle(self):
         self.stack = self.create_stack(
             template=test_template_heat_waitcondition)
-        h_wch.HeatWaitConditionHandle.get_status().AndReturn(['SUCCESS'])
+        mock_get_status = h_wch.HeatWaitConditionHandle.get_status
+        mock_get_status.side_effect = ([['SUCCESS']])
 
-        self.m.ReplayAll()
         self.stack.create()
 
         rsrc = self.stack['wait_condition']
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
         wc_att = rsrc.FnGetAtt('data')
-        self.assertEqual(six.text_type({}), wc_att)
+        self.assertEqual(str({}), wc_att)
 
         handle = self.stack['wait_handle']
         self.assertEqual((handle.CREATE, handle.COMPLETE), handle.state)
-        return (rsrc, handle)
+        return (rsrc, handle, mock_get_status)
 
     def test_data(self):
-        rsrc, handle = self._create_heat_wc_and_handle()
+        rsrc, handle, mock_get_status = self._create_heat_wc_and_handle()
         test_metadata = {'data': 'foo', 'reason': 'bar',
                          'status': 'SUCCESS', 'id': '123'}
         ret = handle.handle_signal(details=test_metadata)
@@ -278,13 +282,13 @@ class HeatWaitConditionTest(common.HeatTestCase):
                          'status': 'SUCCESS', 'id': '456'}
         ret = handle.handle_signal(details=test_metadata)
         wc_att = rsrc.FnGetAtt('data')
-        self.assertEqual(json.loads(u'{"123": "foo", "456": "dog"}'),
+        self.assertEqual(json.loads('{"123": "foo", "456": "dog"}'),
                          json.loads(wc_att))
         self.assertEqual('status:SUCCESS reason:cat', ret)
-        self.m.VerifyAll()
+        mock_get_status.assert_called_once()
 
     def test_data_noid(self):
-        rsrc, handle = self._create_heat_wc_and_handle()
+        rsrc, handle, mock_get_status = self._create_heat_wc_and_handle()
         test_metadata = {'data': 'foo', 'reason': 'bar',
                          'status': 'SUCCESS'}
         ret = handle.handle_signal(details=test_metadata)
@@ -296,13 +300,13 @@ class HeatWaitConditionTest(common.HeatTestCase):
                          'status': 'SUCCESS'}
         ret = handle.handle_signal(details=test_metadata)
         wc_att = rsrc.FnGetAtt('data')
-        self.assertEqual(json.loads(u'{"1": "foo", "2": "dog"}'),
+        self.assertEqual(json.loads('{"1": "foo", "2": "dog"}'),
                          json.loads(wc_att))
         self.assertEqual('status:SUCCESS reason:cat', ret)
-        self.m.VerifyAll()
+        mock_get_status.assert_called_once()
 
     def test_data_nodata(self):
-        rsrc, handle = self._create_heat_wc_and_handle()
+        rsrc, handle, mock_get_status = self._create_heat_wc_and_handle()
         ret = handle.handle_signal()
         expected = 'status:SUCCESS reason:Signal 1 received'
         self.assertEqual(expected, ret)
@@ -311,12 +315,12 @@ class HeatWaitConditionTest(common.HeatTestCase):
 
         handle.handle_signal()
         wc_att = rsrc.FnGetAtt('data')
-        self.assertEqual(json.loads(u'{"1": null, "2": null}'),
+        self.assertEqual(json.loads('{"1": null, "2": null}'),
                          json.loads(wc_att))
-        self.m.VerifyAll()
+        mock_get_status.assert_called_once()
 
     def test_data_partial_complete(self):
-        rsrc, handle = self._create_heat_wc_and_handle()
+        rsrc, handle, mock_get_status = self._create_heat_wc_and_handle()
         test_metadata = {'status': 'SUCCESS'}
         ret = handle.handle_signal(details=test_metadata)
         expected = 'status:SUCCESS reason:Signal 1 received'
@@ -329,15 +333,14 @@ class HeatWaitConditionTest(common.HeatTestCase):
         expected = 'status:SUCCESS reason:Signal 2 received'
         self.assertEqual(expected, ret)
         wc_att = rsrc.FnGetAtt('data')
-        self.assertEqual(json.loads(u'{"1": null, "2": null}'),
+        self.assertEqual(json.loads('{"1": null, "2": null}'),
                          json.loads(wc_att))
-        self.m.VerifyAll()
+        mock_get_status.assert_called_once()
 
     def _create_heat_handle(self,
                             template=test_template_heat_waithandle_token):
         self.stack = self.create_stack(template=template, stub_status=False)
 
-        self.m.ReplayAll()
         self.stack.create()
 
         handle = self.stack['wait_handle']
@@ -356,7 +359,6 @@ class HeatWaitConditionTest(common.HeatTestCase):
         md_expected = {'1': {'data': None, 'reason': 'Signal 1 received',
                        'status': 'SUCCESS'}}
         self.assertEqual(md_expected, handle.metadata_get())
-        self.m.VerifyAll()
 
     def test_get_status_partial_complete(self):
         handle = self._create_heat_handle()
@@ -369,8 +371,6 @@ class HeatWaitConditionTest(common.HeatTestCase):
                        'status': 'SUCCESS'}}
         self.assertEqual(md_expected, handle.metadata_get())
 
-        self.m.VerifyAll()
-
     def test_get_status_failure(self):
         handle = self._create_heat_handle()
         test_metadata = {'status': 'FAILURE'}
@@ -382,33 +382,24 @@ class HeatWaitConditionTest(common.HeatTestCase):
                        'status': 'FAILURE'}}
         self.assertEqual(md_expected, handle.metadata_get())
 
-        self.m.VerifyAll()
-
     def test_getatt_token(self):
         handle = self._create_heat_handle()
         self.assertEqual('adomainusertoken', handle.FnGetAtt('token'))
-        self.m.VerifyAll()
 
     def test_getatt_endpoint(self):
-        self.m.StubOutWithMock(heat_plugin.HeatClientPlugin, 'get_heat_url')
-        heat_plugin.HeatClientPlugin.get_heat_url().AndReturn(
-            'foo/%s' % self.tenant_id)
-        self.m.ReplayAll()
+        self.patchobject(heat_plugin.HeatClientPlugin, 'get_heat_url',
+                         return_value='foo/%s' % self.tenant_id)
         handle = self._create_heat_handle()
         expected = ('foo/aprojectid/stacks/test_stack/%s/resources/'
                     'wait_handle/signal'
                     % self.stack_id)
         self.assertEqual(expected, handle.FnGetAtt('endpoint'))
-        self.m.VerifyAll()
 
     def test_getatt_curl_cli(self):
-        self.m.StubOutWithMock(heat_plugin.HeatClientPlugin, 'get_heat_url')
-        heat_plugin.HeatClientPlugin.get_heat_url().AndReturn(
-            'foo/%s' % self.tenant_id)
-        self.m.StubOutWithMock(
-            heat_plugin.HeatClientPlugin, 'get_insecure_option')
-        heat_plugin.HeatClientPlugin.get_insecure_option().AndReturn(False)
-        self.m.ReplayAll()
+        self.patchobject(heat_plugin.HeatClientPlugin, 'get_heat_url',
+                         return_value='foo/%s' % self.tenant_id)
+        self.patchobject(heat_plugin.HeatClientPlugin, 'get_insecure_option',
+                         return_value=False)
         handle = self._create_heat_handle()
         expected = ("curl -i -X POST -H 'X-Auth-Token: adomainusertoken' "
                     "-H 'Content-Type: application/json' "
@@ -416,16 +407,12 @@ class HeatWaitConditionTest(common.HeatTestCase):
                     "foo/aprojectid/stacks/test_stack/%s/resources/wait_handle"
                     "/signal" % self.stack_id)
         self.assertEqual(expected, handle.FnGetAtt('curl_cli'))
-        self.m.VerifyAll()
 
     def test_getatt_curl_cli_insecure_true(self):
-        self.m.StubOutWithMock(heat_plugin.HeatClientPlugin, 'get_heat_url')
-        heat_plugin.HeatClientPlugin.get_heat_url().AndReturn(
-            'foo/%s' % self.tenant_id)
-        self.m.StubOutWithMock(
-            heat_plugin.HeatClientPlugin, 'get_insecure_option')
-        heat_plugin.HeatClientPlugin.get_insecure_option().AndReturn(True)
-        self.m.ReplayAll()
+        self.patchobject(heat_plugin.HeatClientPlugin, 'get_heat_url',
+                         return_value='foo/%s' % self.tenant_id)
+        self.patchobject(heat_plugin.HeatClientPlugin, 'get_insecure_option',
+                         return_value=True)
         handle = self._create_heat_handle()
         expected = (
             "curl --insecure -i -X POST -H 'X-Auth-Token: adomainusertoken' "
@@ -434,7 +421,6 @@ class HeatWaitConditionTest(common.HeatTestCase):
             "foo/aprojectid/stacks/test_stack/%s/resources/wait_handle"
             "/signal" % self.stack_id)
         self.assertEqual(expected, handle.FnGetAtt('curl_cli'))
-        self.m.VerifyAll()
 
     def test_getatt_signal_heat(self):
         handle = self._create_heat_handle(
@@ -451,9 +437,6 @@ class HeatWaitConditionTest(common.HeatTestCase):
         self.assertIn('domain_id', signal)
 
     def test_getatt_signal_swift(self):
-        self.m.StubOutWithMock(swift_plugin.SwiftClientPlugin, 'get_temp_url')
-        self.m.StubOutWithMock(swift_plugin.SwiftClientPlugin, 'client')
-
         class mock_swift(object):
             @staticmethod
             def put_container(container, **kwargs):
@@ -463,15 +446,11 @@ class HeatWaitConditionTest(common.HeatTestCase):
             def put_object(container, object, contents, **kwargs):
                 pass
 
-        swift_plugin.SwiftClientPlugin.client().AndReturn(mock_swift)
-        swift_plugin.SwiftClientPlugin.client().AndReturn(mock_swift)
-        swift_plugin.SwiftClientPlugin.client().AndReturn(mock_swift)
-        swift_plugin.SwiftClientPlugin.get_temp_url(mox.IgnoreArg(),
-                                                    mox.IgnoreArg(),
-                                                    mox.IgnoreArg()
-                                                    ).AndReturn('foo')
-
-        self.m.ReplayAll()
+        mock_tempurl = self.patchobject(swift_plugin.SwiftClientPlugin,
+                                        'get_temp_url',
+                                        return_value='foo')
+        self.patchobject(swift_plugin.SwiftClientPlugin, 'client',
+                         return_value=mock_swift)
 
         handle = self._create_heat_handle(
             template=test_template_heat_waithandle_swift)
@@ -480,6 +459,7 @@ class HeatWaitConditionTest(common.HeatTestCase):
         self.assertIsNone(handle.FnGetAtt('curl_cli'))
         signal = json.loads(handle.FnGetAtt('signal'))
         self.assertIn('alarm_url', signal)
+        mock_tempurl.assert_called_once()
 
     @mock.patch('zaqarclient.queues.v2.queues.Queue.signed_url')
     def test_getatt_signal_zaqar(self, mock_signed_url):
@@ -507,10 +487,11 @@ class HeatWaitConditionTest(common.HeatTestCase):
     def test_create_update_updatehandle(self):
         self.stack = self.create_stack(
             template=test_template_update_waithandle, stub_status=False)
-        self.m.ReplayAll()
         self.stack.create()
 
         handle = self.stack['update_wait_handle']
         self.assertEqual((handle.CREATE, handle.COMPLETE), handle.state)
+
         self.assertRaises(
-            resource.UpdateReplace, handle.update, None, None)
+            resource.UpdateReplace,
+            scheduler.TaskRunner(handle.update, handle.t))

@@ -11,26 +11,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import functools
 import sys
+import time
 import types
 
-import eventlet
 from oslo_log import log as logging
 from oslo_utils import encodeutils
 from oslo_utils import excutils
-import six
-from six import reraise as raise_
 
 from heat.common.i18n import _
-from heat.common.i18n import _LI
-from heat.common.i18n import repr_wrapper
 from heat.common import timeutils
 
 LOG = logging.getLogger(__name__)
 
 
-# Whether TaskRunner._sleep actually does an eventlet sleep when called.
+# Whether TaskRunner._sleep actually does a sleep when called.
 ENABLE_SLEEP = True
 
 
@@ -43,13 +38,12 @@ def task_description(task):
     if name is not None and isinstance(task, (types.MethodType,
                                               types.FunctionType)):
         if getattr(task, '__self__', None) is not None:
-            return '%s from %s' % (six.text_type(name), task.__self__)
+            return '%s from %s' % (str(name), task.__self__)
         else:
-            return six.text_type(name)
+            return str(name)
     return encodeutils.safe_decode(repr(task))
 
 
-@functools.total_ordering
 class Timeout(BaseException):
     """Raised when task has exceeded its allotted (wallclock) running time.
 
@@ -61,7 +55,7 @@ class Timeout(BaseException):
 
     def __init__(self, task_runner, timeout):
         """Initialise with the TaskRunner and a timeout period in seconds."""
-        message = _('%s Timed out') % six.text_type(task_runner)
+        message = _('%s Timed out') % str(task_runner)
         super(Timeout, self).__init__(message)
 
         self._duration = timeutils.Duration(timeout)
@@ -80,14 +74,11 @@ class Timeout(BaseException):
             generator.close()
             return False
 
-    def __eq__(self, other):
-        if not isinstance(other, Timeout):
-            return NotImplemented
-        return not (self < other or other < self)
+    def earlier_than(self, other):
+        if other is None:
+            return True
 
-    def __lt__(self, other):
-        if not isinstance(other, Timeout):
-            return NotImplemented
+        assert isinstance(other, Timeout), "Invalid type for Timeout compare"
         return self._duration.endtime() < other._duration.endtime()
 
 
@@ -98,7 +89,6 @@ class TimedCancel(Timeout):
         return False
 
 
-@six.python_2_unicode_compatible
 class ExceptionGroup(Exception):
     """Container for multiple exceptions.
 
@@ -118,7 +108,6 @@ class ExceptionGroup(Exception):
         return str([str(ex) for ex in self.exceptions])
 
 
-@six.python_2_unicode_compatible
 class TaskRunner(object):
     """Wrapper for a resumable task (co-routine)."""
 
@@ -149,13 +138,13 @@ class TaskRunner(object):
     def __str__(self):
         """Return a human-readable string representation of the task."""
         text = 'Task %s' % self.name
-        return six.text_type(text)
+        return str(text)
 
     def _sleep(self, wait_time):
         """Sleep for the specified number of seconds."""
         if ENABLE_SLEEP and wait_time is not None:
-            LOG.debug('%s sleeping' % six.text_type(self))
-            eventlet.sleep(wait_time)
+            LOG.debug('%s sleeping', str(self))
+            time.sleep(wait_time)
 
     def __call__(self, wait_time=1, timeout=None, progress_callback=None):
         """Start and run the task to completion.
@@ -181,7 +170,7 @@ class TaskRunner(object):
         assert self._runner is None, "Task already started"
         assert not self._done, "Task already cancelled"
 
-        LOG.debug('%s starting' % six.text_type(self))
+        LOG.debug('%s starting', str(self))
 
         if timeout is not None:
             self._timeout = Timeout(self, timeout)
@@ -193,7 +182,7 @@ class TaskRunner(object):
         else:
             self._runner = False
             self._done = True
-            LOG.debug('%s done (not resumable)' % six.text_type(self))
+            LOG.debug('%s done (not resumable)', str(self))
 
     def step(self):
         """Run another step of the task.
@@ -208,20 +197,20 @@ class TaskRunner(object):
                 return False
 
             if self._timeout is not None and self._timeout.expired():
-                LOG.info(_LI('%s timed out'), six.text_type(self))
+                LOG.info('%s timed out', self)
                 self._done = True
 
                 self._timeout.trigger(self._runner)
             else:
-                LOG.debug('%s running' % six.text_type(self))
+                LOG.debug('%s running', str(self))
 
                 try:
                     poll_period = next(self._runner)
                 except StopIteration:
                     self._done = True
-                    LOG.debug('%s complete' % six.text_type(self))
+                    LOG.debug('%s complete', str(self))
                 else:
-                    if isinstance(poll_period, six.integer_types):
+                    if isinstance(poll_period, int):
                         self._poll_period = max(poll_period, 1)
                     else:
                         self._poll_period = 1
@@ -247,7 +236,7 @@ class TaskRunner(object):
         else:
             if timeout is not None:
                 new_timeout = Timeout(self, timeout)
-                if self._timeout is None or new_timeout < self._timeout:
+                if new_timeout.earlier_than(self._timeout):
                     self._timeout = new_timeout
 
         done = self.step() if resuming else self.done()
@@ -277,13 +266,13 @@ class TaskRunner(object):
             return
 
         if not self.started() or grace_period is None:
-            LOG.debug('%s cancelled' % six.text_type(self))
+            LOG.debug('%s cancelled', str(self))
             self._done = True
             if self.started():
                 self._runner.close()
         else:
             timeout = TimedCancel(self, grace_period)
-            if self._timeout is None or timeout < self._timeout:
+            if timeout.earlier_than(self._timeout):
                 self._timeout = timeout
 
     def started(self):
@@ -303,76 +292,6 @@ class TaskRunner(object):
         return self.__nonzero__()
 
 
-def wrappertask(task):
-    """Decorator for a task that needs to drive a subtask.
-
-    This is essentially a replacement for the Python 3-only "yield from"
-    keyword (PEP 380), using the "yield" keyword that is supported in
-    Python 2. For example::
-
-        @wrappertask
-        def parent_task(self):
-            self.setup()
-
-            yield self.child_task()
-
-            self.cleanup()
-    """
-
-    @six.wraps(task)
-    def wrapper(*args, **kwargs):
-        parent = task(*args, **kwargs)
-
-        try:
-            subtask = next(parent)
-        except StopIteration:
-            return
-
-        while True:
-            try:
-                if isinstance(subtask, types.GeneratorType):
-                    subtask_running = True
-                    try:
-                        step = next(subtask)
-                    except StopIteration:
-                        subtask_running = False
-
-                    while subtask_running:
-                        try:
-                            yield step
-                        except GeneratorExit:
-                            subtask.close()
-                            raise
-                        except:  # noqa
-                            try:
-                                step = subtask.throw(*sys.exc_info())
-                            except StopIteration:
-                                subtask_running = False
-                        else:
-                            try:
-                                step = next(subtask)
-                            except StopIteration:
-                                subtask_running = False
-                else:
-                    yield subtask
-            except GeneratorExit:
-                parent.close()
-                raise
-            except:  # noqa
-                try:
-                    subtask = parent.throw(*sys.exc_info())
-                except StopIteration:
-                    return
-            else:
-                try:
-                    subtask = next(parent)
-                except StopIteration:
-                    return
-
-    return wrapper
-
-
-@repr_wrapper
 class DependencyTaskGroup(object):
     """Task which manages group of subtasks that have ordering dependencies."""
 
@@ -408,7 +327,7 @@ class DependencyTaskGroup(object):
         if name is None:
             name = '(%s) %s' % (getattr(task, '__name__',
                                         task_description(task)),
-                                six.text_type(dependencies))
+                                str(dependencies))
         self.name = name
 
     def __repr__(self):
@@ -421,47 +340,45 @@ class DependencyTaskGroup(object):
         raised_exceptions = []
         thrown_exceptions = []
 
-        while any(six.itervalues(self._runners)):
-            try:
-                for k, r in self._ready():
-                    r.start()
-                    if not r:
-                        del self._graph[k]
+        try:
+            while any(self._runners.values()):
+                try:
+                    for k, r in self._ready():
+                        r.start()
+                        if not r:
+                            del self._graph[k]
 
-                if self._graph:
-                    try:
-                        yield
-                    except Exception:
-                        thrown_exceptions.append(sys.exc_info())
-                        raise
+                    if self._graph:
+                        try:
+                            yield
+                        except Exception as err:
+                            thrown_exceptions.append(err)
+                            raise
 
-                for k, r in self._running():
-                    if r.step():
-                        del self._graph[k]
-            except Exception:
-                exc_info = sys.exc_info()
+                    for k, r in self._running():
+                        if r.step():
+                            del self._graph[k]
+                except Exception as err:
+                    if self.aggregate_exceptions:
+                        self._cancel_recursively(k, r)
+                    else:
+                        self.cancel_all(grace_period=self.error_wait_time)
+                    raised_exceptions.append(err)
+                except:  # noqa
+                    with excutils.save_and_reraise_exception():
+                        self.cancel_all()
+
+            if raised_exceptions:
                 if self.aggregate_exceptions:
-                    self._cancel_recursively(k, r)
-                else:
-                    self.cancel_all(grace_period=self.error_wait_time)
-                raised_exceptions.append(exc_info)
-                del exc_info
-            except:  # noqa
-                with excutils.save_and_reraise_exception():
-                    self.cancel_all()
-
-        if raised_exceptions:
-            try:
-                if self.aggregate_exceptions:
-                    raise ExceptionGroup(v for t, v, tb in raised_exceptions)
+                    raise ExceptionGroup(err for err in raised_exceptions)
                 else:
                     if thrown_exceptions:
-                        raise_(*thrown_exceptions[-1])
+                        raise thrown_exceptions[-1]
                     else:
-                        raise_(*raised_exceptions[0])
-            finally:
-                del raised_exceptions
-                del thrown_exceptions
+                        raise raised_exceptions[0]
+        finally:
+            del raised_exceptions
+            del thrown_exceptions
 
     def cancel_all(self, grace_period=None):
         if callable(grace_period):
@@ -470,15 +387,21 @@ class DependencyTaskGroup(object):
             def get_grace_period(key):
                 return grace_period
 
-        for k, r in six.iteritems(self._runners):
-            gp = get_grace_period(k)
+        for k, r in self._runners.items():
+            if not r.started() or r.done():
+                gp = None
+            else:
+                gp = get_grace_period(k)
             try:
                 r.cancel(grace_period=gp)
             except Exception as ex:
-                LOG.debug('Exception cancelling task: %s' % six.text_type(ex))
+                LOG.debug('Exception cancelling task: %s', str(ex))
 
     def _cancel_recursively(self, key, runner):
-        runner.cancel()
+        try:
+            runner.cancel()
+        except Exception as ex:
+            LOG.debug('Exception cancelling task: %s', str(ex))
         node = self._graph[key]
         for dependent_node in node.required_by():
             node_runner = self._runners[dependent_node]
@@ -508,4 +431,4 @@ class DependencyTaskGroup(object):
         def running(k_r):
             return k_r[0] in self._graph and k_r[1].started()
 
-        return six.moves.filter(running, six.iteritems(self._runners))
+        return filter(running, self._runners.items())

@@ -62,8 +62,7 @@ Adding support for GMRs to new executable
 
 Adding support for a *GMR* to a given executable is fairly easy.
 
-First import the module (currently residing in oslo-incubator), as well as the
-Heat version module:
+First import the module, as well as the Heat version module:
 
 .. code-block:: python
 
@@ -90,5 +89,4 @@ Extending the GMR
 
 As mentioned above, additional sections can be added to the GMR for a
 particular executable. For more information, see the documentation about
-``oslo.reports``:
-`oslo.reports <http://docs.openstack.org/developer/oslo.reports/>`_
+:oslo.reports-doc:`oslo.reports <>`.

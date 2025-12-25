@@ -13,13 +13,9 @@
 
 from oslo_config import cfg
 from oslo_log import log as logging
-import oslo_messaging as messaging
-import osprofiler.profiler
-import osprofiler.web
+import osprofiler.initializer
 
 from heat.common import context
-from heat.common.i18n import _LW
-from heat.common import messaging as rpc_messaging
 
 cfg.CONF.import_opt('enabled', 'heat.common.config', group='profiler')
 
@@ -28,19 +24,20 @@ LOG = logging.getLogger(__name__)
 
 def setup(binary, host):
     if cfg.CONF.profiler.enabled:
-        _notifier = osprofiler.notifier.create(
-            "Messaging", messaging, context.get_admin_context().to_dict(),
-            rpc_messaging.TRANSPORT, "heat", binary, host)
-        osprofiler.notifier.set(_notifier)
-        osprofiler.web.enable(cfg.CONF.profiler.hmac_keys)
-        LOG.warning(_LW("OSProfiler is enabled.\nIt means that person who "
-                        "knows any of hmac_keys that are specified in "
-                        "/etc/heat/heat.conf can trace his requests. \n"
-                        "In real life only operator can read this file so "
-                        "there is no security issue. Note that even if person "
-                        "can trigger profiler, only admin user can retrieve "
-                        "trace information.\n"
-                        "To disable OSprofiler set in heat.conf:\n"
-                        "[profiler]\nenabled=false"))
+        osprofiler.initializer.init_from_conf(
+            conf=cfg.CONF,
+            context=context.get_admin_context().to_dict(),
+            project="heat",
+            service=binary,
+            host=host)
+        LOG.warning("OSProfiler is enabled.\nIt means that person who "
+                    "knows any of hmac_keys that are specified in "
+                    "/etc/heat/heat.conf can trace his requests. \n"
+                    "In real life only operator can read this file so "
+                    "there is no security issue. Note that even if person "
+                    "can trigger profiler, only admin user can retrieve "
+                    "trace information.\n"
+                    "To disable OSprofiler set in heat.conf:\n"
+                    "[profiler]\nenabled=false")
     else:
         osprofiler.web.disable()

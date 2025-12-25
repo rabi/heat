@@ -14,14 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
+
 from novaclient import client as base_client
 from novaclient import exceptions as nova_exceptions
 import requests
-from six.moves.urllib import parse as urlparse
+from urllib import parse as urlparse
 
 from heat.tests import fakes
-
 
 NOVA_API_VERSION = "2.1"
 
@@ -39,24 +39,24 @@ def fake_exception(status_code=404, message=None, details=None):
 class FakeClient(fakes.FakeClient, Client):
 
     def __init__(self, *args, **kwargs):
-        super(FakeClient, self).__init__('username', 'password', 'project_id',
-                                         'auth_url', direct_use=False)
-        self.client = FakeHTTPClient(**kwargs)
+        super(FakeClient, self).__init__(direct_use=False)
+        self.client = FakeSessionClient(session=mock.Mock(), **kwargs)
 
 
-class FakeHTTPClient(base_client.HTTPClient):
+class FakeSessionClient(base_client.SessionClient):
 
-    def __init__(self, **kwargs):
-        super(FakeHTTPClient, self).__init__('username', 'password',
-                                             'project_id', 'auth_url')
+    def __init__(self, *args, **kwargs):
+        super(FakeSessionClient, self).__init__(*args, **kwargs)
         self.callstack = []
 
-    def _cs_request(self, url, method, **kwargs):
+    def request(self, url, method, **kwargs):
         # Check that certain things are called correctly
         if method in ['GET', 'DELETE']:
-            assert 'body' not in kwargs
+            if 'body' in kwargs:
+                raise AssertionError('Request body in %s' % method)
         elif method == 'PUT':
-            assert 'body' in kwargs
+            if 'body' not in kwargs:
+                raise AssertionError('No request body in %s' % method)
 
         # Call the method
         args = urlparse.parse_qsl(urlparse.urlparse(url)[4])
@@ -89,6 +89,9 @@ class FakeHTTPClient(base_client.HTTPClient):
     # Servers
     #
     def get_servers_detail(self, **kw):
+        if kw.get('marker') == '56789':
+            return (200, {"servers": []})
+
         return (
             200,
             {"servers": [{"id": "1234",
@@ -110,6 +113,8 @@ class FakeHTTPClient(base_client.HTTPClient):
                           "accessIPv6": "",
                           "metadata": {"Server Label": "Web Head 1",
                                        "Image Version": "2.1"}},
+
+                         # 1
                          {"id": "5678",
                           "name": "sample-server2",
                           "OS-EXT-AZ:availability_zone": "nova2",
@@ -134,6 +139,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                                                      "OS-EXT-IPS-MAC:mac_addr":
                                                      "fa:16:3e:8c:44:cc"}]},
                           "metadata": {}},
+                         # 2
                          {"id": "9101",
                           "name": "hard-reboot",
                           "OS-EXT-SRV-ATTR:instance_name":
@@ -151,6 +157,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                                         "private": [{"version": 4,
                                                      "addr": "10.13.12.13"}]},
                           "metadata": {"Server Label": "DB 1"}},
+                         # 3
                          {"id": "9102",
                           "name": "server-with-no-ip",
                           "OS-EXT-SRV-ATTR:instance_name":
@@ -163,6 +170,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                           "accessIPv6": "",
                           "addresses": {"empty_net": []},
                           "metadata": {"Server Label": "DB 1"}},
+                         # 4
                          {"id": "9999",
                           "name": "sample-server3",
                           "OS-EXT-SRV-ATTR:instance_name":
@@ -183,10 +191,79 @@ class FakeHTTPClient(base_client.HTTPClient):
                           "os-extended-volumes:volumes_attached":
                               [{"id":
                                     "66359157-dace-43ab-a7ed-a7e7cd7be59d"}]},
+                         # 5
                          {"id": 56789,
                           "name": "server-with-metadata",
                           "OS-EXT-SRV-ATTR:instance_name":
                           "sample-server2",
+                          "image": {"id": 2, "name": "sample image"},
+                          "flavor": {"id": 1, "name": "256 MB Server"},
+                          "hostId": "9e107d9d372bb6826bd81d3542a419d6",
+                          "status": "ACTIVE",
+                          "accessIPv4": "192.0.2.0",
+                          "accessIPv6": "::babe:4317:0A83",
+                          "addresses": {"public": [{"version": 4,
+                                                    "addr": "4.5.6.7"},
+                                                   {"version": 4,
+                                                    "addr": "5.6.9.8"}],
+                                        "private": [{"version": 4,
+                                                     "addr": "10.13.12.13"}]},
+                          "metadata": {'test': '123', 'this': 'that'}},
+                         # 6
+                         {"id": "WikiDatabase",
+                          "name": "server-with-metadata",
+                          "OS-EXT-STS:task_state": None,
+                          "image": {"id": 2, "name": "sample image"},
+                          "flavor": {"id": 1, "name": "256 MB Server"},
+                          "hostId": "9e107d9d372bb6826bd81d3542a419d6",
+                          "status": "ACTIVE",
+                          "accessIPv4": "192.0.2.0",
+                          "accessIPv6": "::babe:4317:0A83",
+                          "addresses": {"public": [{"version": 4,
+                                                    "addr": "4.5.6.7"},
+                                                   {"version": 4,
+                                                    "addr": "5.6.9.8"}],
+                                        "private": [{"version": 4,
+                                                     "addr": "10.13.12.13"}]},
+                          "metadata": {'test': '123', 'this': 'that'}},
+                         # 7
+                         {"id": "InstanceInResize",
+                          "name": "server-with-metadata",
+                          "OS-EXT-STS:task_state": 'resize_finish',
+                          "image": {"id": 2, "name": "sample image"},
+                          "flavor": {"id": 1, "name": "256 MB Server"},
+                          "hostId": "9e107d9d372bb6826bd81d3542a419d6",
+                          "status": "ACTIVE",
+                          "accessIPv4": "192.0.2.0",
+                          "accessIPv6": "::babe:4317:0A83",
+                          "addresses": {"public": [{"version": 4,
+                                                    "addr": "4.5.6.7"},
+                                                   {"version": 4,
+                                                    "addr": "5.6.9.8"}],
+                                        "private": [{"version": 4,
+                                                     "addr": "10.13.12.13"}]},
+                          "metadata": {'test': '123', 'this': 'that'}},
+                         # 8
+                         {"id": "InstanceInActive",
+                          "name": "server-with-metadata",
+                          "OS-EXT-STS:task_state": 'active',
+                          "image": {"id": 2, "name": "sample image"},
+                          "flavor": {"id": 1, "name": "256 MB Server"},
+                          "hostId": "9e107d9d372bb6826bd81d3542a419d6",
+                          "status": "ACTIVE",
+                          "accessIPv4": "192.0.2.0",
+                          "accessIPv6": "::babe:4317:0A83",
+                          "addresses": {"public": [{"version": 4,
+                                                    "addr": "4.5.6.7"},
+                                                   {"version": 4,
+                                                    "addr": "5.6.9.8"}],
+                                        "private": [{"version": 4,
+                                                     "addr": "10.13.12.13"}]},
+                          "metadata": {'test': '123', 'this': 'that'}},
+                         # 9
+                         {"id": "AnotherServer",
+                          "name": "server-with-metadata",
+                          "OS-EXT-STS:task_state": 'active',
                           "image": {"id": 2, "name": "sample image"},
                           "flavor": {"id": 1, "name": "256 MB Server"},
                           "hostId": "9e107d9d372bb6826bd81d3542a419d6",
@@ -213,6 +290,22 @@ class FakeHTTPClient(base_client.HTTPClient):
         r = {'server': self.get_servers_detail()[1]['servers'][0]}
         return (200, r)
 
+    def get_servers_WikiDatabase(self, **kw):
+        r = {'server': self.get_servers_detail()[1]['servers'][6]}
+        return (200, r)
+
+    def get_servers_InstanceInResize(self, **kw):
+        r = {'server': self.get_servers_detail()[1]['servers'][7]}
+        return (200, r)
+
+    def get_servers_InstanceInActive(self, **kw):
+        r = {'server': self.get_servers_detail()[1]['servers'][8]}
+        return (200, r)
+
+    def get_servers_AnotherServer(self, **kw):
+        r = {'server': self.get_servers_detail()[1]['servers'][9]}
+        return (200, r)
+
     def get_servers_WikiServerOne1(self, **kw):
         r = {'server': self.get_servers_detail()[1]['servers'][0]}
         return (200, r)
@@ -226,6 +319,9 @@ class FakeHTTPClient(base_client.HTTPClient):
         return (200, r)
 
     def delete_servers_1234(self, **kw):
+        return (202, None)
+
+    def delete_servers_5678(self, **kw):
         return (202, None)
 
     def get_servers_9999(self, **kw):
@@ -243,21 +339,28 @@ class FakeHTTPClient(base_client.HTTPClient):
     def post_servers_1234_action(self, body, **kw):
         _body = None
         resp = 202
-        assert len(body.keys()) == 1
+        if len(body.keys()) != 1:
+            raise AssertionError('No keys in request body')
         action = next(iter(body))
+        keys = list(body[action].keys()) if body[action] is not None else None
         if action == 'reboot':
-            assert list(body[action].keys()) == ['type']
-            assert body[action]['type'] in ['HARD', 'SOFT']
+            if keys != ['type']:
+                raise AssertionError('Unexpection action keys for %s: %s' %
+                                     (action, keys))
+            if body[action]['type'] not in ['HARD', 'SOFT']:
+                raise AssertionError('Unexpected reboot type %s' %
+                                     body[action]['type'])
         elif action == 'rebuild':
-            keys = list(body[action].keys())
             if 'adminPass' in keys:
                 keys.remove('adminPass')
-            assert keys == ['imageRef']
+            if keys != ['imageRef']:
+                raise AssertionError('Unexpection action keys for %s: %s' %
+                                     (action, keys))
             _body = self.get_servers_1234()[1]
-        elif action == 'resize':
-            assert list(body[action].keys()) == ['flavorRef']
         elif action == 'confirmResize':
-            assert body[action] is None
+            if body[action] is not None:
+                raise AssertionError('Unexpected data for confirmResize: %s' %
+                                     body[action])
             # This one method returns a different response code
             return (204, None)
         elif action in ['revertResize',
@@ -265,43 +368,53 @@ class FakeHTTPClient(base_client.HTTPClient):
                         'rescue', 'unrescue',
                         'suspend', 'resume',
                         'lock', 'unlock',
-                        ]:
-            assert body[action] is None
-        elif action == 'addFixedIp':
-            assert list(body[action].keys()) == ['networkId']
-        elif action in ['removeFixedIp',
-                        'addFloatingIp',
-                        'removeFloatingIp',
-                        ]:
-            assert list(body[action].keys()) == ['address']
-        elif action == 'createImage':
-            assert set(body[action].keys()) == set(['name', 'metadata'])
-            resp = {"status": 202,
-                    "location": "http://blah/images/456"}
-        elif action == 'changePassword':
-            assert list(body[action].keys()) == ['adminPass']
-        elif action == 'os-getConsoleOutput':
-            assert list(body[action].keys()) == ['length']
-            return (202, {'output': 'foo'})
-        elif action == 'os-getVNCConsole':
-            assert list(body[action].keys()) == ['type']
-        elif action == 'os-migrateLive':
-            assert set(body[action].keys()) == set(['host',
-                                                    'block_migration',
-                                                    'disk_over_commit'])
+                        'forceDelete']:
+            if body[action] is not None:
+                raise AssertionError('Unexpected data for %s: %s' %
+                                     (action, body[action]))
         else:
-            raise AssertionError("Unexpected server action: %s" % action)
+            expected_keys = {
+                'resize': {'flavorRef'},
+                'addFixedIp': {'networkId'},
+                'removeFixedIp': {'address'},
+                'addFloatingIp': {'address'},
+                'removeFloatingp': {'address'},
+                'createImage': {'name', 'metadata'},
+                'changePassword': {'adminPass'},
+                'os-getConsoleOutput': {'length'},
+                'os-getVNCConsole': {'type'},
+                'os-migrateLive': {'host', 'block_migration',
+                                   'disk_over_commit'},
+            }
+
+            if action in expected_keys:
+                if set(keys) != set(expected_keys[action]):
+                    raise AssertionError('Unexpection action keys for %s: %s' %
+                                         (action, keys))
+            else:
+                raise AssertionError("Unexpected server action: %s" % action)
+
+            if action == 'createImage':
+                resp = {"status": 202,
+                        "location": "http://blah/images/456"}
+            if action == 'os-getConsoleOutput':
+                return (202, {'output': 'foo'})
+
         return (resp, _body)
 
     def post_servers_5678_action(self, body, **kw):
         _body = None
         resp = 202
-        assert len(body.keys()) == 1
+        if len(body.keys()) != 1:
+            raise AssertionError("No action in body")
         action = next(iter(body))
         if action in ['addFloatingIp',
                       'removeFloatingIp',
                       ]:
-            assert list(body[action].keys()) == ['address']
+            keys = list(body[action].keys())
+            if keys != ['address']:
+                raise AssertionError('Unexpection action keys for %s: %s' %
+                                     (action, keys))
 
         return (resp, _body)
 
@@ -342,6 +455,19 @@ class FakeHTTPClient(base_client.HTTPClient):
         return (200, {'flavor': {
             'id': 3, 'name': 'm1.large', 'ram': 512, 'disk': 20,
             'OS-FLV-EXT-DATA:ephemeral': 30}})
+
+    #
+    # Interfaces
+    #
+
+    def get_servers_5678_os_interface(self, **kw):
+        return (200, {'interfaceAttachments':
+                      [{"fixed_ips":
+                        [{"ip_address": "10.0.0.1",
+                          "subnet_id": "f8a6e8f8-c2ec-497c-9f23-da9616de54ef"
+                          }],
+                        "port_id": "ce531f90-199f-48c0-816c-13e38010b442"
+                        }]})
 
     #
     # Floating ips

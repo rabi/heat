@@ -16,21 +16,21 @@ import hashlib
 import json
 
 import fixtures
-from oslotest import mockpatch
-import six
 from stevedore import extension
 
 from heat.common import exception
 from heat.common import template_format
 from heat.engine.cfn import functions as cfn_funcs
+from heat.engine.cfn import parameters as cfn_p
 from heat.engine.cfn import template as cfn_t
 from heat.engine.clients.os import nova
 from heat.engine import environment
 from heat.engine import function
 from heat.engine.hot import template as hot_t
-from heat.engine import parameters
+from heat.engine import node_data
 from heat.engine import rsrc_defn
 from heat.engine import stack
+from heat.engine import stk_defn
 from heat.engine import template
 from heat.tests import common
 from heat.tests.openstack.nova import fakes as fakes_nova
@@ -109,7 +109,7 @@ class TemplatePluginFixture(fixtures.Fixture):
             template._template_classes = None
 
         clear_template_classes()
-        self.useFixture(mockpatch.PatchObject(
+        self.useFixture(fixtures.MockPatchObject(
             template,
             '_get_template_extension_manager',
             new=self._get_template_extension_manager))
@@ -140,6 +140,9 @@ class TestTemplatePluginManager(common.HeatTestCase):
                 pass
 
             def add_resource(self, definition, name=None):
+                pass
+
+            def outputs(self, stack):
                 pass
 
             def __getitem__(self, section):
@@ -199,7 +202,7 @@ class TestTemplateVersion(common.HeatTestCase):
         ex = self.assertRaises(exception.InvalidTemplateVersion,
                                template.get_version, tmpl, self.versions)
         self.assertEqual('The template version is invalid: Template version '
-                         'was not provided', six.text_type(ex))
+                         'was not provided', str(ex))
 
     def test_ambiguous_version(self):
         tmpl = {
@@ -217,7 +220,7 @@ class ParserTest(common.HeatTestCase):
     def test_list(self):
         raw = ['foo', 'bar', 'baz']
         parsed = join(raw)
-        for i in six.moves.xrange(len(raw)):
+        for i in range(len(raw)):
             self.assertEqual(raw[i], parsed[i])
         self.assertIsNot(raw, parsed)
 
@@ -232,7 +235,7 @@ class ParserTest(common.HeatTestCase):
         raw = {'foo': ['bar', 'baz'], 'blarg': 'wibble'}
         parsed = join(raw)
         self.assertEqual(raw['blarg'], parsed['blarg'])
-        for i in six.moves.xrange(len(raw['foo'])):
+        for i in range(len(raw['foo'])):
             self.assertEqual(raw['foo'][i], parsed['foo'][i])
         self.assertIsNot(raw, parsed)
         self.assertIsNot(raw['foo'], parsed['foo'])
@@ -240,7 +243,7 @@ class ParserTest(common.HeatTestCase):
     def test_list_dict(self):
         raw = [{'foo': 'bar', 'blarg': 'wibble'}, 'baz', 'quux']
         parsed = join(raw)
-        for i in six.moves.xrange(1, len(raw)):
+        for i in range(1, len(raw)):
             self.assertEqual(raw[i], parsed[i])
         for k in raw[0]:
             self.assertEqual(raw[0][k], parsed[0][k])
@@ -259,7 +262,7 @@ class ParserTest(common.HeatTestCase):
         raw = [{'Fn::Join': [' ', ['foo', 'bar', 'baz']]}, 'blarg', 'wibble']
         parsed = join(raw)
         self.assertEqual('foo bar baz', parsed[0])
-        for i in six.moves.xrange(1, len(raw)):
+        for i in range(1, len(raw)):
             self.assertEqual(raw[i], parsed[i])
         self.assertIsNot(raw, parsed)
 
@@ -322,23 +325,23 @@ class TestTemplateConditionParser(common.HeatTestCase):
         stk = stack.Stack(self.ctx, 'test_condition_with_get_attr_func', tmpl)
         ex = self.assertRaises(exception.StackValidationFailed,
                                tmpl.conditions, stk)
-        self.assertIn('"get_attr" is invalid', six.text_type(ex))
+        self.assertIn('"get_attr" is invalid', str(ex))
         self.assertIn('conditions.prod_env.equals[1].get_attr',
-                      six.text_type(ex))
+                      str(ex))
 
         # test with get_resource in top level of a condition
         tmpl.t['conditions']['prod_env'] = {'get_resource': 'R1'}
         stk = stack.Stack(self.ctx, 'test_condition_with_get_attr_func', tmpl)
         ex = self.assertRaises(exception.StackValidationFailed,
                                tmpl.conditions, stk)
-        self.assertIn('"get_resource" is invalid', six.text_type(ex))
+        self.assertIn('"get_resource" is invalid', str(ex))
 
         # test with get_attr in top level of a condition
         tmpl.t['conditions']['prod_env'] = {'get_attr': [None, 'att']}
         stk = stack.Stack(self.ctx, 'test_condition_with_get_attr_func', tmpl)
         ex = self.assertRaises(exception.StackValidationFailed,
                                tmpl.conditions, stk)
-        self.assertIn('"get_attr" is invalid', six.text_type(ex))
+        self.assertIn('"get_attr" is invalid', str(ex))
 
     def test_condition_resolved_not_boolean(self):
         t = {
@@ -360,7 +363,7 @@ class TestTemplateConditionParser(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                conditions.is_enabled, 'prod_env')
         self.assertIn('The definition of condition "prod_env" is invalid',
-                      six.text_type(ex))
+                      str(ex))
 
     def test_condition_reference_condition(self):
         t = {
@@ -395,10 +398,10 @@ class TestTemplateConditionParser(common.HeatTestCase):
 
         conds = tmpl.conditions(stk)
         ex = self.assertRaises(ValueError, conds.is_enabled, 'invalid_cd')
-        self.assertIn('Invalid condition "invalid_cd"', six.text_type(ex))
+        self.assertIn('Invalid condition "invalid_cd"', str(ex))
         # test condition name is not string
         ex = self.assertRaises(ValueError, conds.is_enabled, 111)
-        self.assertIn('Invalid condition "111"', six.text_type(ex))
+        self.assertIn('Invalid condition "111"', str(ex))
 
     def test_res_condition_using_boolean(self):
         tmpl = copy.deepcopy(self.tmpl)
@@ -418,14 +421,14 @@ class TestTemplateConditionParser(common.HeatTestCase):
         self.tmpl.t['outputs']['foo']['condition'] = 'invalid_cd'
         ex = self.assertRaises(exception.StackValidationFailed,
                                lambda: stk.outputs)
-        self.assertIn('Invalid condition "invalid_cd"', six.text_type(ex))
-        self.assertIn('outputs.foo.condition', six.text_type(ex))
+        self.assertIn('Invalid condition "invalid_cd"', str(ex))
+        self.assertIn('outputs.foo.condition', str(ex))
         # test condition name is not string
         self.tmpl.t['outputs']['foo']['condition'] = 222
         ex = self.assertRaises(exception.StackValidationFailed,
                                lambda: stk.outputs)
-        self.assertIn('Invalid condition "222"', six.text_type(ex))
-        self.assertIn('outputs.foo.condition', six.text_type(ex))
+        self.assertIn('Invalid condition "222"', str(ex))
+        self.assertIn('outputs.foo.condition', str(ex))
 
     def test_conditions_circular_ref(self):
         t = {
@@ -448,7 +451,7 @@ class TestTemplateConditionParser(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                conds.is_enabled, 'first_cond')
         self.assertIn('Circular definition for condition "first_cond"',
-                      six.text_type(ex))
+                      str(ex))
 
     def test_parse_output_condition_boolean(self):
         t = copy.deepcopy(self.tmpl.t)
@@ -496,7 +499,7 @@ class TestTemplateValidate(common.HeatTestCase):
         self.assertIsNone(tmpl.t_digest)
         tmpl.validate()
         self.assertEqual(
-            hashlib.sha256(six.text_type(t).encode('utf-8')).hexdigest(),
+            hashlib.sha256(str(t).encode('utf-8')).hexdigest(),
             tmpl.t_digest, 'invalid template digest')
 
     def test_template_validate_cfn_good(self):
@@ -552,7 +555,7 @@ class TestTemplateValidate(common.HeatTestCase):
         tmpl = template.Template(t)
         err = self.assertRaises(exception.InvalidTemplateSection,
                                 tmpl.validate)
-        self.assertIn('Parameteers', six.text_type(err))
+        self.assertIn('Parameteers', str(err))
 
     def test_template_validate_cfn_empty(self):
         t = template_format.parse('''
@@ -606,7 +609,7 @@ class TestTemplateValidate(common.HeatTestCase):
         error = self.assertRaises(exception.StackValidationFailed,
                                   tmpl.validate)
         self.assertEqual('Each Resource must contain a Type key.',
-                         six.text_type(error))
+                         str(error))
 
     def test_get_resources_no_type(self):
         """Test get resources with invalid key."""
@@ -629,7 +632,7 @@ class TestTemplateValidate(common.HeatTestCase):
         error = self.assertRaises(exception.StackValidationFailed,
                                   tmpl.validate)
         self.assertEqual('Each Resource must contain a Type key.',
-                         six.text_type(error))
+                         str(error))
 
     def test_template_validate_hot_check_t_digest(self):
         t = {
@@ -648,7 +651,7 @@ class TestTemplateValidate(common.HeatTestCase):
         self.assertIsNone(tmpl.t_digest)
         tmpl.validate()
         self.assertEqual(hashlib.sha256(
-            six.text_type(t).encode('utf-8')).hexdigest(),
+            str(t).encode('utf-8')).hexdigest(),
             tmpl.t_digest, 'invalid template digest')
 
     def test_template_validate_hot_good(self):
@@ -684,7 +687,7 @@ class TestTemplateValidate(common.HeatTestCase):
         tmpl = template.Template(t)
         err = self.assertRaises(exception.InvalidTemplateSection,
                                 tmpl.validate)
-        self.assertIn('parameteers', six.text_type(err))
+        self.assertIn('parameteers', str(err))
 
 
 class TemplateTest(common.HeatTestCase):
@@ -695,11 +698,12 @@ class TemplateTest(common.HeatTestCase):
 
     @staticmethod
     def resolve(snippet, template, stack=None):
-        return function.resolve(template.parse(stack, snippet))
+        return function.resolve(template.parse(stack and stack.defn, snippet))
 
     @staticmethod
     def resolve_condition(snippet, template, stack=None):
-        return function.resolve(template.parse_condition(stack, snippet))
+        return function.resolve(template.parse_condition(stack and stack.defn,
+                                                         snippet))
 
     def test_defaults(self):
         empty = template.Template(empty_template)
@@ -728,12 +732,15 @@ class TemplateTest(common.HeatTestCase):
                                     template.Template, invalid_hot_version_tmp)
         valid_versions = ['2013-05-23', '2014-10-16',
                           '2015-04-30', '2015-10-15', '2016-04-08',
-                          '2016-10-14', 'newton']
+                          '2016-10-14', '2017-02-24', '2017-09-01',
+                          '2018-03-02', '2018-08-31', '2021-04-16',
+                          'newton', 'ocata', 'pike',
+                          'queens', 'rocky', 'wallaby']
         ex_error_msg = ('The template version is invalid: '
                         '"heat_template_version: 2012-12-12". '
                         '"heat_template_version" should be one of: %s'
                         % ', '.join(valid_versions))
-        self.assertEqual(ex_error_msg, six.text_type(init_ex))
+        self.assertEqual(ex_error_msg, str(init_ex))
 
     def test_invalid_version_not_in_hot_versions(self):
         invalid_hot_version_tmp = template_format.parse(
@@ -753,7 +760,7 @@ class TemplateTest(common.HeatTestCase):
                         '"heat_template_version: 2012-12-12". '
                         '"heat_template_version" should be '
                         'one of: 2013-05-23, 2013-06-23')
-        self.assertEqual(ex_error_msg, six.text_type(init_ex))
+        self.assertEqual(ex_error_msg, str(init_ex))
         template._template_classes = temp_copy
 
     def test_invalid_aws_version(self):
@@ -766,7 +773,7 @@ class TemplateTest(common.HeatTestCase):
         ex_error_msg = ('The template version is invalid: '
                         '"AWSTemplateFormatVersion: 2012-12-12". '
                         '"AWSTemplateFormatVersion" should be: 2010-09-09')
-        self.assertEqual(ex_error_msg, six.text_type(init_ex))
+        self.assertEqual(ex_error_msg, str(init_ex))
 
     def test_invalid_version_not_in_aws_versions(self):
         invalid_aws_version_tmp = template_format.parse(
@@ -786,7 +793,7 @@ class TemplateTest(common.HeatTestCase):
                         '"AWSTemplateFormatVersion: 2012-12-12". '
                         '"AWSTemplateFormatVersion" should be '
                         'one of: 2010-09-09, 2011-06-23')
-        self.assertEqual(ex_error_msg, six.text_type(init_ex))
+        self.assertEqual(ex_error_msg, str(init_ex))
         template._template_classes = temp_copy
 
     def test_invalid_heat_version(self):
@@ -800,7 +807,7 @@ class TemplateTest(common.HeatTestCase):
         ex_error_msg = ('The template version is invalid: '
                         '"HeatTemplateFormatVersion: 2010-09-09". '
                         '"HeatTemplateFormatVersion" should be: 2012-12-12')
-        self.assertEqual(ex_error_msg, six.text_type(init_ex))
+        self.assertEqual(ex_error_msg, str(init_ex))
 
     def test_invalid_version_not_in_heat_versions(self):
         invalid_heat_version_tmp = template_format.parse(
@@ -821,7 +828,7 @@ class TemplateTest(common.HeatTestCase):
                         '"HeatTemplateFormatVersion: 2010-09-09". '
                         '"HeatTemplateFormatVersion" should be '
                         'one of: 2012-12-12, 2014-12-12')
-        self.assertEqual(ex_error_msg, six.text_type(init_ex))
+        self.assertEqual(ex_error_msg, str(init_ex))
 
         template._template_classes = temp_copy
 
@@ -888,7 +895,7 @@ class TemplateTest(common.HeatTestCase):
         tmpl = template.Template(parameter_template, env=env)
         stk = stack.Stack(self.ctx, 'test', tmpl)
         tmpl.env = environment.Environment({})
-        stk.parameters = parameters.Parameters(stk.identifier(), tmpl)
+        stk.defn.parameters = cfn_p.CfnParameters(stk.identifier(), tmpl)
         snippet = {"Ref": "foo"}
         self.assertRaises(exception.UserParameterMissing,
                           self.resolve,
@@ -897,21 +904,19 @@ class TemplateTest(common.HeatTestCase):
     def test_resource_refs(self):
         tmpl = template.Template(resource_template)
         stk = stack.Stack(self.ctx, 'test', tmpl)
+        stk.validate()
 
-        self.m.StubOutWithMock(stk['foo'], 'FnGetRefId')
-        stk['foo'].FnGetRefId().MultipleTimes().AndReturn('bar')
-        self.m.ReplayAll()
-
+        data = node_data.NodeData.from_dict({'reference_id': 'bar'})
+        stk_defn.update_resource_data(stk.defn, 'foo', data)
         r_snippet = {"Ref": "foo"}
         self.assertEqual("bar", self.resolve(r_snippet, tmpl, stk))
-        self.m.VerifyAll()
 
     def test_resource_refs_param(self):
         tmpl = template.Template(resource_template)
         stk = stack.Stack(self.ctx, 'test', tmpl)
 
         p_snippet = {"Ref": "baz"}
-        parsed = tmpl.parse(stk, p_snippet)
+        parsed = tmpl.parse(stk.defn, p_snippet)
         self.assertIsInstance(parsed, cfn_funcs.ParamRef)
 
     def test_select_from_list(self):
@@ -1007,12 +1012,12 @@ class TemplateTest(common.HeatTestCase):
 
         error_msg = ('.Fn::Equals: Arguments to "Fn::Equals" must be '
                      'of the form: [value_1, value_2]')
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
         # test invalid type
         snippet = {'Fn::Equals': {"equal": False}}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
     def test_not(self):
         tpl = template_format.parse('''
@@ -1048,19 +1053,19 @@ class TemplateTest(common.HeatTestCase):
                                 self.resolve_condition, snippet, tmpl, stk)
 
         error_msg = 'Invalid condition "invalid_arg"'
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
         # test invalid type
         snippet = {'Fn::Not': 'invalid'}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
         error_msg = 'Arguments to "Fn::Not" must be '
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
         snippet = {'Fn::Not': ['cd1', 'cd2']}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
         error_msg = 'Arguments to "Fn::Not" must be '
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
     def test_and(self):
         tpl = template_format.parse('''
@@ -1111,21 +1116,21 @@ class TemplateTest(common.HeatTestCase):
         snippet = {'Fn::And': ['invalid_arg']}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
         error_msg = 'Arguments to "Fn::And" must be'
         # test invalid type
         snippet = {'Fn::And': 'invalid'}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
         stk = stack.Stack(utils.dummy_context(), 'test_and_invalid', tmpl)
         snippet = {'Fn::And': ['cd1', True]}
         exc = self.assertRaises(ValueError,
                                 self.resolve_condition, snippet, tmpl, stk)
         error_msg = 'Invalid condition "cd1"'
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
     def test_or(self):
         tpl = template_format.parse('''
@@ -1172,21 +1177,21 @@ class TemplateTest(common.HeatTestCase):
         snippet = {'Fn::Or': ['invalid_arg']}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
         error_msg = 'Arguments to "Fn::Or" must be'
         # test invalid type
         snippet = {'Fn::Or': 'invalid'}
         exc = self.assertRaises(exception.StackValidationFailed,
                                 self.resolve_condition, snippet, tmpl)
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
         stk = stack.Stack(utils.dummy_context(), 'test_or_invalid', tmpl)
         snippet = {'Fn::Or': ['invalid_cd', True]}
         exc = self.assertRaises(ValueError,
                                 self.resolve_condition, snippet, tmpl, stk)
         error_msg = 'Invalid condition "invalid_cd"'
-        self.assertIn(error_msg, six.text_type(exc))
+        self.assertIn(error_msg, str(exc))
 
     def test_join(self):
         tmpl = template.Template(empty_template)
@@ -1220,10 +1225,8 @@ class TemplateTest(common.HeatTestCase):
         snippet = {"Fn::GetAZs": ""}
         stk = stack.Stack(self.ctx, 'test_stack',
                           template.Template(empty_template))
-        self.m.StubOutWithMock(nova.NovaClientPlugin, '_create')
         fc = fakes_nova.FakeClient()
-        nova.NovaClientPlugin._create().AndReturn(fc)
-        self.m.ReplayAll()
+        self.patchobject(nova.NovaClientPlugin, 'client', return_value=fc)
         self.assertEqual(["nova1"], self.resolve(snippet, tmpl, stk))
 
     def test_replace_string_values(self):
@@ -1306,13 +1309,18 @@ class TemplateTest(common.HeatTestCase):
             'parent', 'SomeType',
             deletion_policy=rsrc_defn.ResourceDefinition.RETAIN,
             update_policy={"blarg": "wibble"})
-
+        tmpl = copy.deepcopy(empty_template)
+        tmpl['Resources'] = {'parent': {'Type': 'SomeType',
+                                        'DeletionPolicy': 'Retain',
+                                        'UpdatePolicy': {"blarg": "wibble"}}}
         parent_resource.stack = stack.Stack(self.ctx, 'toplevel_stack',
-                                            template.Template(empty_template))
+                                            template.Template(tmpl))
+        parent_resource.stack._resources = {'parent': parent_resource}
+
         stk = stack.Stack(self.ctx, 'test_stack',
                           template.Template(empty_template),
                           parent_resource='parent', owner_id=45)
-        stk._parent_stack = dict(parent=parent_resource)
+        stk.set_parent_stack(parent_resource.stack)
         self.assertEqual({"foo": "bar"},
                          self.resolve(metadata_snippet, stk.t, stk))
         self.assertEqual('Retain',
@@ -1325,18 +1333,22 @@ class TemplateTest(common.HeatTestCase):
 
         parent_resource = DummyClass()
         parent_resource.metadata_set({"foo": "bar"})
-        parent_resource.stack = stack.Stack(self.ctx, 'toplevel_stack',
-                                            template.Template(empty_template))
-        del_policy = cfn_funcs.Join(parent_resource.stack,
+        del_policy = cfn_funcs.Join(None,
                                     'Fn::Join', ['eta', ['R', 'in']])
         parent_resource.t = rsrc_defn.ResourceDefinition(
             'parent', 'SomeType',
             deletion_policy=del_policy)
+        tmpl = copy.deepcopy(empty_template)
+        tmpl['Resources'] = {'parent': {'Type': 'SomeType',
+                                        'DeletionPolicy': del_policy}}
+        parent_resource.stack = stack.Stack(self.ctx, 'toplevel_stack',
+                                            template.Template(tmpl))
+        parent_resource.stack._resources = {'parent': parent_resource}
 
         stk = stack.Stack(self.ctx, 'test_stack',
                           template.Template(empty_template),
                           parent_resource='parent')
-        stk._parent_stack = dict(parent=parent_resource)
+        stk.set_parent_stack(parent_resource.stack)
         self.assertEqual('Retain',
                          self.resolve(deletion_policy_snippet, stk.t, stk))
 
@@ -1346,7 +1358,7 @@ class TemplateTest(common.HeatTestCase):
                           template.Template(empty_template))
         error = self.assertRaises(exception.StackValidationFailed,
                                   self.resolve, snippet, stk.t, stk)
-        self.assertIn(next(iter(snippet)), six.text_type(error))
+        self.assertIn(next(iter(snippet)), str(error))
 
     def test_resource_facade_missing_deletion_policy(self):
         snippet = {'Fn::ResourceFacade': 'DeletionPolicy'}
@@ -1354,13 +1366,16 @@ class TemplateTest(common.HeatTestCase):
         parent_resource = DummyClass()
         parent_resource.metadata_set({"foo": "bar"})
         parent_resource.t = rsrc_defn.ResourceDefinition('parent', 'SomeType')
+        tmpl = copy.deepcopy(empty_template)
+        tmpl['Resources'] = {'parent': {'Type': 'SomeType'}}
 
         parent_resource.stack = stack.Stack(self.ctx, 'toplevel_stack',
-                                            template.Template(empty_template))
+                                            template.Template(tmpl))
+        parent_resource.stack._resources = {'parent': parent_resource}
         stk = stack.Stack(self.ctx, 'test_stack',
                           template.Template(empty_template),
                           parent_resource='parent', owner_id=78)
-        stk._parent_stack = dict(parent=parent_resource)
+        stk.set_parent_stack(parent_resource.stack)
         self.assertEqual('Delete', self.resolve(snippet, stk.t, stk))
 
     def test_prevent_parameters_access(self):
@@ -1374,7 +1389,7 @@ class TemplateTest(common.HeatTestCase):
         })
         self.assertEqual(expected_description, tmpl['Description'])
         keyError = self.assertRaises(KeyError, tmpl.__getitem__, 'Parameters')
-        self.assertIn("can not be accessed directly", six.text_type(keyError))
+        self.assertIn("can not be accessed directly", str(keyError))
 
     def test_parameters_section_not_iterable(self):
         expected_description = "This can be accessed"
@@ -1404,15 +1419,41 @@ class TemplateTest(common.HeatTestCase):
               foo: bar
           resource2:
             Type: AWS::EC2::Instance
+          resource3:
+            Type: AWS::EC2::Instance
+            DependsOn:
+              - resource1
+              - dummy
+              - resource2
         ''')
         source = template.Template(cfn_tpl)
         empty = template.Template(copy.deepcopy(empty_template))
         stk = stack.Stack(self.ctx, 'test_stack', source)
 
-        for defn in six.itervalues(source.resource_definitions(stk)):
+        for rname, defn in sorted(source.resource_definitions(stk).items()):
             empty.add_resource(defn)
 
-        self.assertEqual(cfn_tpl['Resources'], empty.t['Resources'])
+        expected = copy.deepcopy(cfn_tpl['Resources'])
+        del expected['resource1']['DependsOn']
+        expected['resource3']['DependsOn'] = ['resource1', 'resource2']
+        self.assertEqual(expected, empty.t['Resources'])
+
+    def test_add_output(self):
+        cfn_tpl = template_format.parse('''
+        AWSTemplateFormatVersion: 2010-09-09
+        Outputs:
+          output1:
+            Description: An output
+            Value: foo
+        ''')
+        source = template.Template(cfn_tpl)
+        empty = template.Template(copy.deepcopy(empty_template))
+        stk = stack.Stack(self.ctx, 'test_stack', source)
+
+        for defn in source.outputs(stk).values():
+            empty.add_output(defn)
+
+        self.assertEqual(cfn_tpl['Outputs'], empty.t['Outputs'])
 
     def test_create_empty_template_default_version(self):
         empty_template = template.Template.create_empty_template()
@@ -1607,7 +1648,7 @@ class TemplateFnErrorTest(common.HeatTestCase):
         error = self.assertRaises(self.expect,
                                   resolve,
                                   self.snippet)
-        self.assertIn(next(iter(self.snippet)), six.text_type(error))
+        self.assertIn(next(iter(self.snippet)), str(error))
 
 
 class ResolveDataTest(common.HeatTestCase):
@@ -1622,7 +1663,7 @@ class ResolveDataTest(common.HeatTestCase):
                                  template.Template(empty_template))
 
     def resolve(self, snippet):
-        return function.resolve(self.stack.t.parse(self.stack, snippet))
+        return function.resolve(self.stack.t.parse(self.stack.defn, snippet))
 
     def test_join_split(self):
         # join
@@ -1664,7 +1705,7 @@ class ResolveDataTest(common.HeatTestCase):
                                         [' ', ['foo', 45]]}, 'baz']]}
         error = self.assertRaises(TypeError,
                                   self.resolve, snippet)
-        self.assertIn('45', six.text_type(error))
+        self.assertIn('45', str(error))
 
     def test_base64_replace(self):
         raw = {'Fn::Base64': {'Fn::Replace': [

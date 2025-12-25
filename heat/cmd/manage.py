@@ -19,7 +19,6 @@ import sys
 
 from oslo_config import cfg
 from oslo_log import log
-from six import moves
 
 from heat.common import context
 from heat.common import exception
@@ -27,18 +26,17 @@ from heat.common.i18n import _
 from heat.common import messaging
 from heat.common import service_utils
 from heat.db import api as db_api
-from heat.db import utils
+from heat.db import migration as db_migration
 from heat.objects import service as service_objects
 from heat.rpc import client as rpc_client
 from heat import version
-
 
 CONF = cfg.CONF
 
 
 def do_db_version():
     """Print database's current migration level."""
-    print(db_api.db_version(db_api.get_engine()))
+    print(db_migration.db_version())
 
 
 def do_db_sync():
@@ -46,7 +44,7 @@ def do_db_sync():
 
     Creating first if necessary.
     """
-    db_api.db_sync(db_api.get_engine(), CONF.command.version)
+    db_migration.db_sync(CONF.command.version)
 
 
 class ServiceManageCommand(object):
@@ -107,7 +105,7 @@ def do_reset_stack_status():
             "intended to recover from specific crashes."))
     print(_("It is advised to shutdown all Heat engines beforehand."))
     print(_("Continue ? [y/N]"))
-    data = moves.input()
+    data = input()
     if not data.lower().startswith('y'):
         return
     ctxt = context.get_admin_context()
@@ -123,17 +121,16 @@ def do_migrate():
     except exception.NotFound:
         raise Exception(_("Stack with id %s can not be found.")
                         % CONF.command.stack_id)
-    except exception.ActionInProgress:
-        raise Exception(_("The stack or some of its nested stacks are "
-                          "in progress. Note, that all the stacks should be "
-                          "in COMPLETE state in order to be migrated."))
+    except (exception.NotSupported, exception.ActionNotComplete) as ex:
+        raise Exception(ex.message)
 
 
 def purge_deleted():
     """Remove database records that have been previously soft deleted."""
-    utils.purge_deleted(CONF.command.age,
-                        CONF.command.granularity,
-                        CONF.command.project_id)
+    db_api.purge_deleted(CONF.command.age,
+                         CONF.command.granularity,
+                         CONF.command.project_id,
+                         CONF.command.batch_size)
 
 
 def do_crypt_parameters_and_properties():
@@ -141,11 +138,18 @@ def do_crypt_parameters_and_properties():
     ctxt = context.get_admin_context()
     prev_encryption_key = CONF.command.previous_encryption_key
     if CONF.command.crypt_operation == "encrypt":
-        utils.encrypt_parameters_and_properties(
+        db_api.encrypt_parameters_and_properties(
             ctxt, prev_encryption_key, CONF.command.verbose_update_params)
     elif CONF.command.crypt_operation == "decrypt":
-        utils.decrypt_parameters_and_properties(
+        db_api.decrypt_parameters_and_properties(
             ctxt, prev_encryption_key, CONF.command.verbose_update_params)
+
+
+def do_properties_data_migrate():
+    print(
+        'This command has been deprecated and is now a no-op. '
+        'It will be removed in a future release.'
+    )
 
 
 def add_command_parsers(subparsers):
@@ -159,8 +163,8 @@ def add_command_parsers(subparsers):
     # positional parameter, can be skipped. default=None
     parser.add_argument('version', nargs='?')
 
-    # migrate-stacks parser
-    parser = subparsers.add_parser('migrate-convergence-1')
+    # migrate_convergence_1 parser
+    parser = subparsers.add_parser('migrate_convergence_1')
     parser.set_defaults(func=do_migrate)
     parser.add_argument('stack_id')
 
@@ -179,6 +183,13 @@ def add_command_parsers(subparsers):
     parser.add_argument(
         '-p', '--project-id',
         help=_('Project ID to purge deleted stacks.'))
+    # optional parameter, can be skipped. default='20'
+    parser.add_argument(
+        '-b', '--batch_size', default='20',
+        help=_('Number of stacks to delete at a time (per transaction). '
+               'Note that a single stack may have many DB rows '
+               '(events, etc.) associated with it.'))
+
     # update_params parser
     parser = subparsers.add_parser('update_params')
     parser.set_defaults(func=do_crypt_parameters_and_properties)
@@ -208,11 +219,16 @@ def add_command_parsers(subparsers):
     parser.add_argument('stack_id',
                         help=_('Stack id'))
 
+    # migrate properties_data parser
+    parser = subparsers.add_parser('migrate_properties_data')
+    parser.set_defaults(func=do_properties_data_migrate)
+
     ServiceManageCommand.add_service_parsers(subparsers)
+
 
 command_opt = cfg.SubCommandOpt('command',
                                 title='Commands',
-                                help='Show available commands.',
+                                help=_('Show available commands.'),
                                 handler=add_command_parsers)
 
 

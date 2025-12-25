@@ -33,10 +33,11 @@ https://github.com/openstack/heat/blob/master/rally-scenarios/heat-fakevirt.yaml
 
 Obviously performance analysis make sense, when it can be compared with some
 another performance data. So two different approaches can be used for it:
- - Comparison of one part of code with some custom changes
-   (see :ref:`check_performance_or_detect_regression`)
- - Comparison of two different code parts
-   (see :ref:`compare_output_API_performance`)
+
+- Comparison of one part of code with some custom changes
+  (see :ref:`check_performance_or_detect_regression`)
+- Comparison of two different code parts
+  (see :ref:`compare_output_API_performance`)
 
 Examples of using Rally
 -----------------------
@@ -56,23 +57,22 @@ Check performance or how to detect regression
 
 The easiest way of using Rally is to execute already existing scenarios.
 One of the examples is presented in patch
-https://review.openstack.org/#/c/279450/ . In this patch was executed scenario
+https://review.opendev.org/#/c/279450/ . In this patch was executed scenario
 already existing in Rally ``HeatStacks.create_and_delete_stack``.
 During executing this scenario Rally creates and then, when stack is created,
 delete Heat stack. All existing scenarios can be found here:
-https://github.com/openstack/rally/blob/master/rally/plugins/openstack/scenarios/heat/stacks.py
+https://github.com/openstack/rally-openstack/blob/master/rally_openstack/scenarios/heat/stacks.py
 
 Mentioned scenario uses Heat template as a parameter for task. The template
 path should be mentioned for argument ``template_path``. It can be one of Heat
 templates presented in Rally repository
-(https://github.com/openstack/rally/tree/master/samples/tasks/scenarios/heat/templates)
+(https://github.com/openstack/rally-openstack/tree/master/samples/tasks/scenarios/heat/templates)
 or new one, like it was done for mentioned patch. New added template should be
 placed in ``rally-scenarios/extra/`` directory.
 
 Also it's possible to specify other fields for each Rally task, like ``sla``
 or ``context``. More information about other configuration setting is
-available by link https://rally.readthedocs.org/en/latest/tutorial.html
-
+available by link https://rally.readthedocs.io/en/latest/plugins/#rally-plugins
 Mentioned patch was proposed for confirmation caching mechanism of Heat
 template validation process
 (see https://specs.openstack.org/openstack/heat-specs/specs/liberty/constraint-validation-cache.html).
@@ -94,7 +94,7 @@ is disabled (e.g. Patch Set 7). The follow results were gotten:
 
 In the next patch set (Patch Set 8) was updated by adding Depends-On reference
 to commit message. It let to execute the same test with patch for devstack,
-which turns on caching (https://review.openstack.org/#/c/279400/).
+which turns on caching (https://review.opendev.org/#/c/279400/).
 The results for this case were:
 
 +------------------+----------+----------+----------+--------+------+
@@ -117,10 +117,11 @@ that caching works correct.
 
 Also this approach may be used for detecting regressions. In this case workflow
 may be presented as follow list of steps:
- - add to task list (``heat-fakevirt.yaml``) existing or new tasks.
- - wait a result of this execution.
- - upload patchset with changes (new feature) and launch the same test again.
- - compare performance results.
+
+- add to task list (``heat-fakevirt.yaml``) existing or new tasks.
+- wait a result of this execution.
+- upload patchset with changes (new feature) and launch the same test again.
+- compare performance results.
 
 .. _compare_output_API_performance:
 
@@ -129,7 +130,7 @@ Compare output API performance
 
 Another example of using Rally job is writing custom Rally scenarios in Heat
 repository. There is an example of this is presented on review:
-https://review.openstack.org/#/c/270225/
+https://review.opendev.org/#/c/270225/
 
 It's similar on the first example, but requires more Rally specific coding.
 New tasks in ``heat-fakevirt.yaml`` use undefined in Rally repository

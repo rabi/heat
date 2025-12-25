@@ -13,9 +13,11 @@
 
 import collections
 import copy
+import functools
 import itertools
+import math
 
-import six
+from oslo_log import log as logging
 
 from heat.common import exception
 from heat.common import grouputils
@@ -24,6 +26,7 @@ from heat.common import timeutils
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import function
+from heat.engine import output
 from heat.engine import properties
 from heat.engine.resources import stack_resource
 from heat.engine import rsrc_defn
@@ -31,6 +34,8 @@ from heat.engine import scheduler
 from heat.engine import support
 from heat.scaling import rolling_update
 from heat.scaling import template as scl_template
+
+LOG = logging.getLogger(__name__)
 
 
 class ResourceGroup(stack_resource.StackResource):
@@ -74,8 +79,10 @@ class ResourceGroup(stack_resource.StackResource):
 
     PROPERTIES = (
         COUNT, INDEX_VAR, RESOURCE_DEF, REMOVAL_POLICIES,
+        REMOVAL_POLICIES_MODE,
     ) = (
         'count', 'index_var', 'resource_def', 'removal_policies',
+        'removal_policies_mode'
     )
 
     _RESOURCE_DEF_KEYS = (
@@ -88,6 +95,12 @@ class ResourceGroup(stack_resource.StackResource):
         REMOVAL_RSRC_LIST,
     ) = (
         'resource_list',
+    )
+
+    _REMOVAL_POLICY_MODES = (
+        REMOVAL_POLICY_APPEND, REMOVAL_POLICY_UPDATE
+    ) = (
+        'append', 'update'
     )
 
     _ROLLING_UPDATES_SCHEMA_KEYS = (
@@ -182,7 +195,7 @@ class ResourceGroup(stack_resource.StackResource):
                           "the 'refs' attribute. "
                           "Note this is destructive on update when specified; "
                           "even if the count is not being reduced, and once "
-                          "a resource name is removed, it's name is never "
+                          "a resource name is removed, its name is never "
                           "reused in subsequent updates."
                           ),
                         default=[]
@@ -192,6 +205,18 @@ class ResourceGroup(stack_resource.StackResource):
             update_allowed=True,
             default=[],
             support_status=support.SupportStatus(version='2015.1')
+        ),
+        REMOVAL_POLICIES_MODE: properties.Schema(
+            properties.Schema.STRING,
+            _('How to handle changes to removal_policies on update. '
+              'The default "append" mode appends to the internal list, '
+              '"update" replaces it on update.'),
+            default=REMOVAL_POLICY_APPEND,
+            constraints=[
+                constraints.AllowedValues(_REMOVAL_POLICY_MODES)
+            ],
+            update_allowed=True,
+            support_status=support.SupportStatus(version='10.0.0')
         ),
     }
 
@@ -278,9 +303,10 @@ class ResourceGroup(stack_resource.StackResource):
         if not self.get_size():
             return
 
-        test_tmpl = self._assemble_nested(["0"], include_all=True)
-        res_def = next(six.itervalues(
-            test_tmpl.resource_definitions(self.stack)))
+        first_name = next(self._resource_names())
+        test_tmpl = self._assemble_nested([first_name],
+                                          include_all=True)
+        res_def = next(iter(test_tmpl.resource_definitions(None).values()))
         # make sure we can resolve the nested resource type
         self.stack.env.get_class_to_instantiate(res_def.resource_type)
 
@@ -293,78 +319,110 @@ class ResourceGroup(stack_resource.StackResource):
             nested_stack.strict_validate = False
             nested_stack.validate()
         except Exception as ex:
-            msg = _("Failed to validate: %s") % six.text_type(ex)
-            raise exception.StackValidationFailed(message=msg)
+            path = "%s<%s>" % (self.name, self.template_url)
+            raise exception.StackValidationFailed(
+                ex, path=[self.stack.t.RESOURCES, path])
 
-    def _current_blacklist(self):
+    def _current_skiplist(self):
         db_rsrc_names = self.data().get('name_blacklist')
         if db_rsrc_names:
             return db_rsrc_names.split(',')
         else:
             return []
 
-    def _name_blacklist(self):
-        """Resolve the remove_policies to names for removal."""
+    def _get_new_skiplist_entries(self, properties, current_skiplist):
+        insp = grouputils.GroupInspector.from_parent_resource(self)
 
-        nested = self.nested()
-
-        # To avoid reusing names after removal, we store a comma-separated
-        # blacklist in the resource data
-        current_blacklist = self._current_blacklist()
-
-        # Now we iterate over the removal policies, and update the blacklist
+        # Now we iterate over the removal policies, and update the skiplist
         # with any additional names
-        rsrc_names = set(current_blacklist)
-
-        for r in self.properties[self.REMOVAL_POLICIES]:
+        for r in properties.get(self.REMOVAL_POLICIES, []):
             if self.REMOVAL_RSRC_LIST in r:
                 # Tolerate string or int list values
                 for n in r[self.REMOVAL_RSRC_LIST]:
-                    str_n = six.text_type(n)
-                    if not nested or str_n in nested:
-                        rsrc_names.add(str_n)
-                        continue
-                    rsrc = nested.resource_by_refid(str_n)
-                    if rsrc:
-                        rsrc_names.add(rsrc.name)
+                    str_n = str(n)
+                    if (str_n in current_skiplist or
+                            self.resource_id is None or
+                            str_n in insp.member_names(include_failed=True)):
+                        yield str_n
+                    elif isinstance(n, str):
+                        try:
+                            refids = self.get_output(self.REFS_MAP)
+                        except (exception.NotFound,
+                                exception.TemplateOutputError) as op_err:
+                            LOG.debug('Falling back to resource_by_refid() '
+                                      ' due to %s', op_err)
+                            rsrc = self.nested().resource_by_refid(n)
+                            if rsrc is not None:
+                                yield rsrc.name
+                        else:
+                            if refids is not None:
+                                for name, refid in refids.items():
+                                    if refid == n:
+                                        yield name
+                                        break
 
-        # If the blacklist has changed, update the resource data
-        if rsrc_names != set(current_blacklist):
-            self.data_set('name_blacklist', ','.join(rsrc_names))
-        return rsrc_names
+        # Clear output cache from prior to stack update, so we don't get
+        # outdated values after stack update.
+        self._outputs = None
+
+    def _update_name_skiplist(self, properties):
+        """Resolve the remove_policies to names for removal."""
+        # To avoid reusing names after removal, we store a comma-separated
+        # skiplist in the resource data - in cases where you want to
+        # overwrite the stored data, removal_policies_mode: update can be used
+        curr_sl = set(self._current_skiplist())
+        p_mode = properties.get(self.REMOVAL_POLICIES_MODE,
+                                self.REMOVAL_POLICY_APPEND)
+        if p_mode == self.REMOVAL_POLICY_UPDATE:
+            init_sl = set()
+        else:
+            init_sl = curr_sl
+        updated_sl = init_sl | set(self._get_new_skiplist_entries(properties,
+                                                                  curr_sl))
+
+        # If the skiplist has changed, update the resource data
+        if updated_sl != curr_sl:
+            self.data_set('name_blacklist', ','.join(sorted(updated_sl)))
+
+    def _name_skiplist(self):
+        """Get the list of resource names to skiplist."""
+        sl = set(self._current_skiplist())
+        if self.resource_id is None:
+            sl |= set(self._get_new_skiplist_entries(self.properties, sl))
+        return sl
 
     def _resource_names(self, size=None):
-        name_blacklist = self._name_blacklist()
+        name_skiplist = self._name_skiplist()
         if size is None:
             size = self.get_size()
 
-        def is_blacklisted(name):
-            return name in name_blacklist
+        def is_skipped(name):
+            return name in name_skiplist
 
-        candidates = six.moves.map(six.text_type, itertools.count())
+        candidates = map(str, itertools.count())
 
-        return itertools.islice(six.moves.filterfalse(is_blacklisted,
+        return itertools.islice(itertools.filterfalse(is_skipped,
                                                       candidates),
                                 size)
 
-    def _count_black_listed(self):
-        """Return the number of current resource names that are blacklisted."""
-        existing_members = grouputils.get_member_names(self)
-        return len(self._name_blacklist() & set(existing_members))
+    def _count_skipped(self, existing_members):
+        """Return the number of current resource names that are skipped."""
+        return len(self._name_skiplist() & set(existing_members))
 
     def handle_create(self):
-        if self.update_policy.get(self.BATCH_CREATE):
+        self._update_name_skiplist(self.properties)
+        if self.update_policy.get(self.BATCH_CREATE) and self.get_size():
             batch_create = self.update_policy[self.BATCH_CREATE]
             max_batch_size = batch_create[self.MAX_BATCH_SIZE]
             pause_sec = batch_create[self.PAUSE_TIME]
             checkers = self._replace(0, max_batch_size, pause_sec)
-            checkers[0].start()
+            if checkers:
+                checkers[0].start()
             return checkers
         else:
             names = self._resource_names()
             self.create_with_template(self._assemble_nested(names),
-                                      self.child_params(),
-                                      self.stack.timeout_secs())
+                                      self.child_params())
 
     def check_create_complete(self, checkers=None):
         if checkers is None:
@@ -376,18 +434,18 @@ class ResourceGroup(stack_resource.StackResource):
                 return False
         return True
 
-    def _run_to_completion(self, template, timeout):
+    def _run_to_completion(self, template, timeout_mins):
         updater = self.update_with_template(template, {},
-                                            timeout)
+                                            timeout_mins)
 
         while not super(ResourceGroup,
                         self).check_update_complete(updater):
             yield
 
-    def _run_update(self, total_capacity, max_updates, timeout):
+    def _run_update(self, total_capacity, max_updates, timeout_mins):
         template = self._assemble_for_rolling_update(total_capacity,
                                                      max_updates)
-        return self._run_to_completion(template, timeout)
+        return self._run_to_completion(template, timeout_mins)
 
     def check_update_complete(self, checkers):
         for checker in checkers:
@@ -411,6 +469,7 @@ class ResourceGroup(stack_resource.StackResource):
         checkers = []
         self.properties = json_snippet.properties(self.properties_schema,
                                                   self.context)
+        self._update_name_skiplist(self.properties)
         if prop_diff and self.res_def_changed(prop_diff):
             updaters = self._try_rolling_update()
             if updaters:
@@ -426,7 +485,46 @@ class ResourceGroup(stack_resource.StackResource):
         checkers[0].start()
         return checkers
 
+    def _attribute_output_name(self, *attr_path):
+        if attr_path[0] == self.REFS:
+            return self.REFS
+        return ', '.join(str(a) for a in attr_path)
+
     def get_attribute(self, key, *path):
+        if key == self.REMOVED_RSRC_LIST:
+            return self._current_skiplist()
+        if key == self.ATTR_ATTRIBUTES and not path:
+            raise exception.InvalidTemplateAttribute(resource=self.name,
+                                                     key=key)
+
+        is_resource_ref = (key.startswith("resource.") and
+                           not path and (len(key.split('.', 2)) == 2))
+        if is_resource_ref:
+            output_name = self.REFS_MAP
+        else:
+            output_name = self._attribute_output_name(key, *path)
+
+        if self.resource_id is not None:
+            try:
+                output = self.get_output(output_name)
+            except (exception.NotFound,
+                    exception.TemplateOutputError) as op_err:
+                LOG.debug('Falling back to grouputils due to %s', op_err)
+            else:
+                if is_resource_ref:
+                    try:
+                        target = key.split('.', 2)[1]
+                        return output[target]
+                    except KeyError:
+                        raise exception.NotFound(_("Member '%(mem)s' not "
+                                                   "found in group resource "
+                                                   "'%(grp)s'.") %
+                                                 {'mem': target,
+                                                  'grp': self.name})
+                if key == self.REFS:
+                    return attributes.select_from_attribute(output, path)
+                return output
+
         if key.startswith("resource."):
             return grouputils.get_nested_attrs(self, key, False, *path)
 
@@ -438,18 +536,45 @@ class ResourceGroup(stack_resource.StackResource):
             refs_map = {n: grouputils.get_rsrc_id(self, key, False, n)
                         for n in names}
             return refs_map
-        if key == self.REMOVED_RSRC_LIST:
-            return self._current_blacklist()
         if key == self.ATTR_ATTRIBUTES:
-            if not path:
-                raise exception.InvalidTemplateAttribute(
-                    resource=self.name, key=key)
             return dict((n, grouputils.get_rsrc_attr(
                 self, key, False, n, *path)) for n in names)
 
         path = [key] + list(path)
         return [grouputils.get_rsrc_attr(self, key, False, n, *path)
                 for n in names]
+
+    def _nested_output_defns(self, resource_names, get_attr_fn, get_res_fn):
+        for attr in self.referenced_attrs():
+            if isinstance(attr, str):
+                key, path = attr, []
+            else:
+                key, path = attr[0], list(attr[1:])
+            output_name = self._attribute_output_name(key, *path)
+            value = None
+
+            if key.startswith("resource."):
+                keycomponents = key.split('.', 2)
+                res_name = keycomponents[1]
+                attr_path = keycomponents[2:] + path
+                if attr_path:
+                    if res_name in resource_names:
+                        value = get_attr_fn([res_name] + attr_path)
+                else:
+                    output_name = key = self.REFS_MAP
+            elif key == self.ATTR_ATTRIBUTES and path:
+                value = {r: get_attr_fn([r] + path) for r in resource_names}
+            elif key not in self.ATTRIBUTES:
+                value = [get_attr_fn([r, key] + path) for r in resource_names]
+
+            if key == self.REFS:
+                value = [get_res_fn(r) for r in resource_names]
+
+            if value is not None:
+                yield output.OutputDefinition(output_name, value)
+
+        value = {r: get_res_fn(r) for r in resource_names}
+        yield output.OutputDefinition(self.REFS_MAP, value)
 
     def build_resource_definition(self, res_name, res_defn):
         res_def = copy.deepcopy(res_defn)
@@ -476,19 +601,25 @@ class ResourceGroup(stack_resource.StackResource):
         # At this stage, we don't mind if all of the parameters have values
         # assigned. Pass in a custom resolver to the properties to not
         # error when a parameter does not have a user entered value.
-        def ignore_param_resolve(snippet):
+        def ignore_param_resolve(snippet, nullable=False):
             if isinstance(snippet, function.Function):
                 try:
-                    return snippet.result()
+                    result = snippet.result()
                 except exception.UserParameterMissing:
                     return None
+                if not (nullable or function._non_null_value(result)):
+                    result = None
+                return result
 
-            if isinstance(snippet, collections.Mapping):
-                return dict((k, ignore_param_resolve(v))
-                            for k, v in snippet.items())
-            elif (not isinstance(snippet, six.string_types) and
-                  isinstance(snippet, collections.Iterable)):
-                return [ignore_param_resolve(v) for v in snippet]
+            if isinstance(snippet, collections.abc.Mapping):
+                return dict(filter(function._non_null_item,
+                                   ((k, ignore_param_resolve(v, nullable=True))
+                                    for k, v in snippet.items())))
+            elif (not isinstance(snippet, str) and
+                  isinstance(snippet, collections.abc.Iterable)):
+                return list(filter(function._non_null_value,
+                                   (ignore_param_resolve(v, nullable=True)
+                                    for v in snippet)))
 
             return snippet
 
@@ -514,13 +645,22 @@ class ResourceGroup(stack_resource.StackResource):
         def recurse(x):
             return self._handle_repl_val(res_name, x)
 
-        if isinstance(val, six.string_types):
+        if isinstance(val, str):
             return val.replace(repl_var, res_name)
-        elif isinstance(val, collections.Mapping):
+        elif isinstance(val, collections.abc.Mapping):
             return {k: recurse(v) for k, v in val.items()}
-        elif isinstance(val, collections.Sequence):
+        elif isinstance(val, collections.abc.Sequence):
             return [recurse(v) for v in val]
         return val
+
+    def _add_output_defns_to_template(self, tmpl, resource_names):
+        att_func = 'get_attr'
+        get_attr = functools.partial(tmpl.functions[att_func], None, att_func)
+        res_func = 'get_resource'
+        get_res = functools.partial(tmpl.functions[res_func], None, res_func)
+        for odefn in self._nested_output_defns(resource_names,
+                                               get_attr, get_res):
+            tmpl.add_output(odefn)
 
     def _assemble_nested(self, names, include_all=False,
                          template_version=('heat_template_version',
@@ -529,19 +669,29 @@ class ResourceGroup(stack_resource.StackResource):
         def_dict = self.get_resource_def(include_all)
         definitions = [(k, self.build_resource_definition(k, def_dict))
                        for k in names]
-        return scl_template.make_template(definitions,
+        tmpl = scl_template.make_template(definitions,
                                           version=template_version)
+        self._add_output_defns_to_template(tmpl, [k for k, d in definitions])
+        return tmpl
+
+    def child_template_files(self, child_env):
+        is_rolling_update = (self.action == self.UPDATE
+                             and self.update_policy[self.ROLLING_UPDATE])
+        return grouputils.get_child_template_files(self.context,
+                                                   self.stack,
+                                                   is_rolling_update,
+                                                   self.old_template_id)
 
     def _assemble_for_rolling_update(self, total_capacity, max_updates,
                                      include_all=False,
                                      template_version=('heat_template_version',
                                                        '2015-04-30')):
         names = list(self._resource_names(total_capacity))
-        name_blacklist = self._name_blacklist()
+        name_skiplist = self._name_skiplist()
 
         valid_resources = [(n, d) for n, d in
                            grouputils.get_member_definitions(self)
-                           if n not in name_blacklist]
+                           if n not in name_skiplist]
 
         targ_cap = self.get_size()
 
@@ -562,7 +712,7 @@ class ResourceGroup(stack_resource.StackResource):
 
         old_resources = sorted(valid_resources, key=replace_priority)
         existing_names = set(n for n, d in valid_resources)
-        new_names = six.moves.filterfalse(lambda n: n in existing_names,
+        new_names = itertools.filterfalse(lambda n: n in existing_names,
                                           names)
         res_def = self.get_resource_def(include_all)
         definitions = scl_template.member_definitions(
@@ -571,8 +721,10 @@ class ResourceGroup(stack_resource.StackResource):
             max_updates,
             lambda: next(new_names),
             self.build_resource_definition)
-        return scl_template.make_template(definitions,
+        tmpl = scl_template.make_template(definitions,
                                           version=template_version)
+        self._add_output_defns_to_template(tmpl, names)
+        return tmpl
 
     def _try_rolling_update(self):
         if self.update_policy[self.ROLLING_UPDATE]:
@@ -583,7 +735,7 @@ class ResourceGroup(stack_resource.StackResource):
 
     def _resolve_attribute(self, name):
         if name == self.REMOVED_RSRC_LIST:
-            return self._current_blacklist()
+            return self._current_skiplist()
 
     def _update_timeout(self, batch_cnt, pause_sec):
         total_pause_time = pause_sec * max(batch_cnt - 1, 0)
@@ -616,26 +768,44 @@ class ResourceGroup(stack_resource.StackResource):
             while not duration.expired():
                 yield
 
-        # blacklist count existing
-        num_blacklist = self._count_black_listed()
-
-        # current capacity not including existing blacklisted
-        curr_cap = len(self.nested()) - num_blacklist if self.nested() else 0
+        # current capacity not including existing skiplisted
+        inspector = grouputils.GroupInspector.from_parent_resource(self)
+        num_skiplist = self._count_skipped(
+            inspector.member_names(include_failed=False))
+        num_resources = inspector.size(include_failed=True)
+        curr_cap = num_resources - num_skiplist
 
         batches = list(self._get_batches(self.get_size(), curr_cap, batch_size,
                                          min_in_service))
-        update_timeout = self._update_timeout(len(batches), pause_sec)
+        update_timeout_secs = self._update_timeout(len(batches), pause_sec)
+
+        # NOTE(gibi) update_timeout is in seconds but the _run_update
+        # eventually calls StackResource.update_with_template that takes
+        # timeout in minutes so we need to convert here.
+        update_timeout_mins = math.ceil(update_timeout_secs / 60)
 
         def tasks():
             for index, (curr_cap, max_upd) in enumerate(batches):
                 yield scheduler.TaskRunner(self._run_update,
                                            curr_cap, max_upd,
-                                           update_timeout)
+                                           update_timeout_mins)
 
                 if index < (len(batches) - 1) and pause_sec > 0:
                     yield scheduler.TaskRunner(pause_between_batch, pause_sec)
 
         return list(tasks())
+
+    def preview(self):
+        # NOTE(pas-ha) just need to use include_all in _assemble_nested,
+        # so this method is a simplified copy of preview() from StackResource,
+        # and next two lines are basically a modified copy of child_template()
+        names = self._resource_names()
+        child_template = self._assemble_nested(names, include_all=True)
+        params = self.child_params()
+        name = "%s-%s" % (self.stack.name, self.name)
+        self._nested = self._parse_nested_stack(name, child_template, params)
+
+        return self.nested().preview_resources()
 
     def child_template(self):
         names = self._resource_names()
@@ -650,6 +820,14 @@ class ResourceGroup(stack_resource.StackResource):
             return self.create_with_template(self._assemble_nested(names),
                                              {},
                                              adopt_data=resource_data)
+
+    def get_nested_parameters_stack(self):
+        """Return a nested group of size 1 for validation."""
+        names = self._resource_names(1)
+        child_template = self._assemble_nested(names)
+        params = self.child_params()
+        name = "%s-%s" % (self.stack.name, self.name)
+        return self._parse_nested_stack(name, child_template, params)
 
 
 def resource_mapping():

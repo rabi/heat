@@ -12,12 +12,12 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mox
 from neutronclient.common import exceptions
 from neutronclient.neutron import v2_0 as neutronV20
 from neutronclient.v2_0 import client as neutronclient
-import six
+from oslo_config import cfg
 
 from heat.common import exception
 from heat.common import template_format
@@ -123,29 +123,22 @@ class VPNServiceTest(common.HeatTestCase):
 
     def setUp(self):
         super(VPNServiceTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client, 'create_vpnservice')
-        self.m.StubOutWithMock(neutronclient.Client, 'delete_vpnservice')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_vpnservice')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_vpnservice')
-        self.m.StubOutWithMock(neutronV20, 'find_resourceid_by_name_or_id')
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
+
+        def lookup(client, lookup_type, name, cmd_resource):
+            return name
+
+        self.patchobject(neutronV20,
+                         'find_resourceid_by_name_or_id',
+                         side_effect=lookup)
+
         self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
                          return_value=True)
 
     def create_vpnservice(self, resolve_neutron=True, resolve_router=True):
         self.stub_SubnetConstraint_validate()
         self.stub_RouterConstraint_validate()
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub123',
-            cmd_resource=None,
-        ).AndReturn('sub123')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'router',
-            'rou123',
-            cmd_resource=None,
-        ).AndReturn('rou123')
         if resolve_neutron:
             snippet = template_format.parse(vpnservice_template)
         else:
@@ -154,9 +147,9 @@ class VPNServiceTest(common.HeatTestCase):
             props = snippet['resources']['VPNService']['properties']
             props['router'] = 'rou123'
             del props['router_id']
-        neutronclient.Client.create_vpnservice(
-            self.VPN_SERVICE_CONF).AndReturn({'vpnservice': {'id': 'vpn123'}})
-
+        self.mockclient.create_vpnservice.return_value = {
+            'vpnservice': {'id': 'vpn123'}
+        }
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
         return vpnservice.VPNService('vpnservice',
@@ -174,7 +167,9 @@ class VPNServiceTest(common.HeatTestCase):
 
     def _test_create(self, resolve_neutron=True, resolve_router=True):
         rsrc = self.create_vpnservice(resolve_neutron, resolve_router)
-        self.m.ReplayAll()
+        self.mockclient.show_vpnservice.return_value = {
+            'vpnservice': {'status': 'ACTIVE'}
+        }
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
@@ -182,26 +177,37 @@ class VPNServiceTest(common.HeatTestCase):
         if not resolve_router:
             self.assertEqual('rou123', rsrc.properties.get(rsrc.ROUTER))
             self.assertIsNone(rsrc.properties.get(rsrc.ROUTER_ID))
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_once_with('vpn123')
+
+    def test_create_failed_error_status(self):
+        cfg.CONF.set_override('action_retry_limit', 0)
+        rsrc = self.create_vpnservice()
+
+        self.mockclient.show_vpnservice.side_effect = [
+            {'vpnservice': {'status': 'ERROR'}},
+        ]
+
+        error = self.assertRaises(exception.ResourceFailure,
+                                  scheduler.TaskRunner(rsrc.create))
+        self.assertEqual(
+            'ResourceInError: resources.vpnservice: '
+            'Went to status ERROR due to "Error in VPNService"',
+            str(error))
+        self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_with('vpn123')
 
     def test_create_failed(self):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub123',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('sub123')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'router',
-            'rou123',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('rou123')
         self.stub_RouterConstraint_validate()
 
-        neutronclient.Client.create_vpnservice(self.VPN_SERVICE_CONF).AndRaise(
-            exceptions.NeutronClientException())
-        self.m.ReplayAll()
+        self.mockclient.create_vpnservice.side_effect = (
+            exceptions.NeutronClientException)
+
         snippet = template_format.parse(vpnservice_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -213,82 +219,119 @@ class VPNServiceTest(common.HeatTestCase):
         self.assertEqual(
             'NeutronClientException: resources.vpnservice: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
 
     def test_delete(self):
-        neutronclient.Client.delete_vpnservice('vpn123')
-        neutronclient.Client.show_vpnservice('vpn123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_vpnservice()
-        self.m.ReplayAll()
+        self.mockclient.show_vpnservice.side_effect = [
+            {'vpnservice': {'status': 'ACTIVE'}},
+            exceptions.NeutronClientException(status_code=404),
+        ]
+        self.mockclient.delete_vpnservice.return_value = None
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.delete_vpnservice.assert_called_once_with(
+            'vpn123')
+        self.mockclient.show_vpnservice.assert_called_with('vpn123')
+        self.assertEqual(2, self.mockclient.show_vpnservice.call_count)
 
     def test_delete_already_gone(self):
-        neutronclient.Client.delete_vpnservice('vpn123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_vpnservice()
-        self.m.ReplayAll()
+        self.mockclient.show_vpnservice.return_value = {
+            'vpnservice': {'status': 'ACTIVE'}
+        }
+        self.mockclient.delete_vpnservice.side_effect = (
+            exceptions.NeutronClientException(status_code=404))
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_once_with('vpn123')
+        self.mockclient.delete_vpnservice.assert_called_once_with(
+            'vpn123')
 
     def test_delete_failed(self):
-        neutronclient.Client.delete_vpnservice('vpn123').AndRaise(
-            exceptions.NeutronClientException(status_code=400))
         rsrc = self.create_vpnservice()
-        self.m.ReplayAll()
+        self.mockclient.show_vpnservice.return_value = {
+            'vpnservice': {'status': 'ACTIVE'}
+        }
+        self.mockclient.delete_vpnservice.side_effect = (
+            exceptions.NeutronClientException(status_code=400))
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.ResourceFailure,
                                   scheduler.TaskRunner(rsrc.delete))
         self.assertEqual(
             'NeutronClientException: resources.vpnservice: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.DELETE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_once_with('vpn123')
+        self.mockclient.delete_vpnservice.assert_called_once_with(
+            'vpn123')
 
     def test_attribute(self):
         rsrc = self.create_vpnservice()
-        neutronclient.Client.show_vpnservice('vpn123').MultipleTimes(
-        ).AndReturn(self.VPN_SERVICE_CONF)
-        self.m.ReplayAll()
+        self.mockclient.show_vpnservice.return_value = {
+            'vpnservice': {'status': 'ACTIVE'}
+        }
+
         scheduler.TaskRunner(rsrc.create)()
+
+        self.mockclient.show_vpnservice.return_value = self.VPN_SERVICE_CONF
+
         self.assertEqual('VPNService', rsrc.FnGetAtt('name'))
         self.assertEqual('My new VPN service', rsrc.FnGetAtt('description'))
         self.assertIs(True, rsrc.FnGetAtt('admin_state_up'))
         self.assertEqual('rou123', rsrc.FnGetAtt('router_id'))
         self.assertEqual('sub123', rsrc.FnGetAtt('subnet_id'))
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_with('vpn123')
 
     def test_attribute_failed(self):
         rsrc = self.create_vpnservice()
-        self.m.ReplayAll()
+        self.mockclient.show_vpnservice.return_value = {
+            'vpnservice': {'status': 'ACTIVE'}
+        }
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.InvalidTemplateAttribute,
                                   rsrc.FnGetAtt, 'non-existent_property')
         self.assertEqual(
             'The Referenced Attribute (vpnservice non-existent_property) is '
             'incorrect.',
-            six.text_type(error))
-        self.m.VerifyAll()
+            str(error))
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_once_with('vpn123')
 
     def test_update(self):
         rsrc = self.create_vpnservice()
-        self.patchobject(rsrc, 'physical_resource_name',
-                         return_value='VPNService')
+        self.mockclient.show_vpnservice.return_value = {
+            'vpnservice': {'status': 'ACTIVE'}
+        }
+        self.mockclient.update_vpnservice.return_value = None
 
-        upd_dict = {'vpnservice': {'name': 'VPNService',
-                                   'admin_state_up': False}}
-        neutronclient.Client.update_vpnservice(
-            'vpn123', upd_dict).MultipleTimes().AndReturn(None)
+        rsrc.physical_resource_name = mock.Mock(return_value='VPNService')
 
-        self.m.ReplayAll()
         scheduler.TaskRunner(rsrc.create)()
         # with name
         prop_diff = {'name': 'VPNService', 'admin_state_up': False}
@@ -297,7 +340,14 @@ class VPNServiceTest(common.HeatTestCase):
         # without name
         prop_diff = {'name': None, 'admin_state_up': False}
         self.assertIsNone(rsrc.handle_update({}, {}, prop_diff))
-        self.m.VerifyAll()
+
+        self.mockclient.create_vpnservice.assert_called_once_with(
+            self.VPN_SERVICE_CONF)
+        self.mockclient.show_vpnservice.assert_called_once_with('vpn123')
+        upd_dict = {'vpnservice': {'name': 'VPNService',
+                                   'admin_state_up': False}}
+        self.mockclient.update_vpnservice.assert_called_with('vpn123',
+                                                             upd_dict)
 
 
 class IPsecSiteConnectionTest(common.HeatTestCase):
@@ -326,21 +376,16 @@ class IPsecSiteConnectionTest(common.HeatTestCase):
 
     def setUp(self):
         super(IPsecSiteConnectionTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client,
-                               'create_ipsec_site_connection')
-        self.m.StubOutWithMock(neutronclient.Client,
-                               'delete_ipsec_site_connection')
-        self.m.StubOutWithMock(neutronclient.Client,
-                               'show_ipsec_site_connection')
-        self.m.StubOutWithMock(neutronclient.Client,
-                               'update_ipsec_site_connection')
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
+
         self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
                          return_value=True)
 
     def create_ipsec_site_connection(self):
-        neutronclient.Client.create_ipsec_site_connection(
-            self.IPSEC_SITE_CONNECTION_CONF).AndReturn(
-                {'ipsec_site_connection': {'id': 'con123'}})
+        self.mockclient.create_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'id': 'con123'}
+        }
         snippet = template_format.parse(ipsec_site_connection_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -351,16 +396,22 @@ class IPsecSiteConnectionTest(common.HeatTestCase):
 
     def test_create(self):
         rsrc = self.create_ipsec_site_connection()
-        self.m.ReplayAll()
+        self.mockclient.show_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'status': 'ACTIVE'}
+        }
+
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_once_with(
+            'con123')
 
     def test_create_failed(self):
-        neutronclient.Client.create_ipsec_site_connection(
-            self.IPSEC_SITE_CONNECTION_CONF).AndRaise(
-                exceptions.NeutronClientException())
-        self.m.ReplayAll()
+        self.mockclient.create_ipsec_site_connection.side_effect = (
+            exceptions.NeutronClientException)
+
         snippet = template_format.parse(ipsec_site_connection_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -373,53 +424,105 @@ class IPsecSiteConnectionTest(common.HeatTestCase):
         self.assertEqual(
             'NeutronClientException: resources.ipsec_site_connection: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+
+    def test_create_failed_error_status(self):
+        cfg.CONF.set_override('action_retry_limit', 0)
+        rsrc = self.create_ipsec_site_connection()
+        self.mockclient.show_ipsec_site_connection.side_effect = [
+            {'ipsec_site_connection': {'status': 'PENDING_CREATE'}},
+            {'ipsec_site_connection': {'status': 'ERROR'}},
+        ]
+
+        error = self.assertRaises(exception.ResourceFailure,
+                                  scheduler.TaskRunner(rsrc.create))
+        self.assertEqual(
+            'ResourceInError: resources.ipsec_site_connection: '
+            'Went to status ERROR due to "Error in IPsecSiteConnection"',
+            str(error))
+        self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_with('con123')
 
     def test_delete(self):
-        neutronclient.Client.delete_ipsec_site_connection('con123')
-        neutronclient.Client.show_ipsec_site_connection('con123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_ipsec_site_connection()
-        self.m.ReplayAll()
+        self.mockclient.show_ipsec_site_connection.side_effect = [
+            {'ipsec_site_connection': {'status': 'ACTIVE'}},
+            exceptions.NeutronClientException(status_code=404),
+        ]
+        self.mockclient.delete_ipsec_site_connection.return_value = None
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.delete_ipsec_site_connection.assert_called_once_with(
+            'con123')
+        self.mockclient.show_ipsec_site_connection.assert_called_with('con123')
+        self.assertEqual(2,
+                         self.mockclient.show_ipsec_site_connection.call_count)
 
     def test_delete_already_gone(self):
-        neutronclient.Client.delete_ipsec_site_connection('con123').AndRaise(
+        self.mockclient.show_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'status': 'ACTIVE'}
+        }
+        self.mockclient.delete_ipsec_site_connection.side_effect = (
             exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_ipsec_site_connection()
-        self.m.ReplayAll()
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_once_with(
+            'con123')
+        self.mockclient.delete_ipsec_site_connection.assert_called_once_with(
+            'con123')
 
     def test_delete_failed(self):
-        neutronclient.Client.delete_ipsec_site_connection('con123').AndRaise(
+        self.mockclient.show_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'status': 'ACTIVE'}
+        }
+        self.mockclient.delete_ipsec_site_connection.side_effect = (
             exceptions.NeutronClientException(status_code=400))
         rsrc = self.create_ipsec_site_connection()
-        self.m.ReplayAll()
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.ResourceFailure,
                                   scheduler.TaskRunner(rsrc.delete))
         self.assertEqual(
             'NeutronClientException: resources.ipsec_site_connection: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.DELETE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_once_with(
+            'con123')
+        self.mockclient.delete_ipsec_site_connection.assert_called_once_with(
+            'con123')
 
     def test_attribute(self):
         rsrc = self.create_ipsec_site_connection()
-        neutronclient.Client.show_ipsec_site_connection(
-            'con123').MultipleTimes().AndReturn(
-                self.IPSEC_SITE_CONNECTION_CONF)
-        self.m.ReplayAll()
+        self.mockclient.show_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'status': 'ACTIVE'}
+        }
+
         scheduler.TaskRunner(rsrc.create)()
+        self.mockclient.show_ipsec_site_connection.return_value = (
+            self.IPSEC_SITE_CONNECTION_CONF)
+
         self.assertEqual('IPsecSiteConnection', rsrc.FnGetAtt('name'))
         self.assertEqual('My new VPN connection', rsrc.FnGetAtt('description'))
         self.assertEqual('172.24.4.233', rsrc.FnGetAtt('peer_address'))
@@ -434,31 +537,49 @@ class IPsecSiteConnectionTest(common.HeatTestCase):
         self.assertEqual('ike123', rsrc.FnGetAtt('ikepolicy_id'))
         self.assertEqual('ips123', rsrc.FnGetAtt('ipsecpolicy_id'))
         self.assertEqual('vpn123', rsrc.FnGetAtt('vpnservice_id'))
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_with('con123')
 
     def test_attribute_failed(self):
         rsrc = self.create_ipsec_site_connection()
-        self.m.ReplayAll()
+        self.mockclient.show_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'status': 'ACTIVE'}
+        }
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.InvalidTemplateAttribute,
                                   rsrc.FnGetAtt, 'non-existent_property')
         self.assertEqual(
             'The Referenced Attribute (ipsec_site_connection '
             'non-existent_property) is incorrect.',
-            six.text_type(error))
-        self.m.VerifyAll()
+            str(error))
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_with('con123')
 
     def test_update(self):
         rsrc = self.create_ipsec_site_connection()
-        neutronclient.Client.update_ipsec_site_connection(
-            'con123', {'ipsec_site_connection': {'admin_state_up': False}})
-        self.m.ReplayAll()
+        self.mockclient.show_ipsec_site_connection.return_value = {
+            'ipsec_site_connection': {'status': 'ACTIVE'}
+        }
+        self.mockclient.update_ipsec_site_connection.return_value = None
+
         scheduler.TaskRunner(rsrc.create)()
         props = dict(rsrc.properties)
         props['admin_state_up'] = False
         update_template = rsrc.t.freeze(properties=props)
         scheduler.TaskRunner(rsrc.update, update_template)()
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsec_site_connection.assert_called_once_with(
+            self.IPSEC_SITE_CONNECTION_CONF)
+        self.mockclient.show_ipsec_site_connection.assert_called_with('con123')
+        update = self.mockclient.update_ipsec_site_connection
+        update.assert_called_once_with('con123', {
+            'ipsec_site_connection': {'admin_state_up': False}
+        })
 
 
 class IKEPolicyTest(common.HeatTestCase):
@@ -481,17 +602,16 @@ class IKEPolicyTest(common.HeatTestCase):
 
     def setUp(self):
         super(IKEPolicyTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client, 'create_ikepolicy')
-        self.m.StubOutWithMock(neutronclient.Client, 'delete_ikepolicy')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_ikepolicy')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_ikepolicy')
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
+
         self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
                          return_value=True)
 
     def create_ikepolicy(self):
-        neutronclient.Client.create_ikepolicy(
-            self.IKE_POLICY_CONF).AndReturn(
-                {'ikepolicy': {'id': 'ike123'}})
+        self.mockclient.create_ikepolicy.return_value = {
+            'ikepolicy': {'id': 'ike123'}
+        }
         snippet = template_format.parse(ikepolicy_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -501,16 +621,16 @@ class IKEPolicyTest(common.HeatTestCase):
 
     def test_create(self):
         rsrc = self.create_ikepolicy()
-        self.m.ReplayAll()
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
 
     def test_create_failed(self):
-        neutronclient.Client.create_ikepolicy(
-            self.IKE_POLICY_CONF).AndRaise(
-                exceptions.NeutronClientException())
-        self.m.ReplayAll()
+        self.mockclient.create_ikepolicy.side_effect = (
+            exceptions.NeutronClientException)
+
         snippet = template_format.parse(ikepolicy_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -523,51 +643,64 @@ class IKEPolicyTest(common.HeatTestCase):
         self.assertEqual(
             'NeutronClientException: resources.ikepolicy: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
 
     def test_delete(self):
-        neutronclient.Client.delete_ikepolicy('ike123')
-        neutronclient.Client.show_ikepolicy('ike123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_ikepolicy()
-        self.m.ReplayAll()
+        self.mockclient.delete_ikepolicy.return_value = None
+        self.mockclient.show_ikepolicy.side_effect = (
+            exceptions.NeutronClientException(status_code=404))
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
+        self.mockclient.delete_ikepolicy.assert_called_once_with('ike123')
+        self.mockclient.show_ikepolicy.assert_called_once_with('ike123')
 
     def test_delete_already_gone(self):
-        neutronclient.Client.delete_ikepolicy('ike123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_ikepolicy()
-        self.m.ReplayAll()
+        self.mockclient.delete_ikepolicy.side_effect = (
+            exceptions.NeutronClientException(status_code=404))
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
+        self.mockclient.delete_ikepolicy.assert_called_once_with('ike123')
+        self.mockclient.show_ikepolicy.assert_not_called()
 
     def test_delete_failed(self):
-        neutronclient.Client.delete_ikepolicy('ike123').AndRaise(
-            exceptions.NeutronClientException(status_code=400))
         rsrc = self.create_ikepolicy()
-        self.m.ReplayAll()
+        self.mockclient.delete_ikepolicy.side_effect = (
+            exceptions.NeutronClientException(status_code=400))
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.ResourceFailure,
                                   scheduler.TaskRunner(rsrc.delete))
         self.assertEqual(
             'NeutronClientException: resources.ikepolicy: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.DELETE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
+        self.mockclient.delete_ikepolicy.assert_called_once_with('ike123')
+        self.mockclient.show_ikepolicy.assert_not_called()
 
     def test_attribute(self):
         rsrc = self.create_ikepolicy()
-        neutronclient.Client.show_ikepolicy(
-            'ike123').MultipleTimes().AndReturn(self.IKE_POLICY_CONF)
-        self.m.ReplayAll()
+        self.mockclient.show_ikepolicy.return_value = self.IKE_POLICY_CONF
+
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual('IKEPolicy', rsrc.FnGetAtt('name'))
         self.assertEqual('My new IKE policy', rsrc.FnGetAtt('description'))
@@ -578,32 +711,56 @@ class IKEPolicyTest(common.HeatTestCase):
         self.assertEqual(3600, rsrc.FnGetAtt('lifetime')['value'])
         self.assertEqual('group5', rsrc.FnGetAtt('pfs'))
         self.assertEqual('v1', rsrc.FnGetAtt('ike_version'))
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
+        self.mockclient.show_ikepolicy.assert_called_with('ike123')
 
     def test_attribute_failed(self):
         rsrc = self.create_ikepolicy()
-        self.m.ReplayAll()
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.InvalidTemplateAttribute,
                                   rsrc.FnGetAtt, 'non-existent_property')
         self.assertEqual(
             'The Referenced Attribute (ikepolicy non-existent_property) is '
             'incorrect.',
-            six.text_type(error))
-        self.m.VerifyAll()
+            str(error))
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
+        self.mockclient.show_ikepolicy.assert_not_called()
 
     def test_update(self):
         rsrc = self.create_ikepolicy()
-        neutronclient.Client.update_ikepolicy('ike123',
-                                              {'ikepolicy': {
-                                                  'name': 'New IKEPolicy'}})
-        self.m.ReplayAll()
+        self.mockclient.update_ikepolicy.return_value = None
+
+        new_props = {
+            'name': 'New IKEPolicy',
+            'auth_algorithm': 'sha512',
+            'description': 'New description',
+            'encryption_algorithm': 'aes-256',
+            'lifetime': {
+                'units': 'seconds',
+                'value': 1800
+            },
+            'pfs': 'group2',
+            'ike_version': 'v2'
+        }
+        update_body = {
+            'ikepolicy': new_props
+        }
         scheduler.TaskRunner(rsrc.create)()
         props = dict(rsrc.properties)
-        props['name'] = 'New IKEPolicy'
+        props.update(new_props)
+
         update_template = rsrc.t.freeze(properties=props)
         scheduler.TaskRunner(rsrc.update, update_template)()
-        self.m.VerifyAll()
+
+        self.mockclient.create_ikepolicy.assert_called_once_with(
+            self.IKE_POLICY_CONF)
+        self.mockclient.update_ikepolicy.assert_called_once_with(
+            'ike123', update_body)
 
 
 class IPsecPolicyTest(common.HeatTestCase):
@@ -626,17 +783,16 @@ class IPsecPolicyTest(common.HeatTestCase):
 
     def setUp(self):
         super(IPsecPolicyTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client, 'create_ipsecpolicy')
-        self.m.StubOutWithMock(neutronclient.Client, 'delete_ipsecpolicy')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_ipsecpolicy')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_ipsecpolicy')
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
+
         self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
                          return_value=True)
 
     def create_ipsecpolicy(self):
-        neutronclient.Client.create_ipsecpolicy(
-            self.IPSEC_POLICY_CONF).AndReturn(
-                {'ipsecpolicy': {'id': 'ips123'}})
+        self.mockclient.create_ipsecpolicy.return_value = {
+            'ipsecpolicy': {'id': 'ips123'}
+        }
         snippet = template_format.parse(ipsecpolicy_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -646,16 +802,17 @@ class IPsecPolicyTest(common.HeatTestCase):
 
     def test_create(self):
         rsrc = self.create_ipsecpolicy()
-        self.m.ReplayAll()
+
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
 
     def test_create_failed(self):
-        neutronclient.Client.create_ipsecpolicy(
-            self.IPSEC_POLICY_CONF).AndRaise(
-                exceptions.NeutronClientException())
-        self.m.ReplayAll()
+        self.mockclient.create_ipsecpolicy.side_effect = (
+            exceptions.NeutronClientException)
+
         snippet = template_format.parse(ipsecpolicy_template)
         self.stack = utils.parse_stack(snippet)
         resource_defns = self.stack.t.resource_definitions(self.stack)
@@ -668,51 +825,64 @@ class IPsecPolicyTest(common.HeatTestCase):
         self.assertEqual(
             'NeutronClientException: resources.ipsecpolicy: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
 
     def test_delete(self):
-        neutronclient.Client.delete_ipsecpolicy('ips123')
-        neutronclient.Client.show_ipsecpolicy('ips123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_ipsecpolicy()
-        self.m.ReplayAll()
+        self.mockclient.delete_ipsecpolicy.return_value = None
+        self.mockclient.show_ipsecpolicy.side_effect = (
+            exceptions.NeutronClientException(status_code=404))
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
+        self.mockclient.delete_ipsecpolicy.assert_called_once_with('ips123')
+        self.mockclient.show_ipsecpolicy.assert_called_once_with('ips123')
 
     def test_delete_already_gone(self):
-        neutronclient.Client.delete_ipsecpolicy('ips123').AndRaise(
-            exceptions.NeutronClientException(status_code=404))
         rsrc = self.create_ipsecpolicy()
-        self.m.ReplayAll()
+        self.mockclient.delete_ipsecpolicy.side_effect = (
+            exceptions.NeutronClientException(status_code=404))
+
         scheduler.TaskRunner(rsrc.create)()
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
+        self.mockclient.delete_ipsecpolicy.assert_called_once_with('ips123')
+        self.mockclient.show_ipsecpolicy.assert_not_called()
 
     def test_delete_failed(self):
-        neutronclient.Client.delete_ipsecpolicy('ips123').AndRaise(
-            exceptions.NeutronClientException(status_code=400))
         rsrc = self.create_ipsecpolicy()
-        self.m.ReplayAll()
+        self.mockclient.delete_ipsecpolicy.side_effect = (
+            exceptions.NeutronClientException(status_code=400))
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.ResourceFailure,
                                   scheduler.TaskRunner(rsrc.delete))
         self.assertEqual(
             'NeutronClientException: resources.ipsecpolicy: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.DELETE, rsrc.FAILED), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
+        self.mockclient.delete_ipsecpolicy.assert_called_once_with('ips123')
+        self.mockclient.show_ipsecpolicy.assert_not_called()
 
     def test_attribute(self):
         rsrc = self.create_ipsecpolicy()
-        neutronclient.Client.show_ipsecpolicy(
-            'ips123').MultipleTimes().AndReturn(self.IPSEC_POLICY_CONF)
-        self.m.ReplayAll()
+        self.mockclient.show_ipsecpolicy.return_value = self.IPSEC_POLICY_CONF
+
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual('IPsecPolicy', rsrc.FnGetAtt('name'))
         self.assertEqual('My new IPsec policy', rsrc.FnGetAtt('description'))
@@ -723,30 +893,40 @@ class IPsecPolicyTest(common.HeatTestCase):
         self.assertEqual('seconds', rsrc.FnGetAtt('lifetime')['units'])
         self.assertEqual(3600, rsrc.FnGetAtt('lifetime')['value'])
         self.assertEqual('group5', rsrc.FnGetAtt('pfs'))
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
+        self.mockclient.show_ipsecpolicy.assert_called_with('ips123')
 
     def test_attribute_failed(self):
         rsrc = self.create_ipsecpolicy()
-        self.m.ReplayAll()
+
         scheduler.TaskRunner(rsrc.create)()
         error = self.assertRaises(exception.InvalidTemplateAttribute,
                                   rsrc.FnGetAtt, 'non-existent_property')
         self.assertEqual(
             'The Referenced Attribute (ipsecpolicy non-existent_property) is '
             'incorrect.',
-            six.text_type(error))
-        self.m.VerifyAll()
+            str(error))
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
+        self.mockclient.show_ipsecpolicy.assert_not_called()
 
     def test_update(self):
         rsrc = self.create_ipsecpolicy()
-        neutronclient.Client.update_ipsecpolicy(
-            'ips123',
-            {'ipsecpolicy': {'name': 'New IPsecPolicy'}})
-        self.m.ReplayAll()
+        self.mockclient.update_ipsecpolicy.return_value = None
+
         scheduler.TaskRunner(rsrc.create)()
         update_template = copy.deepcopy(rsrc.t)
         props = dict(rsrc.properties)
         props['name'] = 'New IPsecPolicy'
         update_template = rsrc.t.freeze(properties=props)
         scheduler.TaskRunner(rsrc.update, update_template)()
-        self.m.VerifyAll()
+
+        self.mockclient.create_ipsecpolicy.assert_called_once_with(
+            self.IPSEC_POLICY_CONF)
+        self.mockclient.update_ipsecpolicy.assert_called_once_with(
+            'ips123',
+            {'ipsecpolicy': {'name': 'New IPsecPolicy'}})
+        self.mockclient.show_ipsecpolicy.assert_not_called()

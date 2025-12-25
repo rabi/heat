@@ -12,7 +12,6 @@
 #    under the License.
 
 from requests import exceptions
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -54,15 +53,16 @@ class NestedStack(stack_resource.StackResource):
     }
 
     def child_template(self):
+        template_url = self.properties[self.TEMPLATE_URL]
         try:
-            template_data = urlfetch.get(self.properties[self.TEMPLATE_URL])
+            template_data = urlfetch.get(template_url)
         except (exceptions.RequestException, IOError) as r_exc:
             raise ValueError(_("Could not fetch remote template '%(url)s': "
                              "%(exc)s") %
-                             {'url': self.properties[self.TEMPLATE_URL],
+                             {'url': template_url,
                               'exc': r_exc})
 
-        return template_format.parse(template_data)
+        return template_format.parse(template_data, template_url)
 
     def child_params(self):
         return self.properties[self.PARAMETERS]
@@ -84,31 +84,25 @@ class NestedStack(stack_resource.StackResource):
         if key and not key.startswith('Outputs.'):
             raise exception.InvalidTemplateAttribute(resource=self.name,
                                                      key=key)
-        attribute = self.get_output(key.partition('.')[-1])
+        try:
+            attribute = self.get_output(key.partition('.')[-1])
+        except exception.NotFound:
+            raise exception.InvalidTemplateAttribute(resource=self.name,
+                                                     key=key)
         return attributes.select_from_attribute(attribute, path)
 
     def get_reference_id(self):
-        if self.nested() is None:
-            return six.text_type(self.name)
+        identifier = self.nested_identifier()
+        if identifier is None:
+            return str(self.name)
 
-        return self.nested().identifier().arn()
+        return identifier.arn()
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         # Nested stack template may be changed even if the prop_diff is empty.
         self.properties = json_snippet.properties(self.properties_schema,
                                                   self.context)
-
-        try:
-            template_data = urlfetch.get(self.properties[self.TEMPLATE_URL])
-        except (exceptions.RequestException, IOError) as r_exc:
-            raise ValueError(_("Could not fetch remote template '%(url)s': "
-                             "%(exc)s") %
-                             {'url': self.properties[self.TEMPLATE_URL],
-                              'exc': r_exc})
-
-        template = template_format.parse(template_data)
-
-        return self.update_with_template(template,
+        return self.update_with_template(self.child_template(),
                                          self.properties[self.PARAMETERS],
                                          self.properties[self.TIMEOUT_IN_MINS])
 

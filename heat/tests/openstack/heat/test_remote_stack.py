@@ -12,18 +12,21 @@
 #    under the License.
 
 import collections
+import json
+from unittest import mock
 
 from heatclient import exc
 from heatclient.v1 import stacks
-import mock
+from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
+from heat.common import policy
 from heat.common import template_format
 from heat.engine.clients.os import heat_plugin
 from heat.engine import environment
+from heat.engine import node_data
 from heat.engine import resource
 from heat.engine.resources.openstack.heat import remote_stack
 from heat.engine import rsrc_defn
@@ -130,7 +133,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         self.that_region = 'RegionTwo'
         self.bad_region = 'RegionNone'
 
-        cfg.CONF.set_override('action_retry_limit', 0, enforce_type=True)
+        cfg.CONF.set_override('action_retry_limit', 0)
         self.parent = None
         self.heat = None
         self.client_plugin = None
@@ -143,14 +146,18 @@ class RemoteStackTest(tests_common.HeatTestCase):
 
         self.addCleanup(unset_clients_property)
 
-    def initialize(self):
-        parent, rsrc = self.create_parent_stack(remote_region='RegionTwo')
+    def initialize(self, stack_template=None):
+        parent, rsrc = self.create_parent_stack(remote_region='RegionTwo',
+                                                stack_template=stack_template)
         self.parent = parent
         self.heat = rsrc._context().clients.client("heat")
         self.client_plugin = rsrc._context().clients.client_plugin('heat')
 
-    def create_parent_stack(self, remote_region=None, custom_template=None):
-        snippet = template_format.parse(parent_stack_template)
+    def create_parent_stack(self, remote_region=None, custom_template=None,
+                            stack_template=None):
+        if not stack_template:
+            stack_template = parent_stack_template
+        snippet = template_format.parse(stack_template)
         self.files = {
             'remote_template.yaml': custom_template or remote_template
         }
@@ -195,13 +202,13 @@ class RemoteStackTest(tests_common.HeatTestCase):
 
         return parent, rsrc
 
-    def create_remote_stack(self):
+    def create_remote_stack(self, stack_template=None):
         # This method default creates a stack on RegionTwo (self.other_region)
         defaults = [get_stack(stack_status='CREATE_IN_PROGRESS'),
                     get_stack(stack_status='CREATE_COMPLETE')]
 
         if self.parent is None:
-            self.initialize()
+            self.initialize(stack_template=stack_template)
 
         # prepare clients to return status
         self.heat.stacks.create.return_value = {'stack': get_stack().to_dict()}
@@ -253,7 +260,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
                                rsrc.validate)
         msg = ('Cannot establish connection to Heat endpoint '
                'at region "%s"' % self.bad_region)
-        self.assertIn(msg, six.text_type(ex))
+        self.assertIn(msg, str(ex))
 
     def test_remote_validation_failed(self):
         parent, rsrc = self.create_parent_stack(remote_region=self.that_region,
@@ -274,7 +281,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed, rsrc.validate)
         msg = ('Failed validating stack template using Heat endpoint at region'
                ' "%s"') % self.that_region
-        self.assertIn(msg, six.text_type(ex))
+        self.assertIn(msg, str(ex))
 
     def test_create(self):
         rsrc = self.create_remote_stack()
@@ -296,6 +303,77 @@ class RemoteStackTest(tests_common.HeatTestCase):
         self.heat.stacks.create.assert_called_with(**args)
         self.assertEqual(2, len(self.heat.stacks.get.call_args_list))
 
+    def _create_with_remote_credential(self, credential_secret_id=None,
+                                       ca_cert=None, insecure=False):
+
+        t = template_format.parse(parent_stack_template)
+        properties = t['resources']['remote_stack']['properties']
+        if credential_secret_id:
+            properties['context']['credential_secret_id'] = (
+                credential_secret_id)
+        if ca_cert:
+            properties['context']['ca_cert'] = (
+                ca_cert)
+        if insecure:
+            properties['context']['insecure'] = insecure
+        t = json.dumps(t)
+        self.patchobject(policy.Enforcer, 'check_is_admin')
+
+        rsrc = self.create_remote_stack(stack_template=t)
+        env = environment.get_child_environment(rsrc.stack.env,
+                                                {'name': 'foo'})
+        args = {
+            'stack_name': rsrc.physical_resource_name(),
+            'template': template_format.parse(remote_template),
+            'timeout_mins': 60,
+            'disable_rollback': True,
+            'parameters': {'name': 'foo'},
+            'files': self.files,
+            'environment': env.user_env_as_dict(),
+        }
+        self.heat.stacks.create.assert_called_with(**args)
+        self.assertEqual(2, len(self.heat.stacks.get.call_args_list))
+        rsrc.validate()
+        return rsrc
+
+    @mock.patch('heat.engine.clients.os.barbican.BarbicanClientPlugin.'
+                'get_secret_payload_by_ref')
+    def test_create_with_credential_secret_id(self, m_gsbr):
+        secret = (
+            '{"auth_type": "v3applicationcredential", '
+            '"auth": {"auth_url": "http://192.168.1.101/identity/v3", '
+            '"application_credential_id": "9dfa187e5a354484bf9c49a2b674333a", '
+            '"application_credential_secret": "sec"} }')
+        m_gsbr.return_value = secret
+        self.m_plugin = mock.Mock()
+        self.m_loader = self.patchobject(
+            ks_loading, 'get_plugin_loader', return_value=self.m_plugin)
+        self._create_with_remote_credential('cred_2')
+        self.assertEqual(
+            [mock.call(secret_ref='secrets/cred_2')] * 2,
+            m_gsbr.call_args_list)
+        expected_load_options = [
+            mock.call(
+                application_credential_id='9dfa187e5a354484bf9c49a2b674333a',
+                application_credential_secret='sec',
+                auth_url='http://192.168.1.101/identity/v3')] * 2
+
+        self.assertEqual(expected_load_options,
+                         self.m_plugin.load_from_options.call_args_list)
+
+    def test_create_with_ca_cert(self):
+        ca_cert = (
+            "-----BEGIN CERTIFICATE----- A CA CERT -----END CERTIFICATE-----")
+        rsrc = self._create_with_remote_credential(
+            ca_cert=ca_cert)
+        self.assertEqual(ca_cert, rsrc._cacert)
+        self.assertEqual(ca_cert, rsrc.cacert)
+        self.assertIn('/tmp/', rsrc._ssl_verify)
+
+    def test_create_with_insecure(self):
+        rsrc = self._create_with_remote_credential(insecure=True)
+        self.assertFalse(rsrc._ssl_verify)
+
     def test_create_failed(self):
         returns = [get_stack(stack_status='CREATE_IN_PROGRESS'),
                    get_stack(stack_status='CREATE_FAILED',
@@ -316,7 +394,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         error_msg = ('ResourceInError: resources.remote_stack: '
                      'Went to status CREATE_FAILED due to '
                      '"Remote stack creation failed"')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
 
     def test_delete(self):
@@ -362,7 +440,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         error_msg = ('ResourceInError: resources.remote_stack: '
                      'Went to status DELETE_FAILED due to '
                      '"Remote stack deletion failed"')
-        self.assertIn(error_msg, six.text_type(error))
+        self.assertIn(error_msg, str(error))
         self.assertEqual((rsrc.DELETE, rsrc.FAILED), rsrc.state)
         self.heat.stacks.delete.assert_called_with(stack_id=remote_stack_id)
         self.assertEqual(rsrc.resource_id, remote_stack_id)
@@ -391,7 +469,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         self.assertEqual(
             'The Referenced Attribute (remote_stack non-existent_property) is '
             'incorrect.',
-            six.text_type(error))
+            str(error))
 
     def test_snapshot(self):
         stacks = [get_stack(stack_status='SNAPSHOT_IN_PROGRESS'),
@@ -484,7 +562,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         error_msg = ('ResourceInError: resources.remote_stack: '
                      'Went to status CHECK_FAILED due to '
                      '"Remote stack check failed"')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.CHECK, rsrc.FAILED), rsrc.state)
         self.heat.actions.check.assert_called_with(stack_id=rsrc.resource_id)
 
@@ -517,7 +595,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         error_msg = ('ResourceInError: resources.remote_stack: '
                      'Went to status RESUME_FAILED due to '
                      '"Remote stack resume failed"')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.RESUME, rsrc.FAILED), rsrc.state)
         self.heat.actions.resume.assert_called_with(stack_id=rsrc.resource_id)
 
@@ -529,7 +607,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
                                   scheduler.TaskRunner(rsrc.resume))
         error_msg = ('Error: resources.remote_stack: '
                      'Cannot resume remote_stack, resource not found')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.RESUME, rsrc.FAILED), rsrc.state)
 
     def test_suspend(self):
@@ -559,7 +637,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         error_msg = ('ResourceInError: resources.remote_stack: '
                      'Went to status SUSPEND_FAILED due to '
                      '"Remote stack suspend failed"')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.SUSPEND, rsrc.FAILED), rsrc.state)
         # assert suspend was not called
         self.heat.actions.suspend.assert_has_calls([])
@@ -573,7 +651,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
                                   scheduler.TaskRunner(rsrc.suspend))
         error_msg = ('Error: resources.remote_stack: '
                      'Cannot suspend remote_stack, resource not found')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.SUSPEND, rsrc.FAILED), rsrc.state)
         # assert suspend was not called
         self.heat.actions.suspend.assert_has_calls([])
@@ -640,7 +718,7 @@ class RemoteStackTest(tests_common.HeatTestCase):
         error_msg = _('ResourceInError: resources.remote_stack: '
                       'Went to status UPDATE_FAILED due to '
                       '"Remote stack update failed"')
-        self.assertEqual(error_msg, six.text_type(error))
+        self.assertEqual(error_msg, str(error))
         self.assertEqual((rsrc.UPDATE, rsrc.FAILED), rsrc.state)
         self.assertEqual(2, len(self.heat.stacks.get.call_args_list))
 
@@ -668,15 +746,15 @@ class RemoteStackTest(tests_common.HeatTestCase):
 
     def test_remote_stack_refid_convergence_cache_data(self):
         t = template_format.parse(parent_stack_template)
-        cache_data = {'remote_stack': {
+        cache_data = {'remote_stack': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'reference_id': 'convg_xyz'
-        }}
+        })}
         stack = utils.parse_stack(t, cache_data=cache_data)
-        rsrc = stack['remote_stack']
+        rsrc = stack.defn['remote_stack']
         self.assertEqual('convg_xyz', rsrc.FnGetRefId())
 
     def test_update_in_check_failed_state(self):

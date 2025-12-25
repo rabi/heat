@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from heat.common import exception
 from heat.common import service_utils
@@ -36,7 +36,7 @@ class StackLockTest(common.HeatTestCase):
             stack_object.Stack, 'get_by_id', return_value=stack)
 
     class TestThreadLockException(Exception):
-            pass
+        pass
 
     def test_successful_acquire_new_lock(self):
         mock_create = self.patchobject(stack_lock_object.StackLock,
@@ -62,7 +62,8 @@ class StackLockTest(common.HeatTestCase):
         self.mock_get_by_id.assert_called_once_with(
             self.context,
             self.stack_id,
-            show_deleted=True)
+            show_deleted=True,
+            eager_load=False)
         mock_create.assert_called_once_with(
             self.context, self.stack_id, self.engine_id)
 
@@ -96,7 +97,8 @@ class StackLockTest(common.HeatTestCase):
         self.mock_get_by_id.assert_called_once_with(
             self.context,
             self.stack_id,
-            show_deleted=True)
+            show_deleted=True,
+            eager_load=False)
 
         mock_create.assert_called_once_with(
             self.context, self.stack_id, self.engine_id)
@@ -116,7 +118,8 @@ class StackLockTest(common.HeatTestCase):
         self.mock_get_by_id.assert_called_once_with(
             self.context,
             self.stack_id,
-            show_deleted=True)
+            show_deleted=True,
+            eager_load=False)
 
         mock_create.assert_called_once_with(
             self.context, self.stack_id, self.engine_id)
@@ -157,7 +160,8 @@ class StackLockTest(common.HeatTestCase):
         self.mock_get_by_id.assert_called_with(
             self.context,
             self.stack_id,
-            show_deleted=True)
+            show_deleted=True,
+            eager_load=False)
 
         mock_create.assert_has_calls(
             [mock.call(self.context, self.stack_id, self.engine_id)] * 2)

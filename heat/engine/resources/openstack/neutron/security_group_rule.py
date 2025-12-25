@@ -28,6 +28,8 @@ class SecurityGroupRule(neutron.NeutronResource):
 
     required_service_extension = 'security-group'
 
+    entity = 'security_group_rule'
+
     support_status = support.SupportStatus(version='7.0.0')
 
     PROPERTIES = (
@@ -130,28 +132,25 @@ class SecurityGroupRule(neutron.NeutronResource):
     }
 
     def translation_rules(self, props):
+        client_plugin = self.client_plugin()
         return [
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.SECURITY_GROUP],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='security_group'
+                entity=client_plugin.RES_TYPE_SECURITY_GROUP
             ),
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.REMOTE_GROUP],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='security_group'
+                entity=client_plugin.RES_TYPE_SECURITY_GROUP
             ),
         ]
-
-    def _show_resource(self):
-        return self.client().show_security_group_rule(
-            self.resource_id)['security_group_rule']
 
     def validate(self):
         super(SecurityGroupRule, self).validate()

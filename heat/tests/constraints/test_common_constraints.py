@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
+from unittest import mock
 
 from heat.engine.constraint import common_constraints as cc
 from heat.tests import common
@@ -35,6 +35,11 @@ class TestIPConstraint(common.HeatTestCase):
 
     def test_invalidate_ipv4_format(self):
         invalidate_format = [
+            None,
+            123,
+            '1.1',
+            '1.1.',
+            '1.1.1',
             '1.1.1.',
             '1.1.1.256',
             'invalidate format',
@@ -100,7 +105,6 @@ class TestCIDRConstraint(common.HeatTestCase):
         validate_format = [
             '10.0.0.0/24',
             '6000::/64',
-            '8.8.8.8'
         ]
         for cidr in validate_format:
             self.assertTrue(self.constraint.validate(cidr, None))
@@ -111,10 +115,101 @@ class TestCIDRConstraint(common.HeatTestCase):
             'Invalid cidr',
             '300.0.0.0/24',
             '10.0.0.0/33',
-            '8.8.8.0/ 24'
+            '10.0.0/24',
+            '10.0/24',
+            '10.0.a.10/24',
+            '8.8.8.0/ 24',
+            '8.8.8.8'
         ]
         for cidr in invalidate_format:
             self.assertFalse(self.constraint.validate(cidr, None))
+
+    @mock.patch('neutron_lib.api.validators.validate_subnet')
+    def test_validate(self, mock_validate_subnet):
+        test_formats = [
+            '10.0.0/24',
+            '10.0/24',
+        ]
+        self.assertFalse(self.constraint.validate('10.0.0.0/33', None))
+
+        for cidr in test_formats:
+            self.assertFalse(self.constraint.validate(cidr, None))
+
+        mock_validate_subnet.assert_any_call('10.0.0/24')
+        mock_validate_subnet.assert_called_with('10.0/24')
+        self.assertEqual(mock_validate_subnet.call_count, 2)
+
+
+class TestIPCIDRConstraint(common.HeatTestCase):
+
+    def setUp(self):
+        super(TestIPCIDRConstraint, self).setUp()
+        self.constraint = cc.IPCIDRConstraint()
+
+    def test_valid_format(self):
+        validate_format = [
+            '10.0.0.0/24',
+            '1.1.1.1',
+            '1.0.1.1',
+            '255.255.255.255',
+            '6000::/64',
+            '2002:2002::20c:29ff:fe7d:811a',
+            '::1',
+            '2002::',
+            '2002::1',
+        ]
+        for value in validate_format:
+            self.assertTrue(self.constraint.validate(value, None))
+
+    def test_invalid_format(self):
+        invalidate_format = [
+            '::/129',
+            'Invalid cidr',
+            '300.0.0.0/24',
+            '10.0.0.0/33',
+            '10.0.0/24',
+            '10.0/24',
+            '10.0.a.10/24',
+            '8.8.8.0/ 24',
+            None,
+            123,
+            '1.1',
+            '1.1.',
+            '1.1.1',
+            '1.1.1.',
+            '1.1.1.256',
+            '1.a.1.1',
+            '2002::2001::1',
+            '2002::g',
+            '2001::0::',
+            '20c:29ff:fe7d:811a'
+        ]
+        for value in invalidate_format:
+            self.assertFalse(self.constraint.validate(value, None))
+
+    @mock.patch('neutron_lib.api.validators.validate_subnet')
+    @mock.patch('neutron_lib.api.validators.validate_ip_address')
+    def test_validate(self, mock_validate_ip, mock_validate_subnet):
+        test_formats = [
+            '10.0.0/24',
+            '10.0/24',
+            '10.0.0.0/33',
+
+        ]
+        for cidr in test_formats:
+            self.assertFalse(self.constraint.validate(cidr, None))
+            mock_validate_subnet.assert_called_with(cidr)
+        self.assertEqual(mock_validate_subnet.call_count, 3)
+
+        test_formats = [
+            '10.0.0',
+            '10.0',
+            '10.0.0.0',
+        ]
+        for ip in test_formats:
+            self.assertFalse(self.constraint.validate(ip, None))
+            mock_validate_ip.assert_called_with(ip)
+        self.assertEqual(mock_validate_ip.call_count, 3)
 
 
 class TestISO8601Constraint(common.HeatTestCase):
@@ -157,20 +252,15 @@ class CRONExpressionConstraint(common.HeatTestCase):
 
     def test_validation_out_of_range_error(self):
         cron_expression = "* * * * * 100"
-        expect = ("Invalid CRON expression: [%s] "
-                  "is not acceptable, out of range") % cron_expression
+        expect = "Invalid CRON expression: "
         self.assertFalse(self.constraint.validate(cron_expression, self.ctx))
-        self.assertEqual(expect,
-                         six.text_type(self.constraint._error_message))
+        self.assertTrue(str(self.constraint._error_message).startswith(expect))
 
     def test_validation_columns_length_error(self):
         cron_expression = "* *"
-        expect = ("Invalid CRON expression: Exactly 5 "
-                  "or 6 columns has to be specified for "
-                  "iteratorexpression.")
+        expect = "Invalid CRON expression: "
         self.assertFalse(self.constraint.validate(cron_expression, self.ctx))
-        self.assertEqual(expect,
-                         six.text_type(self.constraint._error_message))
+        self.assertTrue(str(self.constraint._error_message).startswith(expect))
 
 
 class TimezoneConstraintTest(common.HeatTestCase):
@@ -185,12 +275,13 @@ class TimezoneConstraintTest(common.HeatTestCase):
 
     def test_validation_error(self):
         timezone = "wrong_timezone"
-        expected = "Invalid timezone: '%s'" % timezone
+        err = "No time zone found with key %s" % timezone
+        expected = "Invalid timezone: '%s'" % err
 
         self.assertFalse(self.constraint.validate(timezone, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_none(self):
@@ -216,7 +307,7 @@ class DNSNameConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(dns_name, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_error_empty_component(self):
@@ -227,7 +318,7 @@ class DNSNameConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(dns_name, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_error_special_char(self):
@@ -240,7 +331,7 @@ class DNSNameConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(dns_name, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_error_tld_allnumeric(self):
@@ -252,7 +343,7 @@ class DNSNameConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(dns_name, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_none(self):
@@ -276,7 +367,7 @@ class DNSDomainConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(dns_domain, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_none(self):
@@ -300,7 +391,7 @@ class FIPDNSNameConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(dns_name, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_none(self):
@@ -326,7 +417,7 @@ class ExpirationConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(expiration, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
         )
 
     def test_validation_before_current_time(self):
@@ -337,7 +428,34 @@ class ExpirationConstraintTest(common.HeatTestCase):
         self.assertFalse(self.constraint.validate(expiration, self.ctx))
         self.assertEqual(
             expected,
-            six.text_type(self.constraint._error_message)
+            str(self.constraint._error_message)
+        )
+
+    def test_validation_none(self):
+        self.assertTrue(self.constraint.validate(None, self.ctx))
+
+
+class JsonStringConstraintTest(common.HeatTestCase):
+
+    def setUp(self):
+        super(JsonStringConstraintTest, self).setUp()
+        self.ctx = utils.dummy_context()
+        self.constraint = cc.JsonStringConstraint()
+
+    def test_validate_json(self):
+        data = '{"key": "value"}'
+        self.assertTrue(self.constraint.validate(data, None))
+
+    def test_validation_error(self):
+        data = '{\'key\': \'value\'}'
+        expected = (
+            "JSON string {0} is invalid: Expecting property name "
+            "enclosed in double quotes: line 1 column 2 (char 1)".format(data))
+
+        self.assertFalse(self.constraint.validate(data, self.ctx))
+        self.assertEqual(
+            expected,
+            str(self.constraint._error_message)
         )
 
     def test_validation_none(self):

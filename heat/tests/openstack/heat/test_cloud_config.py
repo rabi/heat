@@ -11,9 +11,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
 import uuid
+import yaml
 
-import mock
 
 from heat.engine import stack
 from heat.engine import template
@@ -53,6 +54,7 @@ class CloudConfigTest(common.HeatTestCase):
         kwargs = self.rpc_client.create_software_config.call_args[1]
         self.assertEqual({
             'name': self.config.physical_resource_name(),
-            'config': '#cloud-config\n{foo: bar}\n',
+            'config': '\n'.join(['#cloud-config',
+                                 yaml.safe_dump({'foo': 'bar'})]),
             'group': 'Heat::Ungrouped'
         }, kwargs)

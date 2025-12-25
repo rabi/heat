@@ -13,23 +13,26 @@
 
 from heat.common import exception
 from heat.common.i18n import _
+from heat.engine import constraints
 from heat.engine import properties
 from heat.engine.resources.openstack.neutron import neutron
 from heat.engine import support
-
-from neutronclient.neutron import v2_0 as neutronV20
+from heat.engine import translation
 
 
 class RBACPolicy(neutron.NeutronResource):
     """A Resource for managing RBAC policy in Neutron.
 
     This resource creates and manages Neutron RBAC policy,
-    which allows to share Neutron networks to subsets of tenants.
+    which allows to share Neutron networks and qos-policies
+    to subsets of tenants.
     """
 
     support_status = support.SupportStatus(version='6.0.0')
 
     required_service_extension = 'rbac-policies'
+
+    entity = 'rbac_policy'
 
     PROPERTIES = (
         OBJECT_TYPE, TARGET_TENANT, ACTION, OBJECT_ID, TENANT_ID
@@ -37,14 +40,32 @@ class RBACPolicy(neutron.NeutronResource):
         'object_type', 'target_tenant', 'action', 'object_id', 'tenant_id'
     )
 
+    OBJECT_TYPE_KEYS = (
+        OBJECT_NETWORK, OBJECT_QOS_POLICY,
+    ) = (
+        'network', 'qos_policy',
+    )
+
+    ACTION_KEYS = (
+        ACCESS_AS_SHARED, ACCESS_AS_EXTERNAL,
+    ) = (
+        'access_as_shared', 'access_as_external',
+    )
+
     # Change it when neutron supports more function in the future.
-    SUPPORTED_TYPES_ACTIONS = {'network': ['access_as_shared']}
+    SUPPORTED_TYPES_ACTIONS = {
+        OBJECT_NETWORK: [ACCESS_AS_SHARED, ACCESS_AS_EXTERNAL],
+        OBJECT_QOS_POLICY: [ACCESS_AS_SHARED],
+    }
 
     properties_schema = {
         OBJECT_TYPE: properties.Schema(
             properties.Schema.STRING,
             _('Type of the object that RBAC policy affects.'),
             required=True,
+            constraints=[
+                constraints.AllowedValues(OBJECT_TYPE_KEYS)
+            ]
         ),
         TARGET_TENANT: properties.Schema(
             properties.Schema.STRING,
@@ -54,8 +75,14 @@ class RBACPolicy(neutron.NeutronResource):
         ),
         ACTION: properties.Schema(
             properties.Schema.STRING,
-            _('Action for the RBAC policy.'),
+            _('Action for the RBAC policy. The allowed actions differ for '
+              'different object types - only %(network)s objects can have an '
+              '%(external)s action.') % {'network': OBJECT_NETWORK,
+                                         'external': ACCESS_AS_EXTERNAL},
             required=True,
+            constraints=[
+                constraints.AllowedValues(ACTION_KEYS)
+            ]
         ),
         OBJECT_ID: properties.Schema(
             properties.Schema.STRING,
@@ -70,16 +97,26 @@ class RBACPolicy(neutron.NeutronResource):
         )
     }
 
-    def prepare_properties(self, properties, name):
-        props = super(RBACPolicy, self).prepare_properties(properties, name)
+    def translation_rules(self, props):
+        return [
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                [self.OBJECT_ID],
+                client_plugin=self.client_plugin(),
+                finder='find_resourceid_by_name_or_id',
+                entity=self._get_client_res_type(props[self.OBJECT_TYPE])
+            )
+        ]
 
-        obj_type = props.get(self.OBJECT_TYPE)
-        obj_id_or_name = props.get(self.OBJECT_ID)
-        obj_id = neutronV20.find_resourceid_by_name_or_id(self.client(),
-                                                          obj_type,
-                                                          obj_id_or_name)
-        props['object_id'] = obj_id
-        return props
+    def _get_client_res_type(self, object_type):
+        client_plugin = self.client_plugin()
+        if object_type == self.OBJECT_NETWORK:
+            return client_plugin.RES_TYPE_NETWORK
+        elif object_type == self.OBJECT_QOS_POLICY:
+            return client_plugin.RES_TYPE_QOS_POLICY
+        else:
+            return object_type
 
     def handle_create(self):
         props = self.prepare_properties(
@@ -99,35 +136,27 @@ class RBACPolicy(neutron.NeutronResource):
             with self.client_plugin().ignore_not_found:
                 self.client().delete_rbac_policy(self.resource_id)
 
-    def _show_resource(self):
-        return self.client().show_rbac_policy(self.resource_id)['rbac_policy']
-
     def validate(self):
-        """Validate the provided params."""
+        """Validate the provided properties."""
         super(RBACPolicy, self).validate()
 
         action = self.properties[self.ACTION]
         obj_type = self.properties[self.OBJECT_TYPE]
-        obj_id_or_name = self.properties[self.OBJECT_ID]
 
         # Validate obj_type and action per SUPPORTED_TYPES_ACTIONS.
-        if obj_type not in self.SUPPORTED_TYPES_ACTIONS:
-            msg = (_("Invalid object_type: %(obj_type)s. "
-                     "Valid object_type :%(value)s") %
-                   {'obj_type': obj_type,
-                    'value': self.SUPPORTED_TYPES_ACTIONS.keys()})
-            raise exception.StackValidationFailed(message=msg)
         if action not in self.SUPPORTED_TYPES_ACTIONS[obj_type]:
-            msg = (_("Invalid action %(action)s for object type "
-                   "%(obj_type)s. Valid actions :%(value)s") %
+            valid_actions = ', '.join(self.SUPPORTED_TYPES_ACTIONS[obj_type])
+            msg = (_('Invalid action "%(action)s" for object type '
+                     '%(obj_type)s. Valid actions: %(valid_actions)s') %
                    {'action': action, 'obj_type': obj_type,
-                    'value': self.SUPPORTED_TYPES_ACTIONS[obj_type]})
-            raise exception.StackValidationFailed(message=msg)
-
-        # Make sure the value of object_id is correct.
-        neutronV20.find_resourceid_by_name_or_id(self.client(),
-                                                 obj_type,
-                                                 obj_id_or_name)
+                    'valid_actions': valid_actions})
+            properties_section = self.properties.error_prefix[0]
+            path = [self.stack.t.RESOURCES, self.t.name,
+                    self.stack.t.get_section_name(properties_section),
+                    self.ACTION]
+            raise exception.StackValidationFailed(error='Property error',
+                                                  path=path,
+                                                  message=msg)
 
 
 def resource_mapping():

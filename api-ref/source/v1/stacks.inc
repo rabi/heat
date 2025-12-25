@@ -32,7 +32,9 @@ Request Parameters
    - tenant_id: tenant_id
    - disable_rollback: disable_rollback
    - environment: environment
+   - environment_files: environment_files
    - files: files
+   - files_container: files_container
    - parameters: parameters
    - stack_name: stack_name_request
    - tags: tags
@@ -52,7 +54,7 @@ Response Parameters
 .. rest_parameters:: parameters.yaml
 
    - location: location
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
    - stack: stack
    - id: stack_id
    - links: links
@@ -93,6 +95,8 @@ Request Parameters
    - tenant_id: tenant_id
    - disable_rollback: disable_rollback
    - environment: environment
+   - environment_files: environment_files
+   - files_container: files_container
    - files: files
    - parameters: parameters
    - stack_name: stack_name_request
@@ -112,7 +116,7 @@ Response Parameters
 
 .. rest_parameters:: parameters.yaml
 
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
    - capabilities: capabilities
    - creation_time: creation_time
    - deletion_time: deletion_time
@@ -367,6 +371,7 @@ Request Parameters
    - disable_rollback: disable_rollback
    - environment: environment
    - environment_files: environment_files
+   - files_container: files_container
    - existing: existing
    - files: files
    - parameters: parameters
@@ -374,6 +379,7 @@ Request Parameters
    - template: template
    - template_url: template_url
    - timeout_mins: timeout_mins
+   - converge: converge
 
 Request Example
 ---------------
@@ -433,6 +439,7 @@ Request Parameters
    - disable_rollback: disable_rollback
    - environment: environment
    - environment_files: environment_files
+   - files_container: files_container
    - existing: existing_patch
    - files: files
    - parameters: parameters
@@ -440,6 +447,7 @@ Request Parameters
    - template: template
    - template_url: template_url
    - timeout_mins: timeout_mins
+   - converge: converge
 
 Request Example
 ---------------
@@ -497,6 +505,7 @@ Request Parameters
    - disable_rollback: disable_rollback
    - environment: environment
    - environment_files: environment_files
+   - files_container: files_container
    - existing: existing
    - files: files
    - parameters: parameters
@@ -505,6 +514,7 @@ Request Parameters
    - template: template
    - template_url: template_url
    - timeout_mins: timeout_mins
+   - converge: converge
 
 Request Example
 ---------------
@@ -567,6 +577,7 @@ Request Parameters
    - disable_rollback: disable_rollback
    - environment: environment
    - environment_files: environment_files
+   - files_container: files_container
    - existing: existing_patch
    - files: files
    - parameters: parameters
@@ -575,6 +586,7 @@ Request Parameters
    - template: template
    - template_url: template_url
    - timeout_mins: timeout_mins
+   - converge: converge
 
 Request Example
 ---------------
@@ -633,8 +645,8 @@ Request Parameters
    - tenant_id: tenant_id
    - stack_identity: stack_identity
 
-Reponse Parameters
-------------------
+Response Parameters
+-------------------
 
 .. rest_parameters:: parameters.yaml
 
@@ -681,8 +693,8 @@ Request Parameters
    - stack_name: stack_name_url
    - stack_id: stack_id_url
 
-Reponse Parameters
-------------------
+Response Parameters
+-------------------
 
 This request does not return anything in the response body.
 
@@ -801,7 +813,7 @@ Response Parameters
 .. rest_parameters:: parameters.yaml
 
    - location: location
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
    - stack: stack
    - id: stack_id
    - links: links
@@ -851,7 +863,7 @@ The body of the response contains a map of file names and file contents.
 
 .. rest_parameters:: parameters.yaml
 
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
    - action: action
    - environment: stack_environment
    - files: stack_files
@@ -906,7 +918,7 @@ Response Parameters
 
 .. rest_parameters:: parameters.yaml
 
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
    - heat_template_version: heat_template_version
    - outputs: template_outputs
    - parameters: template_parameters
@@ -955,7 +967,7 @@ Response Parameters
 
 .. rest_parameters:: parameters.yaml
 
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
    - encrypted_param_names: encrypted_param_names
    - event_sinks: event_sinks
    - parameter_defaults: parameter_defaults
@@ -1006,7 +1018,7 @@ The body of the response contains a map of file names and file contents.
 
 .. rest_parameters:: parameters.yaml
 
-   - X-Openstack-Reqeuest-Id: request_id
+   - X-Openstack-Request-Id: request_id
 
 Response Example
 ----------------

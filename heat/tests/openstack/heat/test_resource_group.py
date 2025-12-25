@@ -12,17 +12,17 @@
 #    under the License.
 
 import copy
-
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import grouputils
 from heat.common import template_format
+from heat.engine.clients.os import glance
+from heat.engine.clients.os import nova
+from heat.engine import node_data
 from heat.engine.resources.openstack.heat import resource_group
 from heat.engine import rsrc_defn
 from heat.engine import scheduler
-from heat.engine import stack as stackm
 from heat.tests import common
 from heat.tests import utils
 
@@ -113,12 +113,34 @@ template_attr = {
     }
 }
 
+template_server = {
+    "heat_template_version": "2013-05-23",
+    "resources": {
+        "group1": {
+            "type": "OS::Heat::ResourceGroup",
+            "properties": {
+                "count": 2,
+                "resource_def": {
+                    "type": "OS::Nova::Server",
+                    "properties": {
+                        "image": "image%index%",
+                        "flavor": "flavor%index%"
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 class ResourceGroupTest(common.HeatTestCase):
 
     def setUp(self):
-        common.HeatTestCase.setUp(self)
-        self.m.StubOutWithMock(stackm.Stack, 'validate')
+        super(ResourceGroupTest, self).setUp()
+
+        self.inspector = mock.Mock(spec=grouputils.GroupInspector)
+        self.patchobject(grouputils.GroupInspector, 'from_parent_resource',
+                         return_value=self.inspector)
 
     def test_assemble_nested(self):
         """Tests nested stack creation based on props.
@@ -150,9 +172,70 @@ class ResourceGroupTest(common.HeatTestCase):
                         "Foo": "Bar"
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                        "2": {"get_resource": "2"},
+                    }
+                }
             }
         }
 
+        self.assertEqual(templ, resg._assemble_nested(['0', '1', '2']).t)
+
+    def test_assemble_nested_outputs(self):
+        """Tests nested stack creation based on props.
+
+        Tests that the nested stack that implements the group is created
+        appropriately based on properties.
+        """
+        stack = utils.parse_stack(template)
+        snip = stack.t.resource_definitions(stack)['group1']
+        resg = resource_group.ResourceGroup('test', snip, stack)
+        templ = {
+            "heat_template_version": "2015-04-30",
+            "resources": {
+                "0": {
+                    "type": "OverwrittenFnGetRefIdType",
+                    "properties": {
+                        "Foo": "Bar"
+                    }
+                },
+                "1": {
+                    "type": "OverwrittenFnGetRefIdType",
+                    "properties": {
+                        "Foo": "Bar"
+                    }
+                },
+                "2": {
+                    "type": "OverwrittenFnGetRefIdType",
+                    "properties": {
+                        "Foo": "Bar"
+                    }
+                }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                        "2": {"get_resource": "2"},
+                    }
+                },
+                "foo": {
+                    "value": [
+                        {"get_attr": ["0", "foo"]},
+                        {"get_attr": ["1", "foo"]},
+                        {"get_attr": ["2", "foo"]},
+                    ]
+                }
+            }
+        }
+
+        resg.referenced_attrs = mock.Mock(return_value=["foo"])
         self.assertEqual(templ, resg._assemble_nested(['0', '1', '2']).t)
 
     def test_assemble_nested_include(self):
@@ -169,6 +252,13 @@ class ResourceGroupTest(common.HeatTestCase):
                     "type": "OverwrittenFnGetRefIdType",
                     "properties": {}
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                    }
+                }
             }
         }
         self.assertEqual(expect, resg._assemble_nested(['0']).t)
@@ -184,6 +274,7 @@ class ResourceGroupTest(common.HeatTestCase):
         resg = resource_group.ResourceGroup('test', snip, stack)
         expect = {
             "heat_template_version": "2015-04-30",
+            "outputs": {"refs_map": {"value": {}}},
         }
         self.assertEqual(expect, resg._assemble_nested([]).t)
 
@@ -209,6 +300,13 @@ class ResourceGroupTest(common.HeatTestCase):
                         'role': 'webserver'
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                    }
+                }
             }
         }
         self.assertEqual(expect, resg._assemble_nested(['0']).t)
@@ -229,6 +327,14 @@ class ResourceGroupTest(common.HeatTestCase):
                         "foo": "baz"
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                    }
+                }
             }
         }
         resource_def = rsrc_defn.ResourceDefinition(
@@ -239,8 +345,57 @@ class ResourceGroupTest(common.HeatTestCase):
         stack = utils.parse_stack(template)
         snip = stack.t.resource_definitions(stack)['group1']
         resg = resource_group.ResourceGroup('test', snip, stack)
-        resg._nested = get_fake_nested_stack(['0', '1'])
+        nested = get_fake_nested_stack(['0', '1'])
+        self.inspector.template.return_value = nested.defn._template
+        self.inspector.member_names.return_value = ['0', '1']
         resg.build_resource_definition = mock.Mock(return_value=resource_def)
+        self.assertEqual(expect, resg._assemble_for_rolling_update(2, 1).t)
+
+    def test_assemble_nested_rolling_update_outputs(self):
+        expect = {
+            "heat_template_version": "2015-04-30",
+            "resources": {
+                "0": {
+                    "type": "OverwrittenFnGetRefIdType",
+                    "properties": {
+                        "foo": "bar"
+                    }
+                },
+                "1": {
+                    "type": "OverwrittenFnGetRefIdType",
+                    "properties": {
+                        "foo": "baz"
+                    }
+                }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                    }
+                },
+                "bar": {
+                    "value": [
+                        {"get_attr": ["0", "bar"]},
+                        {"get_attr": ["1", "bar"]},
+                    ]
+                }
+            }
+        }
+        resource_def = rsrc_defn.ResourceDefinition(
+            None,
+            "OverwrittenFnGetRefIdType",
+            {"foo": "baz"})
+
+        stack = utils.parse_stack(template)
+        snip = stack.t.resource_definitions(stack)['group1']
+        resg = resource_group.ResourceGroup('test', snip, stack)
+        nested = get_fake_nested_stack(['0', '1'])
+        self.inspector.template.return_value = nested.defn._template
+        self.inspector.member_names.return_value = ['0', '1']
+        resg.build_resource_definition = mock.Mock(return_value=resource_def)
+        resg.referenced_attrs = mock.Mock(return_value=["bar"])
         self.assertEqual(expect, resg._assemble_for_rolling_update(2, 1).t)
 
     def test_assemble_nested_rolling_update_none(self):
@@ -259,6 +414,14 @@ class ResourceGroupTest(common.HeatTestCase):
                         "foo": "bar"
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                    }
+                }
             }
         }
 
@@ -270,7 +433,9 @@ class ResourceGroupTest(common.HeatTestCase):
         stack = utils.parse_stack(template)
         snip = stack.t.resource_definitions(stack)['group1']
         resg = resource_group.ResourceGroup('test', snip, stack)
-        resg._nested = get_fake_nested_stack(['0', '1'])
+        nested = get_fake_nested_stack(['0', '1'])
+        self.inspector.template.return_value = nested.defn._template
+        self.inspector.member_names.return_value = ['0', '1']
         resg.build_resource_definition = mock.Mock(return_value=resource_def)
         self.assertEqual(expect, resg._assemble_for_rolling_update(2, 0).t)
 
@@ -290,6 +455,14 @@ class ResourceGroupTest(common.HeatTestCase):
                         "foo": "bar"
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                    }
+                }
             }
         }
         resource_def = rsrc_defn.ResourceDefinition(
@@ -300,9 +473,9 @@ class ResourceGroupTest(common.HeatTestCase):
         stack = utils.parse_stack(template)
         snip = stack.t.resource_definitions(stack)['group1']
         resg = resource_group.ResourceGroup('test', snip, stack)
-        resg._nested = get_fake_nested_stack(['0', '1'])
-        res0 = resg._nested['0']
-        res0.status = res0.FAILED
+        nested = get_fake_nested_stack(['0', '1'])
+        self.inspector.template.return_value = nested.defn._template
+        self.inspector.member_names.return_value = ['1']
         resg.build_resource_definition = mock.Mock(return_value=resource_def)
         self.assertEqual(expect, resg._assemble_for_rolling_update(2, 1).t)
 
@@ -334,6 +507,14 @@ class ResourceGroupTest(common.HeatTestCase):
                 "1": {
                     "type": "OverwrittenFnGetRefIdType",
                     "properties": {}
+                }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                    }
                 }
             }
         }
@@ -374,6 +555,15 @@ class ResourceGroupTest(common.HeatTestCase):
                         ]
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                        "1": {"get_resource": "1"},
+                        "2": {"get_resource": "2"},
+                    }
+                }
             }
         }
         nested = resg._assemble_nested(['0', '1', '2']).t
@@ -398,6 +588,13 @@ class ResourceGroupTest(common.HeatTestCase):
                         "listprop": [
                             "%index%_0", "%index%_1", "%index%_2"
                         ]
+                    }
+                }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
                     }
                 }
             }
@@ -429,6 +626,13 @@ class ResourceGroupTest(common.HeatTestCase):
                         ]
                     }
                 }
+            },
+            "outputs": {
+                "refs_map": {
+                    "value": {
+                        "0": {"get_resource": "0"},
+                    }
+                }
             }
         }
         nested = resg._assemble_nested(['0']).t
@@ -444,6 +648,30 @@ class ResourceGroupTest(common.HeatTestCase):
         resg = stack.resources['group1']
         self.assertIsNone(resg.validate())
 
+    def test_validate_with_skiplist(self):
+        templ = copy.deepcopy(template_server)
+        self.mock_flavor = mock.Mock(ram=4, disk=4)
+        self.mock_active_image = mock.Mock(min_ram=1, min_disk=1,
+                                           status='active')
+        self.mock_inactive_image = mock.Mock(min_ram=1, min_disk=1,
+                                             status='inactive')
+
+        def get_image(image_identifier):
+            if image_identifier == 'image0':
+                return self.mock_inactive_image
+            else:
+                return self.mock_active_image
+
+        self.patchobject(glance.GlanceClientPlugin, 'get_image',
+                         side_effect=get_image)
+        self.patchobject(nova.NovaClientPlugin, 'get_flavor',
+                         return_value=self.mock_flavor)
+        props = templ["resources"]["group1"]["properties"]
+        props["removal_policies"] = [{"resource_list": ["0"]}]
+        stack = utils.parse_stack(templ)
+        resg = stack.resources['group1']
+        self.assertIsNone(resg.validate())
+
     def test_invalid_res_type(self):
         """Test that error raised for unknown resource type."""
         tmp = copy.deepcopy(template)
@@ -455,12 +683,20 @@ class ResourceGroupTest(common.HeatTestCase):
         exc = self.assertRaises(exception.StackValidationFailed,
                                 resg.validate)
         exp_msg = 'The Resource Type (idontexist) could not be found.'
-        self.assertIn(exp_msg, six.text_type(exc))
+        self.assertIn(exp_msg, str(exc))
 
     def test_reference_attr(self):
         stack = utils.parse_stack(template2)
         snip = stack.t.resource_definitions(stack)['group1']
         resgrp = resource_group.ResourceGroup('test', snip, stack)
+        self.assertIsNone(resgrp.validate())
+
+    def test_validate_reference_attr_with_none_ref(self):
+        stack = utils.parse_stack(template_attr)
+        snip = stack.t.resource_definitions(stack)['group1']
+        resgrp = resource_group.ResourceGroup('test', snip, stack)
+        self.patchobject(resgrp, 'referenced_attrs',
+                         return_value=set([('nested_dict', None)]))
         self.assertIsNone(resgrp.validate())
 
     def test_invalid_removal_policies_nolist(self):
@@ -474,7 +710,7 @@ class ResourceGroupTest(common.HeatTestCase):
         exc = self.assertRaises(exception.StackValidationFailed,
                                 resg.validate)
         errstr = "removal_policies: \"'notallowed'\" is not a list"
-        self.assertIn(errstr, six.text_type(exc))
+        self.assertIn(errstr, str(exc))
 
     def test_invalid_removal_policies_nomap(self):
         """Test that error raised for malformed removal_policies."""
@@ -487,7 +723,7 @@ class ResourceGroupTest(common.HeatTestCase):
         exc = self.assertRaises(exception.StackValidationFailed,
                                 resg.validate)
         errstr = '"notallowed" is not a map'
-        self.assertIn(errstr, six.text_type(exc))
+        self.assertIn(errstr, str(exc))
 
     def test_child_template(self):
         stack = utils.parse_stack(template2)
@@ -520,6 +756,8 @@ class ResourceGroupTest(common.HeatTestCase):
         self.assertEqual(1, resgrp.create_with_template.call_count)
 
     def test_handle_create_with_batching(self):
+        self.inspector.member_names.return_value = []
+        self.inspector.size.return_value = 0
         stack = utils.parse_stack(tmpl_with_default_updt_policy())
         defn = stack.t.resource_definitions(stack)['group1']
         props = stack.t.t['resources']['group1']['properties'].copy()
@@ -530,6 +768,20 @@ class ResourceGroupTest(common.HeatTestCase):
         self.patchobject(scheduler.TaskRunner, 'start')
         checkers = resgrp.handle_create()
         self.assertEqual(4, len(checkers))
+
+    def test_handle_create_with_batching_zero_count(self):
+        self.inspector.member_names.return_value = []
+        self.inspector.size.return_value = 0
+        stack = utils.parse_stack(tmpl_with_default_updt_policy())
+        defn = stack.t.resource_definitions(stack)['group1']
+        props = stack.t.t['resources']['group1']['properties'].copy()
+        props['count'] = 0
+        update_policy = {'batch_create': {'max_batch_size': 1}}
+        snip = defn.freeze(properties=props, update_policy=update_policy)
+        resgrp = resource_group.ResourceGroup('test', snip, stack)
+        resgrp.create_with_template = mock.Mock(return_value=None)
+        self.assertIsNone(resgrp.handle_create())
+        self.assertEqual(1, resgrp.create_with_template.call_count)
 
     def test_run_to_completion(self):
         stack = utils.parse_stack(template2)
@@ -548,7 +800,7 @@ class ResourceGroupTest(common.HeatTestCase):
         resgrp._assemble_nested = mock.Mock(return_value='tmpl')
         resgrp.properties.data[resgrp.COUNT] = 2
         self.patchobject(scheduler.TaskRunner, 'start')
-        resgrp.handle_update(snip, None, None)
+        resgrp.handle_update(snip, mock.Mock(), {})
         self.assertTrue(resgrp._assemble_nested.called)
 
     def test_handle_delete(self):
@@ -566,52 +818,76 @@ class ResourceGroupTest(common.HeatTestCase):
         resgrp._assemble_nested = mock.Mock(return_value=None)
         resgrp.properties.data[resgrp.COUNT] = 5
         self.patchobject(scheduler.TaskRunner, 'start')
-        resgrp.handle_update(snip, None, None)
+        resgrp.handle_update(snip, mock.Mock(), {})
         self.assertTrue(resgrp._assemble_nested.called)
 
 
-class ResourceGroupBlackList(common.HeatTestCase):
-    """This class tests ResourceGroup._name_blacklist()."""
+class ResourceGroupSkiplistTest(common.HeatTestCase):
+    """This class tests ResourceGroup._name_skiplist()."""
 
-    # 1) no resource_list, empty blacklist
-    # 2) no resource_list, existing blacklist
+    # 1) no resource_list, empty skiplist
+    # 2) no resource_list, existing skiplist
     # 3) resource_list not in nested()
     # 4) resource_list (refid) not in nested()
     # 5) resource_list in nested() -> saved
     # 6) resource_list (refid) in nested() -> saved
+    # 7) resource_list (refid) in nested(), update -> saved
+    # 8) resource_list, update -> saved
+    # 9) resource_list (refid) in nested(), grouputils fallback -> saved
+    # A) resource_list (refid) in nested(), update, grouputils -> saved
     scenarios = [
         ('1', dict(data_in=None, rm_list=[],
                    nested_rsrcs=[], expected=[],
-                   saved=False)),
+                   saved=False, fallback=False, rm_mode='append')),
         ('2', dict(data_in='0,1,2', rm_list=[],
                    nested_rsrcs=[], expected=['0', '1', '2'],
-                   saved=False)),
+                   saved=False, fallback=False, rm_mode='append')),
         ('3', dict(data_in='1,3', rm_list=['6'],
                    nested_rsrcs=['0', '1', '3'],
                    expected=['1', '3'],
-                   saved=False)),
+                   saved=False, fallback=False, rm_mode='append')),
         ('4', dict(data_in='0,1', rm_list=['id-7'],
                    nested_rsrcs=['0', '1', '3'],
                    expected=['0', '1'],
-                   saved=False)),
+                   saved=False, fallback=False, rm_mode='append')),
         ('5', dict(data_in='0,1', rm_list=['3'],
                    nested_rsrcs=['0', '1', '3'],
                    expected=['0', '1', '3'],
-                   saved=True)),
+                   saved=True, fallback=False, rm_mode='append')),
         ('6', dict(data_in='0,1', rm_list=['id-3'],
                    nested_rsrcs=['0', '1', '3'],
                    expected=['0', '1', '3'],
-                   saved=True)),
+                   saved=True, fallback=False, rm_mode='append')),
+        ('7', dict(data_in='0,1', rm_list=['id-3'],
+                   nested_rsrcs=['0', '1', '3'],
+                   expected=['3'],
+                   saved=True, fallback=False, rm_mode='update')),
+        ('8', dict(data_in='1', rm_list=[],
+                   nested_rsrcs=['0', '1', '2'],
+                   expected=[],
+                   saved=True, fallback=False, rm_mode='update')),
+        ('9', dict(data_in='0,1', rm_list=['id-3'],
+                   nested_rsrcs=['0', '1', '3'],
+                   expected=['0', '1', '3'],
+                   saved=True, fallback=True, rm_mode='append')),
+        ('A', dict(data_in='0,1', rm_list=['id-3'],
+                   nested_rsrcs=['0', '1', '3'],
+                   expected=['3'],
+                   saved=True, fallback=True, rm_mode='update')),
     ]
 
-    def test_blacklist(self):
+    def test_skiplist(self):
         stack = utils.parse_stack(template)
         resg = stack['group1']
 
+        if self.data_in is not None:
+            resg.resource_id = 'foo'
+
         # mock properties
-        resg.properties = mock.MagicMock()
-        resg.properties.__getitem__.return_value = [
-            {'resource_list': self.rm_list}]
+        properties = mock.MagicMock()
+        p_data = {'removal_policies': [{'resource_list': self.rm_list}],
+                  'removal_policies_mode': self.rm_mode}
+        properties.get.side_effect = p_data.get
 
         # mock data get/set
         resg.data = mock.Mock()
@@ -619,28 +895,41 @@ class ResourceGroupBlackList(common.HeatTestCase):
         resg.data_set = mock.Mock()
 
         # mock nested access
-        def stack_contains(name):
-            return name in self.nested_rsrcs
+        mock_inspect = mock.Mock()
+        self.patchobject(grouputils.GroupInspector, 'from_parent_resource',
+                         return_value=mock_inspect)
+        mock_inspect.member_names.return_value = self.nested_rsrcs
 
-        def by_refid(name):
-            rid = name.replace('id-', '')
-            if rid not in self.nested_rsrcs:
-                return None
-            res = mock.Mock()
-            res.name = rid
-            return res
+        if not self.fallback:
+            refs_map = {n: 'id-%s' % n for n in self.nested_rsrcs}
+            resg.get_output = mock.Mock(return_value=refs_map)
+        else:
+            resg.get_output = mock.Mock(side_effect=exception.NotFound)
 
-        nested = mock.MagicMock()
-        nested.__contains__.side_effect = stack_contains
-        nested.__iter__.side_effect = iter(self.nested_rsrcs)
-        nested.resource_by_refid.side_effect = by_refid
-        resg.nested = mock.Mock(return_value=nested)
+            def stack_contains(name):
+                return name in self.nested_rsrcs
 
-        blacklist = resg._name_blacklist()
-        self.assertEqual(set(self.expected), blacklist)
+            def by_refid(name):
+                rid = name.replace('id-', '')
+                if rid not in self.nested_rsrcs:
+                    return None
+                res = mock.Mock()
+                res.name = rid
+                return res
+
+            nested = mock.MagicMock()
+            nested.__contains__.side_effect = stack_contains
+            nested.__iter__.side_effect = iter(self.nested_rsrcs)
+            nested.resource_by_refid.side_effect = by_refid
+            resg.nested = mock.Mock(return_value=nested)
+
+        resg._update_name_skiplist(properties)
         if self.saved:
             resg.data_set.assert_called_once_with('name_blacklist',
-                                                  ','.join(blacklist))
+                                                  ','.join(self.expected))
+        else:
+            resg.data_set.assert_not_called()
+            self.assertEqual(set(self.expected), resg._name_skiplist())
 
 
 class ResourceGroupEmptyParams(common.HeatTestCase):
@@ -690,18 +979,18 @@ class ResourceGroupEmptyParams(common.HeatTestCase):
 class ResourceGroupNameListTest(common.HeatTestCase):
     """This class tests ResourceGroup._resource_names()."""
 
-    # 1) no blacklist, 0 count
-    # 2) no blacklist, x count
-    # 3) blacklist (not effecting)
-    # 4) blacklist with pruning
+    # 1) no skiplist, 0 count
+    # 2) no skiplist, x count
+    # 3) skiplist (not effecting)
+    # 4) skiplist with pruning
     scenarios = [
-        ('1', dict(blacklist=[], count=0,
+        ('1', dict(skiplist=[], count=0,
                    expected=[])),
-        ('2', dict(blacklist=[], count=4,
+        ('2', dict(skiplist=[], count=4,
                    expected=['0', '1', '2', '3'])),
-        ('3', dict(blacklist=['5', '6'], count=3,
+        ('3', dict(skiplist=['5', '6'], count=3,
                    expected=['0', '1', '2'])),
-        ('4', dict(blacklist=['2', '4'], count=4,
+        ('4', dict(skiplist=['2', '4'], count=4,
                    expected=['0', '1', '3', '5'])),
     ]
 
@@ -711,7 +1000,7 @@ class ResourceGroupNameListTest(common.HeatTestCase):
 
         resg.properties = mock.MagicMock()
         resg.properties.get.return_value = self.count
-        resg._name_blacklist = mock.MagicMock(return_value=self.blacklist)
+        resg._name_skiplist = mock.MagicMock(return_value=self.skiplist)
         self.assertEqual(self.expected, list(resg._resource_names()))
 
 
@@ -809,29 +1098,24 @@ class ResourceGroupAttrTest(common.HeatTestCase):
         resg = self._create_dummy_stack()
         self.assertEqual("ID-0", resg.FnGetAtt('resource.0'))
         self.assertEqual("ID-1", resg.FnGetAtt('resource.1'))
-        self.assertRaises(exception.InvalidTemplateAttribute, resg.FnGetAtt,
-                          'resource.2')
-
-    @mock.patch.object(grouputils, 'get_rsrc_id')
-    def test_get_attribute(self, mock_get_rsrc_id):
-        stack = utils.parse_stack(template)
-        mock_get_rsrc_id.side_effect = ['0', '1']
-        rsrc = stack['group1']
-        self.assertEqual(['0', '1'], rsrc.FnGetAtt(rsrc.REFS))
+        ex = self.assertRaises(exception.NotFound, resg.FnGetAtt,
+                               'resource.2')
+        self.assertIn("Member '2' not found in group resource 'group1'.",
+                      str(ex))
 
     def test_get_attribute_convg(self):
-        cache_data = {'group1': {
+        cache_data = {'group1': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'attrs': {'refs': ['rsrc1', 'rsrc2']}
-        }}
+        })}
         stack = utils.parse_stack(template, cache_data=cache_data)
-        rsrc = stack['group1']
-        self.assertEqual(['rsrc1', 'rsrc2'], rsrc.FnGetAtt(rsrc.REFS))
+        rsrc = stack.defn['group1']
+        self.assertEqual(['rsrc1', 'rsrc2'], rsrc.FnGetAtt('refs'))
 
-    def test_get_attribute_blacklist(self):
+    def test_get_attribute_skiplist(self):
         resg = self._create_dummy_stack()
         resg.data = mock.Mock(return_value={'name_blacklist': '3,5'})
 
@@ -842,69 +1126,123 @@ class ResourceGroupAttrTest(common.HeatTestCase):
                             expect_attrs=None):
         stack = utils.parse_stack(template_data)
         resg = stack['group1']
-        fake_res = {}
+        resg.resource_id = 'test-test'
+        attrs = {}
+        refids = {}
         if expect_attrs is None:
             expect_attrs = {}
-        for resc in range(expect_count):
-            res = str(resc)
-            fake_res[res] = mock.Mock()
-            fake_res[res].stack = stack
-            fake_res[res].FnGetRefId.return_value = 'ID-%s' % res
-            if res in expect_attrs:
-                fake_res[res].FnGetAtt.return_value = expect_attrs[res]
-            else:
-                fake_res[res].FnGetAtt.return_value = res
-        resg.nested = mock.Mock(return_value=fake_res)
+        for index in range(expect_count):
+            res = str(index)
+            attrs[index] = expect_attrs.get(res, res)
+            refids[index] = 'ID-%s' % res
 
         names = [str(name) for name in range(expect_count)]
         resg._resource_names = mock.Mock(return_value=names)
+        self._stub_get_attr(resg, refids, attrs)
         return resg
+
+    def _stub_get_attr(self, resg, refids, attrs):
+        def ref_id_fn(res_name):
+            return refids[int(res_name)]
+
+        def attr_fn(args):
+            res_name = args[0]
+            return attrs[int(res_name)]
+
+        def get_output(output_name):
+            outputs = resg._nested_output_defns(resg._resource_names(),
+                                                attr_fn, ref_id_fn)
+            op_defns = {od.name: od for od in outputs}
+            self.assertIn(output_name, op_defns)
+            return op_defns[output_name].get_value()
+
+        orig_get_attr = resg.FnGetAtt
+
+        def get_attr(attr_name, *path):
+            if not path:
+                attr = attr_name
+            else:
+                attr = (attr_name,) + path
+            # Mock referenced_attrs() so that _nested_output_definitions()
+            # will include the output required for this attribute
+            resg.referenced_attrs = mock.Mock(return_value=[attr])
+
+            # Pass through to actual function under test
+            return orig_get_attr(attr_name, *path)
+
+        resg.FnGetAtt = mock.Mock(side_effect=get_attr)
+        resg.get_output = mock.Mock(side_effect=get_output)
+
+
+class ResourceGroupAttrFallbackTest(ResourceGroupAttrTest):
+    def _stub_get_attr(self, resg, refids, attrs):
+        # Raise NotFound when getting output, to force fallback to old-school
+        # grouputils functions
+        resg.get_output = mock.Mock(side_effect=exception.NotFound)
+
+        def make_fake_res(idx):
+            fr = mock.Mock()
+            fr.stack = resg.stack
+            fr.FnGetRefId.return_value = refids[idx]
+            fr.FnGetAtt.return_value = attrs[idx]
+            return fr
+
+        fake_res = {str(i): make_fake_res(i) for i in refids}
+        resg.nested = mock.Mock(return_value=fake_res)
+
+    @mock.patch.object(grouputils, 'get_rsrc_id')
+    def test_get_attribute(self, mock_get_rsrc_id):
+        stack = utils.parse_stack(template)
+        mock_get_rsrc_id.side_effect = ['0', '1']
+        rsrc = stack['group1']
+        rsrc.get_output = mock.Mock(side_effect=exception.NotFound)
+        self.assertEqual(['0', '1'], rsrc.FnGetAtt(rsrc.REFS))
 
 
 class ReplaceTest(common.HeatTestCase):
     # 1. no min_in_service
-    # 2. min_in_service > count and existing with no blacklist
-    # 3. min_in_service > count and existing with blacklist
-    # 4. existing > count and min_in_service with blacklist
-    # 5. existing > count and min_in_service with no blacklist
-    # 6. all existing blacklisted
-    # 7. count > existing and min_in_service with no blacklist
-    # 8. count > existing and min_in_service with blacklist
-    # 9. count < existing - blacklisted
+    # 2. min_in_service > count and existing with no skiplist
+    # 3. min_in_service > count and existing with skiplist
+    # 4. existing > count and min_in_service with skiplist
+    # 5. existing > count and min_in_service with no skiplist
+    # 6. all existing skipped
+    # 7. count > existing and min_in_service with no skiplist
+    # 8. count > existing and min_in_service with skiplist
+    # 9. count < existing - skiplisted
     # 10. pause_sec > 0
 
     scenarios = [
         ('1', dict(min_in_service=0, count=2,
-                   existing=['0', '1'], black_listed=['0'],
+                   existing=['0', '1'], skipped=['0'],
                    batch_size=1, pause_sec=0, tasks=2)),
         ('2', dict(min_in_service=3, count=2,
-                   existing=['0', '1'], black_listed=[],
+                   existing=['0', '1'], skipped=[],
                    batch_size=2, pause_sec=0, tasks=3)),
         ('3', dict(min_in_service=3, count=2,
-                   existing=['0', '1'], black_listed=['0'],
+                   existing=['0', '1'], skipped=['0'],
                    batch_size=2, pause_sec=0, tasks=3)),
         ('4', dict(min_in_service=3, count=2,
-                   existing=['0', '1', '2', '3'], black_listed=['2', '3'],
+                   existing=['0', '1', '2', '3'], skipped=['2', '3'],
                    batch_size=1, pause_sec=0, tasks=4)),
         ('5', dict(min_in_service=2, count=2,
-                   existing=['0', '1', '2', '3'], black_listed=[],
+                   existing=['0', '1', '2', '3'], skipped=[],
                    batch_size=2, pause_sec=0, tasks=2)),
         ('6', dict(min_in_service=2, count=3,
-                   existing=['0', '1'], black_listed=['0', '1'],
+                   existing=['0', '1'], skipped=['0', '1'],
                    batch_size=2, pause_sec=0, tasks=2)),
         ('7', dict(min_in_service=0, count=5,
-                   existing=['0', '1'], black_listed=[],
+                   existing=['0', '1'], skipped=[],
                    batch_size=1, pause_sec=0, tasks=5)),
         ('8', dict(min_in_service=0, count=5,
-                   existing=['0', '1'], black_listed=['0'],
+                   existing=['0', '1'], skipped=['0'],
                    batch_size=1, pause_sec=0, tasks=5)),
         ('9', dict(min_in_service=0, count=3,
                    existing=['0', '1', '2', '3', '4', '5'],
-                   black_listed=['0'],
+                   skipped=['0'],
                    batch_size=2, pause_sec=0, tasks=2)),
         ('10', dict(min_in_service=0, count=3,
                     existing=['0', '1', '2', '3', '4', '5'],
-                    black_listed=['0'],
+                    skipped=['0'],
                     batch_size=2, pause_sec=10, tasks=3))]
 
     def setUp(self):
@@ -916,15 +1254,20 @@ class ReplaceTest(common.HeatTestCase):
         self.group.update_with_template = mock.Mock()
         self.group.check_update_complete = mock.Mock()
 
+        inspector = mock.Mock(spec=grouputils.GroupInspector)
+        self.patchobject(grouputils.GroupInspector, 'from_parent_resource',
+                         return_value=inspector)
+        inspector.member_names.return_value = self.existing
+        inspector.size.return_value = len(self.existing)
+
     def test_rolling_updates(self):
         self.group._nested = get_fake_nested_stack(self.existing)
         self.group.get_size = mock.Mock(return_value=self.count)
-        self.group._name_blacklist = mock.Mock(
-            return_value=set(self.black_listed))
+        self.group._name_skiplist = mock.Mock(
+            return_value=set(self.skipped))
         tasks = self.group._replace(self.min_in_service, self.batch_size,
                                     self.pause_sec)
-        self.assertEqual(self.tasks,
-                         len(tasks))
+        self.assertEqual(self.tasks, len(tasks))
 
 
 def tmpl_with_bad_updt_policy():
@@ -992,7 +1335,8 @@ class RollingUpdatePolicyTest(common.HeatTestCase):
         self.assertEqual(2, len(grp.update_policy))
         self.assertIn('rolling_update', grp.update_policy)
         policy = grp.update_policy['rolling_update']
-        self.assertTrue(policy and len(policy) > 0)
+        self.assertIsNotNone(policy)
+        self.assertGreater(len(policy), 0)
         self.assertEqual(1, int(policy['min_in_service']))
         self.assertEqual(tmpl_batch_sz, int(policy['max_batch_size']))
         self.assertEqual(1, policy['pause_time'])
@@ -1006,7 +1350,8 @@ class RollingUpdatePolicyTest(common.HeatTestCase):
         self.assertEqual(2, len(grp.update_policy))
         self.assertIn('rolling_update', grp.update_policy)
         policy = grp.update_policy['rolling_update']
-        self.assertTrue(policy and len(policy) > 0)
+        self.assertIsNotNone(policy)
+        self.assertGreater(len(policy), 0)
         self.assertEqual(0, int(policy['min_in_service']))
         self.assertEqual(1, int(policy['max_batch_size']))
         self.assertEqual(0, policy['pause_time'])
@@ -1016,7 +1361,7 @@ class RollingUpdatePolicyTest(common.HeatTestCase):
         stack = utils.parse_stack(tmpl)
         error = self.assertRaises(
             exception.StackValidationFailed, stack.validate)
-        self.assertIn("foo", six.text_type(error))
+        self.assertIn("foo", str(error))
 
 
 class RollingUpdatePolicyDiffTest(common.HeatTestCase):
@@ -1035,12 +1380,15 @@ class RollingUpdatePolicyDiffTest(common.HeatTestCase):
         tmpl_diff = updated_grp.update_template_diff(
             updated_grp_json, current_grp_json)
         self.assertTrue(tmpl_diff.update_policy_changed())
+        prop_diff = current_grp.update_template_diff_properties(
+            updated_grp.properties,
+            current_grp.properties)
 
         # test application of the new update policy in handle_update
         current_grp._try_rolling_update = mock.Mock()
         current_grp._assemble_nested_for_size = mock.Mock()
         self.patchobject(scheduler.TaskRunner, 'start')
-        current_grp.handle_update(updated_grp_json, tmpl_diff, None)
+        current_grp.handle_update(updated_grp_json, tmpl_diff, prop_diff)
         self.assertEqual(updated_grp_json._update_policy or {},
                          current_grp.update_policy.data)
 
@@ -1109,7 +1457,7 @@ class RollingUpdateTest(common.HeatTestCase):
         err = self.assertRaises(ValueError, self.current_grp._update_timeout,
                                 3, 100)
         self.assertIn('The current update policy will result in stack update '
-                      'timeout.', six.text_type(err))
+                      'timeout.', str(err))
 
     def test_update_time_sufficient(self):
         current = copy.deepcopy(template)
@@ -1120,24 +1468,28 @@ class RollingUpdateTest(common.HeatTestCase):
 
 
 class TestUtils(common.HeatTestCase):
-    # 1. No existing no blacklist
-    # 2. Existing with no blacklist
-    # 3. Existing with blacklist
+    # 1. No existing no skiplist
+    # 2. Existing with no skiplist
+    # 3. Existing with skiplist
     scenarios = [
-        ('1', dict(existing=[], black_listed=[], count=0)),
-        ('2', dict(existing=['0', '1'], black_listed=[], count=0)),
-        ('3', dict(existing=['0', '1'], black_listed=['0'], count=1)),
-        ('4', dict(existing=['0', '1'], black_listed=['1', '2'], count=1))
+        ('1', dict(existing=[], skipped=[], count=0)),
+        ('2', dict(existing=['0', '1'], skipped=[], count=0)),
+        ('3', dict(existing=['0', '1'], skipped=['0'], count=1)),
+        ('4', dict(existing=['0', '1'], skipped=['1', '2'], count=1))
 
     ]
 
-    def test_count_black_listed(self):
+    def test_count_skipped(self):
+        inspector = mock.Mock(spec=grouputils.GroupInspector)
+        self.patchobject(grouputils.GroupInspector, 'from_parent_resource',
+                         return_value=inspector)
+        inspector.member_names.return_value = self.existing
+
         stack = utils.parse_stack(template2)
         snip = stack.t.resource_definitions(stack)['group1']
         resgrp = resource_group.ResourceGroup('test', snip, stack)
-        resgrp._nested = get_fake_nested_stack(self.existing)
-        resgrp._name_blacklist = mock.Mock(return_value=set(self.black_listed))
-        rcount = resgrp._count_black_listed()
+        resgrp._name_skiplist = mock.Mock(return_value=set(self.skipped))
+        rcount = resgrp._count_skipped(self.existing)
         self.assertEqual(self.count, rcount)
 
 
@@ -1409,7 +1761,7 @@ class TestGetBatches(common.HeatTestCase):
 
         self.stack = utils.parse_stack(template)
         self.grp = self.stack['group1']
-        self.grp._name_blacklist = mock.Mock(return_value={'0'})
+        self.grp._name_skiplist = mock.Mock(return_value={'0'})
 
     def test_get_batches(self):
         batches = list(self.grp._get_batches(self.targ_cap,

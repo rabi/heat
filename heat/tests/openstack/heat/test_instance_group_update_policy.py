@@ -12,8 +12,8 @@
 #    under the License.
 
 import json
+from unittest import mock
 
-import mock
 
 from heat.common import exception
 from heat.common import template_format
@@ -181,7 +181,8 @@ class InstanceGroupTest(common.HeatTestCase):
         self.assertEqual(1, len(grp.update_policy))
         self.assertIn('RollingUpdate', grp.update_policy)
         policy = grp.update_policy['RollingUpdate']
-        self.assertTrue(policy and len(policy) > 0)
+        self.assertIsNotNone(policy)
+        self.assertGreater(len(policy), 0)
         self.assertEqual(1, int(policy['MinInstancesInService']))
         self.assertEqual(2, int(policy['MaxBatchSize']))
         self.assertEqual('PT1S', policy['PauseTime'])
@@ -196,7 +197,8 @@ class InstanceGroupTest(common.HeatTestCase):
         self.assertEqual(1, len(grp.update_policy))
         self.assertIn('RollingUpdate', grp.update_policy)
         policy = grp.update_policy['RollingUpdate']
-        self.assertTrue(policy and len(policy) > 0)
+        self.assertIsNotNone(policy)
+        self.assertGreater(len(policy), 0)
         self.assertEqual(0, int(policy['MinInstancesInService']))
         self.assertEqual(1, int(policy['MaxBatchSize']))
         self.assertEqual('PT0S', policy['PauseTime'])
@@ -295,6 +297,7 @@ class InstanceGroupReplaceTest(common.HeatTestCase):
         # (6 - 1)*14*60 > 3600, so to raise error
 
         group = instgrp.InstanceGroup('asg', defn, stack)
-        group.nested = mock.MagicMock(return_value=range(12))
+        group._group_data().size = mock.Mock(return_value=12)
+        group.get_size = mock.Mock(return_value=12)
         self.assertRaises(ValueError,
                           group._replace, 10, 1, 14 * 60)

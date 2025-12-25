@@ -11,6 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import attributes
 from heat.engine import constraints
@@ -28,6 +29,8 @@ class Firewall(neutron.NeutronResource):
     """
 
     required_service_extension = 'fwaas'
+
+    entity = 'firewall'
 
     PROPERTIES = (
         NAME, DESCRIPTION, ADMIN_STATE_UP, FIREWALL_POLICY_ID,
@@ -134,8 +137,21 @@ class Firewall(neutron.NeutronResource):
         ),
     }
 
-    def _show_resource(self):
-        return self.client().show_firewall(self.resource_id)['firewall']
+    def check_create_complete(self, data):
+        attributes = self._show_resource()
+        status = attributes['status']
+        if status == 'PENDING_CREATE':
+            return False
+        elif status == 'ACTIVE' or status == 'INACTIVE':
+            return True
+        elif status == 'ERROR':
+            raise exception.ResourceInError(
+                resource_status=status,
+                status_reason=_('Error in Firewall'))
+        else:
+            raise exception.ResourceUnknownStatus(
+                resource_status=status,
+                result=_('Firewall creation failed'))
 
     def handle_create(self):
         props = self.prepare_properties(
@@ -165,6 +181,13 @@ class Firewall(neutron.NeutronResource):
                     'firewall resource.')
         return super(Firewall, self)._resolve_attribute(name)
 
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        result = super(Firewall, self).parse_live_resource_data(
+            resource_properties, resource_data)
+        if self.SHARED in result:
+            result.pop(self.SHARED)
+        return result
+
 
 class FirewallPolicy(neutron.NeutronResource):
     """A resource for the FirewallPolicy resource in Neutron FWaaS.
@@ -174,6 +197,8 @@ class FirewallPolicy(neutron.NeutronResource):
     """
 
     required_service_extension = 'fwaas'
+
+    entity = 'firewall_policy'
 
     PROPERTIES = (
         NAME, DESCRIPTION, SHARED, AUDITED, FIREWALL_RULES,
@@ -218,8 +243,8 @@ class FirewallPolicy(neutron.NeutronResource):
         ),
         FIREWALL_RULES: properties.Schema(
             properties.Schema.LIST,
-            _('An ordered list of firewall rules to apply to the firewall.'),
-            required=True,
+            _('An ordered list of firewall rules to apply to the firewall. '
+              '(Prior to version 14.0.0 this was a required property).'),
             update_allowed=True
         ),
     }
@@ -250,10 +275,6 @@ class FirewallPolicy(neutron.NeutronResource):
             type=attributes.Schema.STRING
         ),
     }
-
-    def _show_resource(self):
-        return self.client().show_firewall_policy(self.resource_id)[
-            'firewall_policy']
 
     def handle_create(self):
         props = self.prepare_properties(
@@ -286,6 +307,8 @@ class FirewallRule(neutron.NeutronResource):
     """
 
     required_service_extension = 'fwaas'
+
+    entity = 'firewall_rule'
 
     PROPERTIES = (
         NAME, DESCRIPTION, SHARED, PROTOCOL, IP_VERSION,
@@ -446,10 +469,6 @@ class FirewallRule(neutron.NeutronResource):
             type=attributes.Schema.STRING
         ),
     }
-
-    def _show_resource(self):
-        return self.client().show_firewall_rule(
-            self.resource_id)['firewall_rule']
 
     def handle_create(self):
         props = self.prepare_properties(

@@ -11,6 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 from heat.common import exception
 from heat.db import api as db_api
 from heat.tests import utils
@@ -48,4 +50,6 @@ class RealityStore(object):
                                                    prop_name)
         return res_data.value
 
-reality = RealityStore()
+
+with mock.patch("oslo_config.cfg.ConfigOpts.find_file"):
+    reality = RealityStore()

@@ -13,16 +13,14 @@
 """Tests for :module:'heat.engine.clients.os.nova'."""
 
 import collections
+from unittest import mock
 import uuid
 
-import mock
 from novaclient import client as nc
 from novaclient import exceptions as nova_exceptions
 from oslo_config import cfg
 from oslo_serialization import jsonutils as json
-from oslo_utils import encodeutils
 import requests
-import six
 
 from heat.common import exception
 from heat.engine.clients.os import nova
@@ -46,11 +44,28 @@ class NovaClientPluginTest(NovaClientPluginTestCase):
 
     def test_create(self):
         context = utils.dummy_context()
-        ext_mock = self.patchobject(nc, 'discover_extensions')
         plugin = context.clients.client_plugin('nova')
+        plugin.max_microversion = '2.53'
         client = plugin.client()
-        ext_mock.assert_called_once_with('2.1')
         self.assertIsNotNone(client.servers)
+
+    def test_v2_26_create(self):
+        ctxt = utils.dummy_context()
+        self.patchobject(nc, 'Client', return_value=mock.Mock())
+
+        plugin = ctxt.clients.client_plugin('nova')
+        plugin.max_microversion = '2.53'
+        plugin.client(version='2.26')
+
+    def test_v2_26_create_failed(self):
+        ctxt = utils.dummy_context()
+        plugin = ctxt.clients.client_plugin('nova')
+        plugin.max_microversion = '2.23'
+        client_stub = mock.Mock()
+        self.patchobject(nc, 'Client', return_value=client_stub)
+
+        self.assertRaises(exception.InvalidServiceVersion,
+                          plugin.client, '2.26')
 
     def test_get_ip(self):
         my_image = mock.MagicMock()
@@ -75,7 +90,7 @@ class NovaClientPluginTest(NovaClientPluginTestCase):
         self.assertEqual(expected, observed)
 
     def test_find_flavor_by_name_or_id(self):
-        """Tests the get_flavor_id function."""
+        """Tests the find_flavor_by_name_or_id function."""
         flav_id = str(uuid.uuid4())
         flav_name = 'X-Large'
         my_flavor = mock.MagicMock()
@@ -103,28 +118,21 @@ class NovaClientPluginTest(NovaClientPluginTestCase):
 
     def test_get_host(self):
         """Tests the get_host function."""
-        my_host_name = 'myhost'
+        my_hypervisor_hostname = 'myhost'
         my_host = mock.MagicMock()
-        my_host.host_name = my_host_name
-        my_host.service = 'compute'
+        my_host.hypervisor_hostname = my_hypervisor_hostname
 
-        wrong_host = mock.MagicMock()
-        wrong_host.host_name = 'wrong_host'
-        wrong_host.service = 'compute'
-        self.nova_client.hosts.list.side_effect = [
-            [my_host],
-            [wrong_host],
-            exception.EntityNotFound(entity='Host', name='nohost')
+        self.nova_client.hypervisors.search.side_effect = [
+            my_host, nova_exceptions.NotFound(404)
         ]
-        self.assertEqual(my_host, self.nova_plugin.get_host(my_host_name))
-        self.assertRaises(exception.EntityNotFound,
-                          self.nova_plugin.get_host, my_host_name)
-        self.assertRaises(exception.EntityNotFound,
+        self.assertEqual(my_host,
+                         self.nova_plugin.get_host(my_hypervisor_hostname))
+        self.assertRaises(nova_exceptions.NotFound,
                           self.nova_plugin.get_host, 'nohost')
-        self.assertEqual(3, self.nova_client.hosts.list.call_count)
-        calls = [mock.call(), mock.call(), mock.call()]
+        self.assertEqual(2, self.nova_client.hypervisors.search.call_count)
+        calls = [mock.call('myhost'), mock.call('nohost')]
         self.assertEqual(calls,
-                         self.nova_client.hosts.list.call_args_list)
+                         self.nova_client.hypervisors.search.call_args_list)
 
     def test_get_keypair(self):
         """Tests the get_keypair function."""
@@ -154,59 +162,8 @@ class NovaClientPluginTest(NovaClientPluginTestCase):
                  mock.call('idontexist')]
         self.nova_client.servers.get.assert_has_calls(calls)
 
-    def test_get_network_id_by_label(self):
-        """Tests the get_net_id_by_label function."""
-        net = mock.MagicMock()
-        net.id = str(uuid.uuid4())
-        self.nova_client.networks.find.side_effect = [
-            net, nova_exceptions.NotFound(404),
-            nova_exceptions.NoUniqueMatch()]
-        self.assertEqual(net.id,
-                         self.nova_plugin.get_net_id_by_label('net_label'))
-
-        exc = self.assertRaises(
-            exception.EntityNotFound,
-            self.nova_plugin.get_net_id_by_label, 'idontexist')
-        expected = 'The Nova network (idontexist) could not be found'
-        self.assertIn(expected, six.text_type(exc))
-        exc = self.assertRaises(
-            exception.PhysicalResourceNameAmbiguity,
-            self.nova_plugin.get_net_id_by_label, 'notUnique')
-        expected = ('Multiple physical resources were found '
-                    'with name (notUnique)')
-        self.assertIn(expected, six.text_type(exc))
-        calls = [mock.call(label='net_label'),
-                 mock.call(label='idontexist'),
-                 mock.call(label='notUnique')]
-        self.nova_client.networks.find.assert_has_calls(calls)
-
-    def test_get_nova_network_id(self):
-        """Tests the get_nova_network_id function."""
-        net = mock.MagicMock()
-        net.id = str(uuid.uuid4())
-        not_existent_net_id = str(uuid.uuid4())
-        self.nova_client.networks.get.side_effect = [
-            net, nova_exceptions.NotFound(404)]
-        self.nova_client.networks.find.side_effect = [
-            nova_exceptions.NotFound(404)]
-
-        self.assertEqual(net.id,
-                         self.nova_plugin.get_nova_network_id(net.id))
-        exc = self.assertRaises(
-            exception.EntityNotFound,
-            self.nova_plugin.get_nova_network_id, not_existent_net_id)
-        expected = ('The Nova network (%s) could not be found' %
-                    not_existent_net_id)
-        self.assertIn(expected, six.text_type(exc))
-
-        calls = [mock.call(net.id),
-                 mock.call(not_existent_net_id)]
-        self.nova_client.networks.get.assert_has_calls(calls)
-        self.nova_client.networks.find.assert_called_once_with(
-            label=not_existent_net_id)
-
     def test_get_status(self):
-        server = self.m.CreateMockAnything()
+        server = mock.Mock()
         server.status = 'ACTIVE'
 
         observed = self.nova_plugin.get_status(server)
@@ -216,14 +173,34 @@ class NovaClientPluginTest(NovaClientPluginTestCase):
         observed = self.nova_plugin.get_status(server)
         self.assertEqual('ACTIVE', observed)
 
+    def test_check_verify_resize_task_state(self):
+        """Tests the check_verify_resize function with resize task_state."""
+        my_server = mock.MagicMock(status='Foo')
+        setattr(my_server, 'OS-EXT-STS:task_state', 'resize_finish')
+        self.nova_client.servers.get.side_effect = [my_server]
+
+        self.assertEqual(
+            False, self.nova_plugin.check_verify_resize('my_server'))
+
+    def test_check_verify_resize_error(self):
+        """Tests the check_verify_resize function with unknown status."""
+        my_server = mock.MagicMock(status='Foo')
+        setattr(my_server, 'OS-EXT-STS:task_state', 'active')
+        self.nova_client.servers.get.side_effect = [my_server]
+
+        self.assertRaises(
+            exception.ResourceUnknownStatus,
+            self.nova_plugin.check_verify_resize,
+            'my_server')
+
     def _absolute_limits(self):
-        max_personality = self.m.CreateMockAnything()
+        max_personality = mock.Mock()
         max_personality.name = 'maxPersonality'
         max_personality.value = 5
-        max_personality_size = self.m.CreateMockAnything()
+        max_personality_size = mock.Mock()
         max_personality_size.name = 'maxPersonalitySize'
         max_personality_size.value = 10240
-        max_server_meta = self.m.CreateMockAnything()
+        max_server_meta = mock.Mock()
         max_server_meta.name = 'maxServerMeta'
         max_server_meta.value = 3
         yield max_personality
@@ -392,30 +369,23 @@ class NovaClientPluginUserdataTest(NovaClientPluginTestCase):
     def test_build_userdata(self):
         """Tests the build_userdata function."""
         cfg.CONF.set_override('heat_metadata_server_url',
-                              'http://server.test:123', enforce_type=True)
-        cfg.CONF.set_override('heat_watch_server_url',
-                              'http://server.test:345', enforce_type=True)
-        cfg.CONF.set_override('instance_connection_is_secure',
-                              False, enforce_type=True)
+                              'http://server.test:123')
+        cfg.CONF.set_override('instance_connection_is_secure', False)
         cfg.CONF.set_override(
-            'instance_connection_https_validate_certificates', False,
-            enforce_type=True)
+            'instance_connection_https_validate_certificates', False)
         data = self.nova_plugin.build_userdata({})
         self.assertIn("Content-Type: text/cloud-config;", data)
         self.assertIn("Content-Type: text/cloud-boothook;", data)
         self.assertIn("Content-Type: text/part-handler;", data)
         self.assertIn("Content-Type: text/x-cfninitdata;", data)
         self.assertIn("Content-Type: text/x-shellscript;", data)
-        self.assertIn("http://server.test:345", data)
         self.assertIn("http://server.test:123", data)
         self.assertIn("[Boto]", data)
 
     def test_build_userdata_without_instance_user(self):
         """Don't add a custom instance user when not requested."""
         cfg.CONF.set_override('heat_metadata_server_url',
-                              'http://server.test:123', enforce_type=True)
-        cfg.CONF.set_override('heat_watch_server_url',
-                              'http://server.test:345', enforce_type=True)
+                              'http://server.test:123')
         data = self.nova_plugin.build_userdata({}, instance_user=None)
         self.assertNotIn('user: ', data)
         self.assertNotIn('useradd', data)
@@ -424,13 +394,39 @@ class NovaClientPluginUserdataTest(NovaClientPluginTestCase):
     def test_build_userdata_with_instance_user(self):
         """Add a custom instance user."""
         cfg.CONF.set_override('heat_metadata_server_url',
-                              'http://server.test:123', enforce_type=True)
-        cfg.CONF.set_override('heat_watch_server_url',
-                              'http://server.test:345', enforce_type=True)
+                              'http://server.test:123')
         data = self.nova_plugin.build_userdata({}, instance_user='ec2-user')
         self.assertIn('user: ', data)
         self.assertIn('useradd', data)
         self.assertIn('ec2-user', data)
+
+    def test_build_userdata_with_ignition(self):
+        metadata = {"os-collect-config": {"heat": {"password": "***"}}}
+        userdata = '{"ignition": {"version": "3.0"}, "storage": {"files": []}}'
+        ud_format = 'SOFTWARE_CONFIG'
+        data = self.nova_plugin.build_userdata(metadata,
+                                               userdata=userdata,
+                                               user_data_format=ud_format)
+        ig = json.loads(data)
+        self.assertEqual("/var/lib/heat-cfntools/cfn-init-data",
+                         ig["storage"]["files"][0]["path"])
+        self.assertEqual("/var/lib/cloud/data/cfn-init-data",
+                         ig["storage"]["files"][1]["path"])
+        self.assertEqual("data:,%7B%22os-collect-config%22%3A%20%7B%22heat"
+                         "%22%3A%20%7B%22password%22%3A%20%22%2A%2A%2A%22"
+                         "%7D%7D%7D",
+                         ig["storage"]["files"][0]["contents"]["source"])
+
+    def test_build_userdata_with_invalid_ignition(self):
+        metadata = {"os-collect-config": {"heat": {"password": "***"}}}
+        userdata = '{"ignition": {"version": "3.0"}, "storage": []}'
+        ud_format = 'SOFTWARE_CONFIG'
+
+        self.assertRaises(ValueError,
+                          self.nova_plugin.build_userdata,
+                          metadata,
+                          userdata=userdata,
+                          user_data_format=ud_format)
 
 
 class NovaClientPluginMetadataTest(NovaClientPluginTestCase):
@@ -470,7 +466,7 @@ class NovaClientPluginMetadataTest(NovaClientPluginTestCase):
         """Prove that the user can only pass in a dict to nova metadata."""
         excp = self.assertRaises(exception.StackValidationFailed,
                                  self.nova_plugin.meta_serialize, "foo")
-        self.assertIn('metadata needs to be a Map', six.text_type(excp))
+        self.assertIn('metadata needs to be a Map', str(excp))
 
     def test_serialize_combined(self):
         original = {
@@ -514,6 +510,8 @@ class FlavorConstraintTest(common.HeatTestCase):
     def test_validate(self):
         client = fakes_nova.FakeClient()
         self.stub_keystoneclient()
+        self.patchobject(nova.NovaClientPlugin, 'get_max_microversion',
+                         return_value='2.27')
         self.patchobject(nova.NovaClientPlugin, '_create', return_value=client)
         client.flavors = mock.MagicMock()
 
@@ -536,39 +534,6 @@ class FlavorConstraintTest(common.HeatTestCase):
         self.assertEqual(2, client.flavors.find.call_count)
 
 
-class NetworkConstraintTest(common.HeatTestCase):
-
-    def test_validate(self):
-        client = fakes_nova.FakeClient()
-        self.stub_keystoneclient()
-        self.patchobject(nova.NovaClientPlugin, '_create', return_value=client)
-        client.networks = mock.Mock()
-
-        network = collections.namedtuple("Network", ['id', 'label'])
-        network.id = '7f47ff06-0353-4013-b814-123b70b1b27d'
-        network.label = 'foo'
-        client.networks.get.return_value = network
-
-        constraint = nova.NetworkConstraint()
-        ctx = utils.dummy_context()
-
-        self.assertTrue(constraint.validate(network.id, ctx))
-        client.networks.get.side_effect = nova_exceptions.NotFound('')
-        client.networks.find.return_value = network
-        self.assertTrue(constraint.validate(network.id, ctx))
-
-        client.networks.find.side_effect = nova_exceptions.NotFound('')
-        self.assertFalse(constraint.validate(network.id, ctx))
-
-        client.networks.find.side_effect = nova_exceptions.NoUniqueMatch()
-        self.assertFalse(constraint.validate(network.id, ctx))
-
-        network.id = 'nonuuid'
-        client.networks.find.return_value = network
-        client.networks.find.side_effect = None
-        self.assertTrue(constraint.validate(network.id, ctx))
-
-
 class HostConstraintTest(common.HeatTestCase):
 
     def setUp(self):
@@ -586,13 +551,17 @@ class HostConstraintTest(common.HeatTestCase):
     def test_validation_error(self):
         self.mock_get_host.side_effect = exception.EntityNotFound(
             entity='Host', name='bar')
-        self.assertFalse(self.constraint.validate("bar", self.ctx))
+        self.assertRaises(
+            exception.EntityNotFound,
+            self.constraint.validate, "bar", self.ctx)
 
 
 class KeypairConstraintTest(common.HeatTestCase):
 
     def test_validation(self):
         client = fakes_nova.FakeClient()
+        self.patchobject(nova.NovaClientPlugin, 'get_max_microversion',
+                         return_value='2.27')
         self.patchobject(nova.NovaClientPlugin, '_create', return_value=client)
         client.keypairs = mock.MagicMock()
 
@@ -606,7 +575,7 @@ class KeypairConstraintTest(common.HeatTestCase):
         self.assertFalse(constraint.validate("bar", ctx))
         self.assertTrue(constraint.validate("foo", ctx))
         self.assertTrue(constraint.validate("", ctx))
-        nova.NovaClientPlugin._create.assert_called_once_with()
+        nova.NovaClientPlugin._create.assert_called_once_with(version='2.27')
         calls = [mock.call('bar'),
                  mock.call(key.name)]
         client.keypairs.get.assert_has_calls(calls)
@@ -615,11 +584,12 @@ class KeypairConstraintTest(common.HeatTestCase):
 class ConsoleUrlsTest(common.HeatTestCase):
 
     scenarios = [
-        ('novnc', dict(console_type='novnc', srv_method='vnc')),
-        ('xvpvnc', dict(console_type='xvpvnc', srv_method='vnc')),
-        ('spice', dict(console_type='spice-html5', srv_method='spice')),
-        ('rdp', dict(console_type='rdp-html5', srv_method='rdp')),
-        ('serial', dict(console_type='serial', srv_method='serial')),
+        ('novnc', dict(console_type='novnc', res_obj=True)),
+        ('xvpvnc', dict(console_type='xvpvnc', res_obj=True)),
+        ('spice', dict(console_type='spice-html5', res_obj=True)),
+        ('rdp', dict(console_type='rdp-html5', res_obj=True)),
+        ('serial', dict(console_type='serial', res_obj=True)),
+        ('mks', dict(console_type='webmks', res_obj=False)),
     ]
 
     def setUp(self):
@@ -628,10 +598,14 @@ class ConsoleUrlsTest(common.HeatTestCase):
         con = utils.dummy_context()
         c = con.clients
         self.nova_plugin = c.client_plugin('nova')
-        self.nova_plugin.client = lambda: self.nova_client
+        self.patchobject(self.nova_plugin, 'client',
+                         return_value=self.nova_client)
         self.server = mock.Mock()
-        self.console_method = getattr(self.server,
-                                      'get_%s_console' % self.srv_method)
+        if self.res_obj:
+            self.console_method = getattr(self.server, 'get_console_url')
+        else:
+            self.console_method = getattr(self.nova_client.servers,
+                                          'get_console_url')
 
     def test_get_console_url(self):
         console = {
@@ -646,60 +620,45 @@ class ConsoleUrlsTest(common.HeatTestCase):
             self.console_type]
 
         self.assertEqual(console['console']['url'], console_url)
-        self.console_method.assert_called_once_with(self.console_type)
+        self._assert_console_method_called()
+
+    def _assert_console_method_called(self):
+        if self.console_type == 'webmks':
+            self.console_method.assert_called_once_with(self.server,
+                                                        self.console_type)
+        else:
+            self.console_method.assert_called_once_with(self.console_type)
+
+    def _test_get_console_url_tolerate_exception(self, msg):
+        console_url = self.nova_plugin.get_console_urls(self.server)[
+            self.console_type]
+
+        self._assert_console_method_called()
+        self.assertIn(msg, console_url)
 
     def test_get_console_url_tolerate_unavailable(self):
         msg = 'Unavailable console type %s.' % self.console_type
         self.console_method.side_effect = nova_exceptions.BadRequest(
             400, message=msg)
 
-        console_url = self.nova_plugin.get_console_urls(self.server)[
-            self.console_type]
+        self._test_get_console_url_tolerate_exception(msg)
 
-        self.console_method.assert_called_once_with(self.console_type)
-        self.assertEqual(msg, console_url)
+    def test_get_console_url_tolerate_unsupport(self):
+        msg = 'Unsupported console_type "%s"' % self.console_type
+        self.console_method.side_effect = (
+            nova_exceptions.UnsupportedConsoleType(
+                console_type=self.console_type))
 
-    def test_get_console_urls_reraises_other_400(self):
+        self._test_get_console_url_tolerate_exception(msg)
+
+    def test_get_console_urls_tolerate_other_400(self):
         exc = nova_exceptions.BadRequest
         self.console_method.side_effect = exc(400, message="spam")
 
-        urls = self.nova_plugin.get_console_urls(self.server)
-        e = self.assertRaises(exc, urls.__getitem__, self.console_type)
-        self.assertIn('spam', encodeutils.exception_to_unicode(e))
-        self.console_method.assert_called_once_with(self.console_type)
+        self._test_get_console_url_tolerate_exception('spam')
 
     def test_get_console_urls_reraises_other(self):
         exc = Exception
         self.console_method.side_effect = exc("spam")
 
-        urls = self.nova_plugin.get_console_urls(self.server)
-        e = self.assertRaises(exc, urls.__getitem__, self.console_type)
-        self.assertIn('spam', e.args)
-        self.console_method.assert_called_once_with(self.console_type)
-
-
-class NovaClientPluginExtensionsTest(NovaClientPluginTestCase):
-    """Tests for extensions in novaclient."""
-
-    def test_has_no_extensions(self):
-        self.nova_client.list_extensions.show_all.return_value = []
-        self.assertFalse(self.nova_plugin.has_extension(
-            "os-virtual-interfaces"))
-
-    def test_has_no_interface_extensions(self):
-        mock_extension = mock.Mock()
-        p = mock.PropertyMock(return_value='os-xxxx')
-        type(mock_extension).alias = p
-        self.nova_client.list_extensions.show_all.return_value = [
-            mock_extension]
-        self.assertFalse(self.nova_plugin.has_extension(
-            "os-virtual-interfaces"))
-
-    def test_has_os_interface_extension(self):
-        mock_extension = mock.Mock()
-        p = mock.PropertyMock(return_value='os-virtual-interfaces')
-        type(mock_extension).alias = p
-        self.nova_client.list_extensions.show_all.return_value = [
-            mock_extension]
-        self.assertTrue(self.nova_plugin.has_extension(
-            "os-virtual-interfaces"))
+        self._test_get_console_url_tolerate_exception('spam')

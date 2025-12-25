@@ -71,10 +71,10 @@ Resource Status and Action
 
 The base class handles reporting state of the resource back to the engine.
 A resource's state is the combination of the life cycle action and the status
-of that action. For example, if a resource is created successfully, the status
-of that resource will be ``CREATE COMPLETE``. Alternatively, if the plug-in
+of that action. For example, if a resource is created successfully, the state
+of that resource will be ``CREATE_COMPLETE``. Alternatively, if the plug-in
 encounters an error when attempting to create the physical resource, the
-status would be ``CREATE FAILED``. The base class handles the
+state would be ``CREATE_FAILED``. The base class handles the
 reporting and persisting of resource state, so a plug-in's handler
 methods only need to return data or raise exceptions as appropriate.
 
@@ -112,6 +112,14 @@ manipulate when including that resource in a template. Some examples would be:
 * Which flavor and image to use for a Nova server
 * The port to listen to on Neutron LBaaS nodes
 * The size of a Cinder volume
+
+.. note::
+
+   Properties should normally be accessed through self.properties.
+   This resolves intrinsic functions, provides default values when required
+   and performs property translation for backward compatible schema changes.
+   The self.properties.data dict provides access to the raw data supplied by
+   the user in the template without any of those transformations.
 
 *Attributes* describe runtime state data of the physical resource that the
 plug-in can expose to other resources in a Stack. Generally, these aren't
@@ -159,16 +167,16 @@ plug-in.
         }
 
 As shown above, some properties may themselves be complex and
-reference nested schema definitions.  Following are the parameters to the
+reference nested schema definitions. Following are the parameters to the
 ``Schema`` constructor; all but the first have defaults.
 
 *data_type*:
 
         Defines the type of the property's value. The valid types are
         the members of the list ``properties.Schema.TYPES``, currently
-        ``INTEGER``, ``STRING``, ``NUMBER``, ``BOOLEAN``, ``MAP``, and
-        ``LIST``; please use those symbolic names rather than the
-        literals to which they are equated.  For ``LIST`` and ``MAP``
+        ``INTEGER``, ``STRING``, ``NUMBER``, ``BOOLEAN``, ``MAP``, ``LIST``
+        and ``ANY``; please use those symbolic names rather than the
+        literals to which they are equated. For ``LIST`` and ``MAP``
         type properties, the ``schema`` referenced constrains the
         format of complex items in the list or map.
 
@@ -240,7 +248,7 @@ the end user.
 
 *AllowedValues(allowed, description)*:
   Lists the allowed values.  ``allowed`` must be a
-  ``collections.Sequence`` or ``basestring``.  Applicable to all types
+  ``collections.abc.Sequence`` or ``string``.  Applicable to all types
   of value except MAP.
 
 *Length(min, max, description)*:
@@ -250,6 +258,12 @@ the end user.
 *Range(min, max, description)*:
   Constrains a numerical value.  Applicable to INTEGER and NUMBER.
   Both ``min`` and ``max`` default to ``None``.
+
+*Modulo(step, offset, description)*:
+  Starting with the specified ``offset``, every multiple of ``step`` is a valid
+  value. Applicable to INTEGER and NUMBER.
+
+  Available from template version 2017-02-24.
 
 *CustomConstraint(name, description, environment)*:
   This constructor brings in a named constraint class from an
@@ -333,16 +347,19 @@ overridden:
            """Default implementation; should be overridden by resources.
 
            :returns: the map of resource information or None
-           """
+            """
            if self.entity:
                try:
                    obj = getattr(self.client(), self.entity)
                    resource = obj.get(self.resource_id)
-                   return resource.to_dict()
-                except AttributeError as ex:
-                    LOG.warning(_LW("Resolving 'show' attribute has "
-                                    "failed : %s"), ex)
-                    return None
+                   if isinstance(resource, dict):
+                       return resource
+                   else:
+                       return resource.to_dict()
+               except AttributeError as ex:
+                   LOG.warning("Resolving 'show' attribute has failed : %s",
+                               ex)
+                   return None
 
 Property and Attribute Example
 ******************************
@@ -458,20 +475,31 @@ Note that there is a default implementation of ``handle_update`` in
 that updates require the engine to delete and re-create the resource
 (this is the default behavior) so implementing this is optional.
 
-.. py:function:: handle_update(self, json_snippet, templ_diff, prop_diff)
+.. py:function:: handle_update(self, json_snippet, tmpl_diff, prop_diff)
 
   Update the physical resources using updated information.
 
   :param json_snippet: the resource definition from the updated template
-  :type json_snippet: collections.Mapping
-  :param templ_diff: changed values from the original template definition
-  :type templ_diff: collections.Mapping
+  :type json_snippet: collections.abc.Mapping
+  :param tmpl_diff: values in the updated definition that have changed
+                    with respect to the original template definition.
+  :type tmpl_diff: collections.abc.Mapping
   :param prop_diff: property values that are different between the original
                     definition and the updated definition; keys are
                     property names and values are the new values. Deleted or
                     properties that were originally present but now absent
                     have values of ``None``
-  :type prop_diff: collections.Mapping
+  :type prop_diff: collections.abc.Mapping
+
+  *Note* Before calling ``handle_update`` we check whether need to replace
+  the resource, especially for resource in ``*_FAILED`` state, there is a
+  default implementation of ``needs_replace_failed`` in
+  ``heat.engine.resource.Resource`` that simply returns ``True`` indicating
+  that updates require replacement. And we override the implementation for
+  ``OS::Nova::Server``, ``OS::Cinder::Volume`` and all of neutron resources.
+  The base principle is that to check whether the resource exists underlying
+  and whether the real status is available. So override the method
+  ``needs_replace_failed`` for your resource plug-ins if needed.
 
 .. py:function:: check_update_complete(self, token)
 
@@ -617,8 +645,8 @@ your resource plugin! This has previously caused `problems
 <https://bugs.launchpad.net/heat/+bug/1554625>`_ for multiple operations,
 usually due to uncaught exceptions, If you feel you need to override
 `add_dependencies()`, please reach out to Heat developers on the `#heat` IRC
-channel on FreeNode or on the `openstack-dev
-<mailto:openstack-dev@lists.openstack.org>`_ mailing list to discuss the
+channel on OFTC or on the `openstack-discuss
+<mailto:openstack-discuss@lists.openstack.org>`_ mailing list to discuss the
 possibility of a better solution.
 
 Registering Resource Plug-ins
@@ -654,8 +682,8 @@ directories on the local file system where the engine will search for plug-ins.
 Simply place the file containing your resource in one of these directories and
 the engine will make them available next time the service starts.
 
-See one of the Installation Guides at http://docs.OpenStack.org/ for
-more information on configuring the orchestration service.
+See :doc:`../configuration/index` for more information on configuring the
+orchestration service.
 
 Testing
 -------

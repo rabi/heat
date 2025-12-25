@@ -15,8 +15,6 @@ import collections
 import functools
 import weakref
 
-import six
-
 from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import conditions
@@ -77,31 +75,39 @@ class CommonTemplate(template.Template):
 
         yield ('resource_type',
                self._parse_resource_field(self.RES_TYPE,
-                                          six.string_types, 'string',
+                                          str, 'string',
                                           name, data, parse))
 
         yield ('properties',
                self._parse_resource_field(self.RES_PROPERTIES,
-                                          (collections.Mapping,
+                                          (collections.abc.Mapping,
                                            function.Function), 'object',
                                           name, data, parse))
 
         yield ('metadata',
                self._parse_resource_field(self.RES_METADATA,
-                                          (collections.Mapping,
+                                          (collections.abc.Mapping,
                                            function.Function), 'object',
                                           name, data, parse))
 
         depends = self._parse_resource_field(self.RES_DEPENDS_ON,
-                                             collections.Sequence,
+                                             collections.abc.Sequence,
                                              'list or string',
                                              name, data, no_parse)
-        if isinstance(depends, six.string_types):
+        if isinstance(depends, str):
             depends = [depends]
+        elif depends:
+            for dep in depends:
+                if not isinstance(dep, str):
+                    msg = _('Resource %(name)s %(key)s '
+                            'must be a list of strings') % {
+                                'name': name, 'key': self.RES_DEPENDS_ON}
+                    raise exception.StackValidationFailed(message=msg)
+
         yield 'depends', depends
 
         del_policy = self._parse_resource_field(self.RES_DELETION_POLICY,
-                                                (six.string_types,
+                                                (str,
                                                  function.Function),
                                                 'string',
                                                 name, data, parse)
@@ -116,13 +122,13 @@ class CommonTemplate(template.Template):
 
         yield ('update_policy',
                self._parse_resource_field(self.RES_UPDATE_POLICY,
-                                          (collections.Mapping,
+                                          (collections.abc.Mapping,
                                            function.Function), 'object',
                                           name, data, parse))
 
         yield ('description',
                self._parse_resource_field(self.RES_DESCRIPTION,
-                                          six.string_types, 'string',
+                                          str, 'string',
                                           name, data, no_parse))
 
     def _get_condition_definitions(self):
@@ -137,7 +143,7 @@ class CommonTemplate(template.Template):
             return cached_conds
 
         raw_defs = self._get_condition_definitions()
-        if not isinstance(raw_defs, collections.Mapping):
+        if not isinstance(raw_defs, collections.abc.Mapping):
             message = _('Condition definitions must be a map. Found a '
                         '%s instead') % type(raw_defs).__name__
             raise exception.StackValidationFailed(
@@ -160,7 +166,7 @@ class CommonTemplate(template.Template):
 
         def get_outputs():
             for key, val in outputs.items():
-                if not isinstance(val, collections.Mapping):
+                if not isinstance(val, collections.abc.Mapping):
                     message = _('Output definitions must be a map. Found a '
                                 '%s instead') % type(val).__name__
                     raise exception.StackValidationFailed(
@@ -187,7 +193,7 @@ class CommonTemplate(template.Template):
                         enabled = conds.is_enabled(function.resolve(cond))
                     except ValueError as exc:
                         path = [self.OUTPUTS, key, self.OUTPUT_CONDITION]
-                        message = six.text_type(exc)
+                        message = str(exc)
                         raise exception.StackValidationFailed(path=path,
                                                               message=message)
 

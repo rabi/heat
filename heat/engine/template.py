@@ -16,17 +16,15 @@ import collections
 import copy
 import functools
 import hashlib
-import warnings
 
-import six
 from stevedore import extension
 
 from heat.common import exception
 from heat.common.i18n import _
+from heat.common import template_format
 from heat.engine import conditions
 from heat.engine import environment
 from heat.engine import function
-from heat.engine import output
 from heat.engine import template_files
 from heat.objects import raw_template as template_object
 
@@ -38,8 +36,8 @@ _template_classes = None
 
 def get_version(template_data, available_versions):
     version_keys = set(key for key, version in available_versions)
-    candidate_keys = set(k for k, v in six.iteritems(template_data) if
-                         isinstance(v, six.string_types))
+    candidate_keys = set(k for k, v in template_data.items() if
+                         isinstance(v, str))
 
     keys_present = version_keys & candidate_keys
 
@@ -62,7 +60,7 @@ def _get_template_extension_manager():
 
 
 def raise_extension_exception(extmanager, ep, err):
-    raise TemplatePluginNotRegistered(name=ep.name, error=six.text_type(err))
+    raise TemplatePluginNotRegistered(name=ep.name, error=str(err))
 
 
 class TemplatePluginNotRegistered(exception.HeatException):
@@ -91,7 +89,7 @@ def get_template_class(template_data):
         raise exception.InvalidTemplateVersion(explanation=explanation)
 
 
-class Template(collections.Mapping):
+class Template(collections.abc.Mapping):
     """Abstract base class for template format plugins.
 
     All template formats (both internal and third-party) should derive from
@@ -197,9 +195,33 @@ class Template(collections.Mapping):
         """Return a dict of parameters.Schema objects for the parameters."""
         pass
 
+    def all_param_schemata(self, files):
+        schema = {}
+        files = files if files is not None else {}
+        for f in files.values():
+            try:
+                data = template_format.parse(f)
+            except ValueError:
+                continue
+            else:
+                sub_tmpl = Template(data)
+                schema.update(sub_tmpl.param_schemata())
+        # Parent template has precedence, so update the schema last.
+        schema.update(self.param_schemata())
+        return schema
+
     @abc.abstractmethod
     def get_section_name(self, section):
-        """Return a correct section name."""
+        """Get the name of a field within a resource or output definition.
+
+        Return the name of the given field (specified by the constants given
+        in heat.engine.rsrc_defn and heat.engine.output) in the template
+        format. This is used in error reporting to help users find the
+        location of errors in the template.
+
+        Note that 'section' here does not refer to a top-level section of the
+        template (like parameters, resources, &c.) as it does everywhere else.
+        """
         pass
 
     @abc.abstractmethod
@@ -207,90 +229,14 @@ class Template(collections.Mapping):
         """Return a parameters.Parameters object for the stack."""
         pass
 
-    @classmethod
-    def validate_resource_key_type(cls, key, valid_types, typename,
-                                   allowed_keys, rsrc_name, rsrc_data):
-        """Validate the type of the value provided for a specific resource key.
-
-        This method is deprecated. This is a utility function previously used
-        by the HOT and CFN template implementations. Its API makes no sense
-        since it attempts to check both properties of user-provided keys
-        (i.e. whether they're valid keys) and properties that must necessarily
-        be associated with a pre-defined whitelist of keys (i.e. knowing what
-        types the values should be associated with). This method will be
-        removed in a future version of Heat.
-        """
-        warnings.warn("The validate_resource_key_type() method doesn't make "
-                      "any sense and will be removed in a future version of "
-                      "Heat. Template subclasses should define any "
-                      "validation utility functions they need themselves.",
-                      DeprecationWarning)
-
-        if key not in allowed_keys:
-            raise ValueError(_('"%s" is not a valid '
-                               'keyword inside a resource '
-                               'definition') % key)
-        if key in rsrc_data:
-            if not isinstance(rsrc_data.get(key), valid_types):
-                args = {'name': rsrc_name, 'key': key,
-                        'typename': typename}
-                message = _('Resource %(name)s %(key)s type '
-                            'must be %(typename)s') % args
-                raise TypeError(message)
-            return True
-        else:
-            return False
-
-    def validate_resource_definitions(self, stack):
-        """Check validity of resource definitions.
-
-        This method is deprecated. Subclasses should validate the resource
-        definitions in the process of generating them when calling
-        resource_definitions(). However, for now this method is still called
-        in case any third-party plugins are relying on this for validation and
-        need time to migrate.
-        """
-        pass
-
     def conditions(self, stack):
         """Return a dictionary of resolved conditions."""
         return conditions.Conditions({})
 
+    @abc.abstractmethod
     def outputs(self, stack):
-        warnings.warn("The default implementation of the outputs() method "
-                      "is deprecated, and this method could become an "
-                      "abstractmethod as early as the Pike release. "
-                      "Template subclasses should override this method with "
-                      "a custom implementation for their particular template "
-                      "format.",
-                      DeprecationWarning)
-
-        outputs = self.parse(stack, self[self.OUTPUTS], path=self.OUTPUTS)
-
-        def get_outputs():
-            for key, val in outputs.items():
-                if not isinstance(val, collections.Mapping):
-                    message = _('Outputs must contain Output. '
-                                'Found a [%s] instead') % type(val)
-                    raise exception.StackValidationFailed(
-                        error='Output validation error',
-                        path=[self.OUTPUTS, key],
-                        message=message)
-
-                if self.OUTPUT_VALUE not in val:
-                    message = _('Each output must contain '
-                                'a %s key.') % self.OUTPUT_VALUE
-                    raise exception.StackValidationFailed(
-                        error='Output validation error',
-                        path=[self.OUTPUTS, key],
-                        message=message)
-
-                value_def = val[self.OUTPUT_VALUE]
-                description = val.get(self.OUTPUT_DESCRIPTION)
-
-                yield key, output.OutputDefinition(key, value_def, description)
-
-        return dict(get_outputs())
+        """Return a dictionary of OutputDefinition objects."""
+        pass
 
     @abc.abstractmethod
     def resource_definitions(self, stack):
@@ -305,6 +251,13 @@ class Template(collections.Mapping):
         specified, the name from the ResourceDefinition should be used.
         """
         pass
+
+    def add_output(self, definition):
+        """Add an output to the template.
+
+        The output is passed as a OutputDefinition object.
+        """
+        raise NotImplementedError
 
     def remove_resource(self, name):
         """Remove a resource from the template."""
@@ -331,12 +284,12 @@ class Template(collections.Mapping):
         sections (e.g. parameters are check by parameters schema class).
         """
         t_digest = hashlib.sha256(
-            six.text_type(self.t).encode('utf-8')).hexdigest()
+            str(self.t).encode('utf-8')).hexdigest()
 
         # TODO(kanagaraj-manickam) currently t_digest is stored in self. which
         # is used to check whether already template is validated or not.
         # But it needs to be loaded from dogpile cache backend once its
-        # available in heat (http://specs.openstack.org/openstack/heat-specs/
+        # available in heat (https://specs.openstack.org/openstack/heat-specs/
         # specs/liberty/constraint-validation-cache.html). This is required
         # as multiple heat-engines may process the same template at least
         # in case of instance_group. And it fixes partially bug 1444316
@@ -350,7 +303,7 @@ class Template(collections.Mapping):
                 raise exception.InvalidTemplateSection(section=k)
 
         # check resources
-        for res in six.itervalues(self[self.RESOURCES]):
+        for res in self[self.RESOURCES].values():
             try:
                 if not res or not res.get('Type'):
                     message = _('Each Resource must contain '
@@ -372,9 +325,9 @@ class Template(collections.Mapping):
         not provided, a new empty HOT template of version "2015-04-30"
         is returned.
 
-        :param version: A tuple containing version header of the
-        template: version key and value. E.g. ("heat_template_version",
-        "2015-04-30")
+        :param version: A tuple containing version header of the template
+                        version key and value,
+                        e.g. ``('heat_template_version', '2015-04-30')``
         :returns: A new empty template.
         """
         if from_template:
@@ -391,17 +344,18 @@ class Template(collections.Mapping):
 def parse(functions, stack, snippet, path='', template=None):
     recurse = functools.partial(parse, functions, stack, template=template)
 
-    if isinstance(snippet, collections.Mapping):
+    if isinstance(snippet, collections.abc.Mapping):
         def mkpath(key):
-            return '.'.join([path, six.text_type(key)])
+            return '.'.join([path, str(key)])
 
         if len(snippet) == 1:
-            fn_name, args = next(six.iteritems(snippet))
+            fn_name, args = next(iter(snippet.items()))
             Func = functions.get(fn_name)
             if Func is not None:
                 try:
                     path = '.'.join([path, fn_name])
-                    if issubclass(Func, function.Macro):
+                    if (isinstance(Func, type) and
+                            issubclass(Func, function.Macro)):
                         return Func(stack, fn_name, args,
                                     functools.partial(recurse, path=path),
                                     template)
@@ -410,12 +364,12 @@ def parse(functions, stack, snippet, path='', template=None):
                 except (ValueError, TypeError, KeyError) as e:
                     raise exception.StackValidationFailed(
                         path=path,
-                        message=six.text_type(e))
+                        message=str(e))
 
         return dict((k, recurse(v, mkpath(k)))
-                    for k, v in six.iteritems(snippet))
-    elif (not isinstance(snippet, six.string_types) and
-          isinstance(snippet, collections.Iterable)):
+                    for k, v in snippet.items())
+    elif (not isinstance(snippet, str) and
+          isinstance(snippet, collections.abc.Iterable)):
 
         def mkpath(idx):
             return ''.join([path, '[%d]' % idx])

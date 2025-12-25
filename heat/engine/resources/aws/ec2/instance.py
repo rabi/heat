@@ -15,20 +15,18 @@ import copy
 
 from oslo_config import cfg
 from oslo_log import log as logging
-import six
-
-cfg.CONF.import_opt('max_server_name_length', 'heat.common.config')
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
-from heat.common.i18n import _LW
 from heat.engine import attributes
 from heat.engine.clients import progress
 from heat.engine import constraints
 from heat.engine import properties
 from heat.engine import resource
 from heat.engine.resources import scheduler_hints as sh
+
+
+cfg.CONF.import_opt('max_server_name_length', 'heat.common.config')
 
 LOG = logging.getLogger(__name__)
 
@@ -396,9 +394,9 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
         elif name in self.ATTRIBUTES[1:]:
             res = self._ipaddress()
 
-        LOG.info(_LI('%(name)s._resolve_attribute(%(attname)s) == %(res)s'),
+        LOG.info('%(name)s._resolve_attribute(%(attname)s) == %(res)s',
                  {'name': self.name, 'attname': name, 'res': res})
-        return six.text_type(res) if res else None
+        return str(res) if res else None
 
     def _port_data_delete(self):
         # delete the port data which implicit-created
@@ -417,7 +415,7 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
             unsorted_nics = []
             for entry in network_interfaces:
                 nic = (entry
-                       if not isinstance(entry, six.string_types)
+                       if not isinstance(entry, str)
                        else {'NetworkInterfaceId': entry,
                              'DeviceIndex': len(unsorted_nics)})
                 unsorted_nics.append(nic)
@@ -522,7 +520,7 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
                 hint = tm[self.NOVA_SCHEDULER_HINT_KEY]
                 hint_value = tm[self.NOVA_SCHEDULER_HINT_VALUE]
                 if hint in scheduler_hints:
-                    if isinstance(scheduler_hints[hint], six.string_types):
+                    if isinstance(scheduler_hints[hint], str):
                         scheduler_hints[hint] = [scheduler_hints[hint]]
                     scheduler_hints[hint].append(hint_value)
                 else:
@@ -560,6 +558,7 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
             if server is not None:
                 self.resource_id_set(server.id)
 
+        assert server is not None
         creator = progress.ServerCreateProgress(server.id)
         attachers = []
         for vol_id, device in self.volumes():
@@ -679,9 +678,9 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
         # keep the behavior as creation
         elif (old_network_ifaces and
                 (self.NETWORK_INTERFACES not in prop_diff)):
-            LOG.warning(_LW('There is no change of "%(net_interfaces)s" '
-                            'for instance %(server)s, do nothing '
-                            'when updating.'),
+            LOG.warning('There is no change of "%(net_interfaces)s" '
+                        'for instance %(server)s, do nothing '
+                        'when updating.',
                         {'net_interfaces': self.NETWORK_INTERFACES,
                          'server': self.resource_id})
         # if the interfaces not come from property 'NetworkInterfaces',
@@ -806,10 +805,10 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
         if network_interfaces and subnet_id:
             # consider the old templates, we only to log to warn user
             # NetworkInterfaces has higher priority than SubnetId
-            LOG.warning(_LW('"%(subnet)s" will be ignored if specified '
-                            '"%(net_interfaces)s". So if you specified the '
-                            '"%(net_interfaces)s" property, '
-                            'do not specify "%(subnet)s" property.'),
+            LOG.warning('"%(subnet)s" will be ignored if specified '
+                        '"%(net_interfaces)s". So if you specified the '
+                        '"%(net_interfaces)s" property, '
+                        'do not specify "%(subnet)s" property.',
                         {'subnet': self.SUBNET_ID,
                          'net_interfaces': self.NETWORK_INTERFACES})
 
@@ -854,7 +853,7 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
             # if the instance has been suspended successful,
             # no need to suspend again
             if self.client_plugin().get_status(server) != 'SUSPENDED':
-                LOG.debug("suspending instance %s" % self.resource_id)
+                LOG.debug("suspending instance %s", self.resource_id)
                 server.suspend()
             return server.id
 
@@ -864,9 +863,9 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
         if not server:
             return False
         status = cp.get_status(server)
-        LOG.debug('%(name)s check_suspend_complete status = %(status)s'
-                  % {'name': self.name, 'status': status})
-        if status in list(cp.deferred_server_statuses + ['ACTIVE']):
+        LOG.debug('%(name)s check_suspend_complete status = %(status)s',
+                  {'name': self.name, 'status': status})
+        if status in (cp.deferred_server_statuses | {'ACTIVE'}):
             return status == 'SUSPENDED'
         else:
             exc = exception.ResourceUnknownStatus(
@@ -897,7 +896,7 @@ class Instance(resource.Resource, sh.SchedulerHintsMixin):
             # if the instance has been resumed successful,
             # no need to resume again
             if self.client_plugin().get_status(server) != 'ACTIVE':
-                LOG.debug("resuming instance %s" % self.resource_id)
+                LOG.debug("resuming instance %s", self.resource_id)
                 server.resume()
             return server.id
 

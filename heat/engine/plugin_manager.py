@@ -17,9 +17,7 @@ import sys
 
 from oslo_config import cfg
 from oslo_log import log
-import six
 
-from heat.common.i18n import _LE
 from heat.common import plugin_loader
 
 LOG = log.getLogger(__name__)
@@ -50,15 +48,14 @@ class PluginManager(object):
                                                   'heat.engine')
 
         def modules():
-            pkg_modules = six.moves.map(plugin_loader.load_modules,
-                                        packages())
+            pkg_modules = map(plugin_loader.load_modules, packages())
             return itertools.chain.from_iterable(pkg_modules)
 
         self.modules = list(modules())
 
     def map_to_modules(self, function):
         """Iterate over the results of calling a function on every module."""
-        return six.moves.map(function, self.modules)
+        return map(function, self.modules)
 
 
 class PluginMapping(object):
@@ -73,7 +70,7 @@ class PluginMapping(object):
         mappings provided by that module. Any other arguments passed will be
         passed to the mapping functions.
         """
-        if isinstance(names, six.string_types):
+        if isinstance(names, str):
             names = [names]
 
         self.names = ['%s_mapping' % name for name in names]
@@ -92,15 +89,15 @@ class PluginMapping(object):
                 try:
                     mapping_dict = mapping_func(*self.args, **self.kwargs)
                 except Exception:
-                    LOG.error(_LE('Failed to load %(mapping_name)s '
-                                  'from %(module)s'), fmt_data)
+                    LOG.error('Failed to load %(mapping_name)s '
+                              'from %(module)s', fmt_data)
                     raise
                 else:
-                    if isinstance(mapping_dict, collections.Mapping):
+                    if isinstance(mapping_dict, collections.abc.Mapping):
                         return mapping_dict
                     elif mapping_dict is not None:
-                        LOG.error(_LE('Invalid type for %(mapping_name)s '
-                                      'from %(module)s'), fmt_data)
+                        LOG.error('Invalid type for %(mapping_name)s '
+                                  'from %(module)s', fmt_data)
 
         return {}
 
@@ -110,5 +107,5 @@ class PluginMapping(object):
         Mappings are returned as a list of (key, value) tuples.
         """
         mod_dicts = plugin_manager.map_to_modules(self.load_from_module)
-        return itertools.chain.from_iterable(six.iteritems(d) for d
+        return itertools.chain.from_iterable(d.items() for d
                                              in mod_dicts)

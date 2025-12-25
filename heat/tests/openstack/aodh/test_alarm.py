@@ -1,3 +1,4 @@
+
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,22 +14,18 @@
 
 import copy
 import json
-
-import mock
-import mox
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import template_format
 from heat.engine.clients.os import aodh
-from heat.engine.clients.os import ceilometer
+from heat.engine.clients.os import octavia
 from heat.engine import resource
 from heat.engine.resources.openstack.aodh import alarm
 from heat.engine import rsrc_defn
 from heat.engine import scheduler
 from heat.engine import stack as parser
 from heat.engine import template as tmpl
-from heat.engine import watchrule
 from heat.tests import common
 from heat.tests import utils
 
@@ -121,31 +118,75 @@ not_string_alarm_template = '''
 }
 '''
 
-combination_alarm_template = '''
+event_alarm_template = '''
 {
-  "AWSTemplateFormatVersion" : "2010-09-09",
-  "Description" : "Combination Alarm Test",
-  "Resources" : {
-    "CombinAlarm": {
-     "Type": "OS::Aodh::CombinationAlarm",
-     "Properties": {
-        "description": "Do stuff in combination",
-        "alarm_ids": ["alarm1", "alarm2"],
-        "operator": "and",
-        "alarm_actions": [],
+  "heat_template_version" : "newton",
+  "description" : "Event alarm test",
+  "parameters" : {},
+  "resources" : {
+    "test_event_alarm": {
+     "type": "OS::Aodh::EventAlarm",
+     "properties": {
+        "description": "Alarm event when an image is updated",
+        "event_type": "image.update",
+        "query": [{
+          "field": 'traits.resource_id',
+          "op": "eq",
+          "value": "9a8fec25-1ba6-4170-aa44-5d72f17c07f6"}]
       }
+    },
+    "signal_handler" : {
+      "type" : "SignalResourceType"
     }
   }
 }
 '''
 
+lbmemberhealth_alarm_template = '''
+{
+  "heat_template_version" : "newton",
+  "description" : "Loadbalancer member health alarm test",
+  "parameters" : {},
+  "resources" : {
+    "test_loadbalancer_member_health_alarm": {
+        "type": "OS::Aodh::LBMemberHealthAlarm",
+        "properties": {
+            "description": "Something something dark side",
+            "alarm_actions": ["trust+heat://"],
+            "repeat_actions": false,
+            "pool": "12345",
+            "stack": "13579",
+            "autoscaling_group_id": "02468"
+        }
+    },
+    "signal_handler" : {
+      "type" : "SignalResourceType"
+    }
+  }
+}
+'''
 
-class FakeCombinationAlarm(object):
-    alarm_id = 'foo'
-
-    def __init__(self):
-        self.to_dict = lambda: {'attr': 'val'}
-
+prometheus_alarm_template = '''
+{
+  "heat_template_version" : "wallaby",
+  "description" : "Prometheus alarm test",
+  "parameters" : {},
+  "resources" : {
+    "test_prometheus_alarm": {
+        "type": "OS::Aodh::PrometheusAlarm",
+        "properties": {
+            "alarm_actions": [],
+            "threshold": "10",
+            "comparison_operator": "gt",
+            "query": "some_metric{some_label='some_value'}"
+        }
+    },
+    "signal_handler" : {
+      "type" : "SignalResourceType"
+    }
+  }
+}
+'''
 
 FakeAodhAlarm = {'other_attrs': 'val',
                  'alarm_id': 'foo'}
@@ -291,8 +332,8 @@ class AodhAlarmTest(common.HeatTestCase):
         rsrc.properties.data = rsrc.get_alarm_props(properties)
         self.assertIsNone(rsrc.properties.data.get('matching_metadata'))
         query = rsrc.properties.data['threshold_rule']['query']
-        expected_query = [{'field': u'metadata.user_metadata.groupname',
-                           'value': u'foo', 'op': 'eq'}]
+        expected_query = [{'field': 'metadata.user_metadata.groupname',
+                           'value': 'foo', 'op': 'eq'}]
         self.assertEqual(expected_query, query)
 
     def test_alarm_metadata_correct_query_key(self):
@@ -308,8 +349,8 @@ class AodhAlarmTest(common.HeatTestCase):
         rsrc.properties.data = rsrc.get_alarm_props(properties)
         self.assertIsNone(rsrc.properties.data.get('matching_metadata'))
         query = rsrc.properties.data['threshold_rule']['query']
-        expected_query = [{'field': u'metadata.metering.groupname',
-                           'value': u'foo', 'op': 'eq'}]
+        expected_query = [{'field': 'metadata.metering.groupname',
+                           'value': 'foo', 'op': 'eq'}]
         self.assertEqual(expected_query, query)
 
     def test_mem_alarm_high_correct_matching_metadata(self):
@@ -329,7 +370,7 @@ class AodhAlarmTest(common.HeatTestCase):
         rsrc.properties.data = rsrc.get_alarm_props(properties)
         self.assertIsNone(rsrc.properties.data.get('matching_metadata'))
         for key in rsrc.properties.data['threshold_rule']['query']:
-            self.assertIsInstance(key['value'], six.text_type)
+            self.assertIsInstance(key['value'], str)
 
     def test_no_matching_metadata(self):
         """Make sure that we can pass in an empty matching_metadata."""
@@ -360,7 +401,7 @@ class AodhAlarmTest(common.HeatTestCase):
                                       rsrc.validate)
             self.assertEqual(
                 "Property error: Resources.MEMAlarmHigh.Properties.%s: "
-                "Value '60a' is not an integer" % p, six.text_type(error))
+                "Value '60a' is not an integer" % p, str(error))
 
     def test_mem_alarm_high_not_integer_parameters(self):
         orig_snippet = template_format.parse(not_string_alarm_template)
@@ -372,13 +413,14 @@ class AodhAlarmTest(common.HeatTestCase):
             resource_defns = stack.t.resource_definitions(stack)
             rsrc = alarm.AodhAlarm(
                 'MEMAlarmHigh', resource_defns['MEMAlarmHigh'], stack)
-            # python 3.4.3 returns another error message
-            # so try to handle this by regexp
+            # python 3.4.3 and python3.10 return slightly different error
+            # messages, so try to handle this by regexp
             msg = ("Property error: Resources.MEMAlarmHigh.Properties.%s: "
-                   "int\(\) argument must be a string(, a bytes-like "
-                   "object)? or a number, not 'list'" % p)
-            self.assertRaisesRegexp(exception.StackValidationFailed,
-                                    msg, rsrc.validate)
+                   r"int\(\) argument must be a string"
+                   "(, a bytes-like object)?"
+                   " or a (real )?number, not 'list'" % p)
+            self.assertRaisesRegex(exception.StackValidationFailed,
+                                   msg, rsrc.validate)
 
     def test_mem_alarm_high_check_not_required_parameters(self):
         snippet = template_format.parse(not_string_alarm_template)
@@ -393,7 +435,7 @@ class AodhAlarmTest(common.HeatTestCase):
         self.assertEqual(
             "Property error: Resources.MEMAlarmHigh.Properties: "
             "Property meter_name not assigned",
-            six.text_type(error))
+            str(error))
 
         for p in ('period', 'evaluation_periods', 'statistic',
                   'comparison_operator'):
@@ -406,77 +448,24 @@ class AodhAlarmTest(common.HeatTestCase):
                 'MEMAlarmHigh', resource_defns['MEMAlarmHigh'], stack)
             self.assertIsNone(rsrc.validate())
 
-    def test_delete_watchrule_destroy(self):
-        t = template_format.parse(alarm_template)
-
-        test_stack = self.create_stack(template=json.dumps(t))
-        rsrc = test_stack['MEMAlarmHigh']
-
-        wr = mock.MagicMock()
-        self.patchobject(watchrule.WatchRule, 'load', return_value=wr)
-        wr.destroy.return_value = None
-
-        self.patchobject(aodh.AodhClientPlugin, 'client',
-                         return_value=self.fa)
-        self.patchobject(self.fa.alarm, 'delete')
-        rsrc.resource_id = '12345'
-
-        self.assertEqual('12345', rsrc.handle_delete())
-        self.assertEqual(1, wr.destroy.call_count)
-        # check that super method has been called and execute deleting
-        self.assertEqual(1, self.fa.alarm.delete.call_count)
-
-    def test_delete_no_watchrule(self):
-        t = template_format.parse(alarm_template)
-
-        test_stack = self.create_stack(template=json.dumps(t))
-        rsrc = test_stack['MEMAlarmHigh']
-
-        wr = mock.MagicMock()
-        self.patchobject(watchrule.WatchRule, 'load',
-                         side_effect=[exception.EntityNotFound(
-                             entity='Watch Rule', name='test')])
-        wr.destroy.return_value = None
-
-        self.patchobject(aodh.AodhClientPlugin, 'client',
-                         return_value=self.fa)
-        self.patchobject(self.fa.alarm, 'delete')
-        rsrc.resource_id = '12345'
-
-        self.assertEqual('12345', rsrc.handle_delete())
-        self.assertEqual(0, wr.destroy.call_count)
-        # check that super method has been called and execute deleting
-        self.assertEqual(1, self.fa.alarm.delete.call_count)
-
-    def _prepare_check_resource(self):
+    def _prepare_resource(self, for_check=True):
         snippet = template_format.parse(not_string_alarm_template)
         self.stack = utils.parse_stack(snippet)
         res = self.stack['MEMAlarmHigh']
+        if for_check:
+            res.state_set(res.CREATE, res.COMPLETE)
         res.client = mock.Mock()
         mock_alarm = mock.Mock(enabled=True, state='ok')
         res.client().alarm.get.return_value = mock_alarm
         return res
 
-    @mock.patch.object(alarm.watchrule.WatchRule, 'load')
-    def test_check(self, mock_load):
-        res = self._prepare_check_resource()
+    def test_check(self):
+        res = self._prepare_resource()
         scheduler.TaskRunner(res.check)()
         self.assertEqual((res.CHECK, res.COMPLETE), res.state)
 
-    @mock.patch.object(alarm.watchrule.WatchRule, 'load')
-    def test_check_watchrule_failure(self, mock_load):
-        res = self._prepare_check_resource()
-        exc = alarm.exception.EntityNotFound(entity='Watch Rule', name='Boom')
-        mock_load.side_effect = exc
-
-        self.assertRaises(exception.ResourceFailure,
-                          scheduler.TaskRunner(res.check))
-        self.assertEqual((res.CHECK, res.FAILED), res.state)
-        self.assertIn('Boom', res.status_reason)
-
-    @mock.patch.object(alarm.watchrule.WatchRule, 'load')
-    def test_check_alarm_failure(self, mock_load):
-        res = self._prepare_check_resource()
+    def test_check_alarm_failure(self):
+        res = self._prepare_resource()
         res.client().alarm.get.side_effect = Exception('Boom')
 
         self.assertRaises(exception.ResourceFailure,
@@ -485,7 +474,7 @@ class AodhAlarmTest(common.HeatTestCase):
         self.assertIn('Boom', res.status_reason)
 
     def test_show_resource(self):
-        res = self._prepare_check_resource()
+        res = self._prepare_resource(for_check=False)
         res.client().alarm.create.return_value = FakeAodhAlarm
         res.client().alarm.get.return_value = FakeAodhAlarm
         scheduler.TaskRunner(res.create)()
@@ -539,7 +528,7 @@ class AodhAlarmTest(common.HeatTestCase):
         )
         self.assertEqual(
             "StackValidationFailed: resources.MEMAlarmHigh: Property error: "
-            "MEMAlarmHigh.Properties.time_constraints[0].start: Error "
+            "Properties.time_constraints[0].start: Error "
             "validating value '%s': Invalid CRON expression: "
             "[%s] is not acceptable, out of range" % (start_time, start_time),
             error.message)
@@ -590,11 +579,12 @@ class AodhAlarmTest(common.HeatTestCase):
             exception.ResourceFailure,
             scheduler.TaskRunner(rsrc.update, snippet)
         )
+        err = "No time zone found with key %s" % timezone
         self.assertEqual(
             "StackValidationFailed: resources.MEMAlarmHigh: Property error: "
-            "MEMAlarmHigh.Properties.time_constraints[0].timezone: Error "
+            "Properties.time_constraints[0].timezone: Error "
             "validating value '%s': Invalid timezone: '%s'"
-            % (timezone, timezone),
+            % (timezone, err),
             error.message)
 
     def test_alarm_live_state(self):
@@ -643,122 +633,116 @@ class AodhAlarmTest(common.HeatTestCase):
         reality = alarm_res.get_live_state(alarm_res.properties)
         self.assertEqual(expected_data, reality)
 
+    def test_queue_actions(self):
+        stack = self.create_stack()
+        alarm = stack['MEMAlarmHigh']
 
-class CombinationAlarmTest(common.HeatTestCase):
+        props = {
+            'alarm_actions': ['http://example.com/test'],
+            'alarm_queues': ['alarm_queue'],
+            'ok_actions': [],
+            'ok_queues': ['ok_queue_1', 'ok_queue_2'],
+            'insufficient_data_actions': ['http://example.com/test2',
+                                          'http://example.com/test3'],
+            'insufficient_data_queues': ['nodata_queue'],
+        }
 
+        expected = {
+            'alarm_actions': ['http://example.com/test',
+                              'trust+zaqar://?queue_name=alarm_queue'],
+            'ok_actions': ['trust+zaqar://?queue_name=ok_queue_1',
+                           'trust+zaqar://?queue_name=ok_queue_2'],
+            'insufficient_data_actions': [
+                'http://example.com/test2',
+                'http://example.com/test3',
+                'trust+zaqar://?queue_name=nodata_queue'
+            ],
+        }
+
+        self.assertEqual(expected, alarm.actions_to_urls(props))
+
+
+class EventAlarmTest(common.HeatTestCase):
     def setUp(self):
-        super(CombinationAlarmTest, self).setUp()
-        self.fc = mock.Mock()
-        self.m.StubOutWithMock(ceilometer.CeilometerClientPlugin, '_create')
+        super(EventAlarmTest, self).setUp()
+        self.fa = mock.Mock()
 
-    def create_alarm(self):
-        ceilometer.CeilometerClientPlugin._create().AndReturn(
-            self.fc)
-        self.m.StubOutWithMock(self.fc.alarms, 'create')
-        self.fc.alarms.create(
-            alarm_actions=[],
-            description=u'Do stuff in combination',
-            enabled=True,
-            insufficient_data_actions=None,
-            ok_actions=None,
-            name=mox.IgnoreArg(), type='combination',
-            repeat_actions=True,
-            combination_rule={'alarm_ids': [u'alarm1', u'alarm2'],
-                              'operator': u'and'},
-            time_constraints=[],
-            severity='low'
-        ).AndReturn(FakeCombinationAlarm())
-        self.tmpl = template_format.parse(combination_alarm_template)
-        self.stack = utils.parse_stack(self.tmpl)
-        resource_defns = self.stack.t.resource_definitions(self.stack)
-        return alarm.CombinationAlarm(
-            'CombinAlarm', resource_defns['CombinAlarm'], self.stack)
+    def create_stack(self, template=None):
+        if template is None:
+            template = event_alarm_template
+        temp = template_format.parse(template)
+        template = tmpl.Template(temp)
+        ctx = utils.dummy_context()
+        ctx.tenant = 'test_tenant'
+        stack = parser.Stack(ctx, utils.random_name(), template,
+                             disable_rollback=True)
+        stack.store()
 
-    def test_create(self):
-        rsrc = self.create_alarm()
+        self.patchobject(aodh.AodhClientPlugin,
+                         '_create').return_value = self.fa
 
-        self.m.ReplayAll()
-        scheduler.TaskRunner(rsrc.create)()
-        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
-        self.assertEqual('foo', rsrc.resource_id)
-        self.m.VerifyAll()
+        self.patchobject(self.fa.alarm, 'create').return_value = FakeAodhAlarm
 
-    def test_invalid_alarm_list(self):
-        snippet = template_format.parse(combination_alarm_template)
-        snippet['Resources']['CombinAlarm']['Properties']['alarm_ids'] = []
-        stack = utils.parse_stack(snippet)
-        resource_defns = stack.t.resource_definitions(stack)
-        rsrc = alarm.CombinationAlarm(
-            'CombinAlarm', resource_defns['CombinAlarm'], stack)
-        error = self.assertRaises(exception.StackValidationFailed,
-                                  rsrc.validate)
-        self.assertEqual(
-            "Property error: Resources.CombinAlarm.Properties.alarm_ids: "
-            "length (0) is out of range (min: 1, max: None)",
-            six.text_type(error))
+        return stack
 
     def test_update(self):
-        rsrc = self.create_alarm()
-        self.m.StubOutWithMock(self.fc.alarms, 'update')
-        self.fc.alarms.update(
-            alarm_id='foo',
-            combination_rule={'alarm_ids': [u'alarm1', u'alarm3']})
+        test_stack = self.create_stack()
+        update_mock = self.patchobject(self.fa.alarm, 'update')
+        test_stack.create()
+        rsrc = test_stack['test_event_alarm']
 
-        self.m.ReplayAll()
-        scheduler.TaskRunner(rsrc.create)()
+        update_props = copy.deepcopy(rsrc.properties.data)
+        update_props.update({
+            'enabled': True,
+            'insufficient_data_actions': [],
+            'alarm_actions': [],
+            'ok_actions': ['signal_handler'],
+            'query': [dict(
+                field='traits.resource_id',
+                op='eq',
+                value='c7405b0f-139f-4fbd-9348-f32dfc5674ac')]
+        })
 
-        props = self.tmpl['Resources']['CombinAlarm']['Properties'].copy()
-        props['alarm_ids'] = ['alarm1', 'alarm3']
-        update_template = rsrc.t.freeze(properties=props)
-        scheduler.TaskRunner(rsrc.update, update_template)()
+        snippet = rsrc_defn.ResourceDefinition(rsrc.name,
+                                               rsrc.type(),
+                                               update_props)
+
+        scheduler.TaskRunner(rsrc.update, snippet)()
+
         self.assertEqual((rsrc.UPDATE, rsrc.COMPLETE), rsrc.state)
+        self.assertEqual(1, update_mock.call_count)
 
-        self.m.VerifyAll()
+    def test_delete(self):
+        test_stack = self.create_stack()
+        rsrc = test_stack['test_event_alarm']
 
-    def test_suspend(self):
-        rsrc = self.create_alarm()
-        self.m.StubOutWithMock(self.fc.alarms, 'update')
-        self.fc.alarms.update(alarm_id='foo', enabled=False)
+        self.patchobject(aodh.AodhClientPlugin, 'client',
+                         return_value=self.fa)
+        self.patchobject(self.fa.alarm, 'delete')
+        rsrc.resource_id = '12345'
 
-        self.m.ReplayAll()
-        scheduler.TaskRunner(rsrc.create)()
+        self.assertEqual('12345', rsrc.handle_delete())
+        self.assertEqual(1, self.fa.alarm.delete.call_count)
 
-        scheduler.TaskRunner(rsrc.suspend)()
-        self.assertEqual((rsrc.SUSPEND, rsrc.COMPLETE), rsrc.state)
-
-        self.m.VerifyAll()
-
-    def test_resume(self):
-        rsrc = self.create_alarm()
-        self.m.StubOutWithMock(self.fc.alarms, 'update')
-        self.fc.alarms.update(alarm_id='foo', enabled=True)
-
-        self.m.ReplayAll()
-        scheduler.TaskRunner(rsrc.create)()
-        rsrc.state_set(rsrc.SUSPEND, rsrc.COMPLETE)
-
-        scheduler.TaskRunner(rsrc.resume)()
-        self.assertEqual((rsrc.RESUME, rsrc.COMPLETE), rsrc.state)
-
-        self.m.VerifyAll()
-
-    def _prepare_check_resource(self):
-        snippet = template_format.parse(combination_alarm_template)
+    def _prepare_resource(self, for_check=True):
+        snippet = template_format.parse(event_alarm_template)
         self.stack = utils.parse_stack(snippet)
-        res = self.stack['CombinAlarm']
+        res = self.stack['test_event_alarm']
+        if for_check:
+            res.state_set(res.CREATE, res.COMPLETE)
         res.client = mock.Mock()
         mock_alarm = mock.Mock(enabled=True, state='ok')
-        res.client().alarms.get.return_value = mock_alarm
+        res.client().alarm.get.return_value = mock_alarm
         return res
 
     def test_check(self):
-        res = self._prepare_check_resource()
+        res = self._prepare_resource()
         scheduler.TaskRunner(res.check)()
         self.assertEqual((res.CHECK, res.COMPLETE), res.state)
 
-    def test_check_failure(self):
-        res = self._prepare_check_resource()
-        res.client().alarms.get.side_effect = Exception('Boom')
+    def test_check_alarm_failure(self):
+        res = self._prepare_resource()
+        res.client().alarm.get.side_effect = Exception('Boom')
 
         self.assertRaises(exception.ResourceFailure,
                           scheduler.TaskRunner(res.check))
@@ -766,9 +750,201 @@ class CombinationAlarmTest(common.HeatTestCase):
         self.assertIn('Boom', res.status_reason)
 
     def test_show_resource(self):
-        res = self._prepare_check_resource()
-        res.client().alarms.create.return_value = mock.MagicMock(
-            alarm_id='2')
-        res.client().alarms.get.return_value = FakeCombinationAlarm()
+        res = self._prepare_resource(for_check=False)
+        res.client().alarm.create.return_value = FakeAodhAlarm
+        res.client().alarm.get.return_value = FakeAodhAlarm
         scheduler.TaskRunner(res.create)()
-        self.assertEqual({'attr': 'val'}, res.FnGetAtt('show'))
+        self.assertEqual(FakeAodhAlarm, res.FnGetAtt('show'))
+
+
+class LBMemberHealthAlarmTest(common.HeatTestCase):
+
+    def setUp(self):
+        super(LBMemberHealthAlarmTest, self).setUp()
+        self.fa = mock.Mock()
+        self.patchobject(
+            octavia.OctaviaClientPlugin, 'get_pool').return_value = "9999"
+
+    def create_stack(self, template=None):
+
+        if template is None:
+            template = lbmemberhealth_alarm_template
+        temp = template_format.parse(template)
+        template = tmpl.Template(temp)
+        ctx = utils.dummy_context()
+        ctx.tenant = 'test_tenant'
+        stack = parser.Stack(ctx, utils.random_name(), template,
+                             disable_rollback=True)
+        stack.store()
+
+        self.patchobject(aodh.AodhClientPlugin,
+                         '_create').return_value = self.fa
+
+        self.patchobject(self.fa.alarm, 'create').return_value = FakeAodhAlarm
+        return stack
+
+    def _prepare_resource(self, for_check=True):
+
+        snippet = template_format.parse(lbmemberhealth_alarm_template)
+        self.stack = utils.parse_stack(snippet)
+        res = self.stack['test_loadbalancer_member_health_alarm']
+        if for_check:
+            res.state_set(res.CREATE, res.COMPLETE)
+        res.client = mock.Mock()
+        mock_alarm = mock.Mock(enabled=True, state='ok')
+        res.client().alarm.get.return_value = mock_alarm
+        return res
+
+    def test_delete(self):
+        test_stack = self.create_stack()
+        rsrc = test_stack['test_loadbalancer_member_health_alarm']
+
+        self.patchobject(aodh.AodhClientPlugin, 'client',
+                         return_value=self.fa)
+        self.patchobject(self.fa.alarm, 'delete')
+        rsrc.resource_id = '12345'
+
+        self.assertEqual('12345', rsrc.handle_delete())
+        self.assertEqual(1, self.fa.alarm.delete.call_count)
+
+    def test_check(self):
+        res = self._prepare_resource()
+        scheduler.TaskRunner(res.check)()
+        self.assertEqual((res.CHECK, res.COMPLETE), res.state)
+
+    def test_check_alarm_failure(self):
+        res = self._prepare_resource()
+        res.client().alarm.get.side_effect = Exception('Boom')
+
+        self.assertRaises(exception.ResourceFailure,
+                          scheduler.TaskRunner(res.check))
+        self.assertEqual((res.CHECK, res.FAILED), res.state)
+        self.assertIn('Boom', res.status_reason)
+
+    def test_show_resource(self):
+        res = self._prepare_resource(for_check=False)
+        res.client().alarm.create.return_value = FakeAodhAlarm
+        res.client().alarm.get.return_value = FakeAodhAlarm
+        scheduler.TaskRunner(res.create)()
+        self.assertEqual(FakeAodhAlarm, res.FnGetAtt('show'))
+
+    def test_update(self):
+        test_stack = self.create_stack()
+        update_mock = self.patchobject(self.fa.alarm, 'update')
+        test_stack.create()
+        rsrc = test_stack['test_loadbalancer_member_health_alarm']
+
+        update_props = copy.deepcopy(rsrc.properties.data)
+        update_props.update({
+            "enabled": True,
+            "description": "",
+            "insufficient_data_actions": [],
+            "alarm_actions": [],
+            "ok_actions": ["signal_handler"],
+            "pool": "0000",
+            "autoscaling_group_id": "2222"
+        })
+
+        snippet = rsrc_defn.ResourceDefinition(rsrc.name,
+                                               rsrc.type(),
+                                               update_props)
+
+        scheduler.TaskRunner(rsrc.update, snippet)()
+
+        self.assertEqual((rsrc.UPDATE, rsrc.COMPLETE), rsrc.state)
+        self.assertEqual(1, update_mock.call_count)
+
+
+class PrometheusAlarmTest(common.HeatTestCase):
+
+    def setUp(self):
+        super(PrometheusAlarmTest, self).setUp()
+        self.fa = mock.Mock()
+
+    def create_stack(self, template=None):
+        if template is None:
+            template = prometheus_alarm_template
+        temp = template_format.parse(template)
+        template = tmpl.Template(temp)
+        ctx = utils.dummy_context()
+        ctx.tenant = 'test_tenant'
+        stack = parser.Stack(ctx, utils.random_name(), template,
+                             disable_rollback=True)
+        stack.store()
+
+        self.patchobject(aodh.AodhClientPlugin,
+                         '_create').return_value = self.fa
+
+        self.patchobject(self.fa.alarm, 'create').return_value = FakeAodhAlarm
+
+        return stack
+
+    def _prepare_resource(self, for_check=True):
+        snippet = template_format.parse(prometheus_alarm_template)
+        self.stack = utils.parse_stack(snippet)
+        res = self.stack['test_prometheus_alarm']
+        if for_check:
+            res.state_set(res.CREATE, res.COMPLETE)
+        res.client = mock.Mock()
+        mock_alarm = mock.Mock(enabled=True, state='ok')
+        res.client().alarm.get.return_value = mock_alarm
+        return res
+
+    def test_delete(self):
+        test_stack = self.create_stack()
+        rsrc = test_stack['test_prometheus_alarm']
+        rsrc.resource_id = '12345'
+
+        self.patchobject(aodh.AodhClientPlugin, 'client',
+                         return_value=self.fa)
+        self.patchobject(self.fa.alarm, 'delete')
+
+        self.assertEqual('12345', rsrc.handle_delete())
+        self.assertEqual(1, self.fa.alarm.delete.call_count)
+
+    def test_check(self):
+        res = self._prepare_resource()
+        scheduler.TaskRunner(res.check)()
+        self.assertEqual((res.CHECK, res.COMPLETE), res.state)
+
+    def test_check_alarm_failure(self):
+        res = self._prepare_resource()
+        res.client().alarm.get.side_effect = Exception('Boom')
+
+        self.assertRaises(exception.ResourceFailure,
+                          scheduler.TaskRunner(res.check))
+        self.assertEqual((res.CHECK, res.FAILED), res.state)
+        self.assertIn('Boom', res.status_reason)
+
+    def test_show_resource(self):
+        res = self._prepare_resource(for_check=False)
+        res.client().alarm.create.return_value = FakeAodhAlarm
+        res.client().alarm.get.return_value = FakeAodhAlarm
+        scheduler.TaskRunner(res.create)()
+        self.assertEqual(FakeAodhAlarm, res.FnGetAtt('show'))
+
+    def test_update(self):
+        test_stack = self.create_stack()
+        update_mock = self.patchobject(self.fa.alarm, 'update')
+        test_stack.create()
+        rsrc = test_stack['test_prometheus_alarm']
+
+        update_props = copy.deepcopy(rsrc.properties.data)
+        update_props.update({
+            'comparison_operator': 'lt',
+            'enabled': True,
+            'threshold': '9',
+            'insufficient_data_actions': [],
+            'alarm_actions': [],
+            'ok_actions': ['signal_handler'],
+            'query': "some_other_metric{some_other_label='value'}"
+        })
+
+        snippet = rsrc_defn.ResourceDefinition(rsrc.name,
+                                               rsrc.type(),
+                                               update_props)
+
+        scheduler.TaskRunner(rsrc.update, snippet)()
+
+        self.assertEqual((rsrc.UPDATE, rsrc.COMPLETE), rsrc.state)
+        self.assertEqual(1, update_mock.call_count)

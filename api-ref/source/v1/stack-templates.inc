@@ -80,8 +80,8 @@ Request Parameters
    - tenant_id: tenant_id
    - template_version: template_version_url
 
-Reponse Parameters
-------------------
+Response Parameters
+-------------------
 
 .. rest_parameters:: parameters.yaml
 
@@ -145,6 +145,7 @@ Response Parameters
    - Description: Description
    - ParameterGroups: ParameterGroups
    - Parameters: Parameters
+   - Environment: Environment
 
 Response Example
 ----------------

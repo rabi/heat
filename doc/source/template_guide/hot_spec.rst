@@ -31,9 +31,9 @@ Status
 ~~~~~~
 
 HOT is considered reliable, supported, and standardized as of our
-Icehouse (April 2014) release.  The Heat core team may make improvements
-to the standard, which very likely would be backward compatible.  The template
-format is also versioned.  Since Juno release, Heat supports multiple
+Icehouse (April 2014) release. The Heat core team may make improvements
+to the standard, which very likely would be backward compatible. The template
+format is also versioned. Since Juno release, Heat supports multiple
 different versions of the HOT specification.
 
 Template structure
@@ -115,145 +115,346 @@ for the ``heat_template_version`` key:
 
 2013-05-23
 ----------
-    The key with value ``2013-05-23`` indicates that the YAML document is a HOT
-    template and it may contain features implemented until the Icehouse
-    release. This version supports the following functions (some are back
-    ported to this version)::
+The key with value ``2013-05-23`` indicates that the YAML document is a HOT
+template and it may contain features implemented until the Icehouse
+release. This version supports the following functions (some are back
+ported to this version)::
 
-      get_attr
-      get_file
-      get_param
-      get_resource
-      list_join
-      resource_facade
-      str_replace
-      Fn::Base64
-      Fn::GetAZs
-      Fn::Join
-      Fn::MemberListToMap
-      Fn::Replace
-      Fn::ResourceFacade
-      Fn::Select
-      Fn::Split
-      Ref
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  resource_facade
+  str_replace
+  Fn::Base64
+  Fn::GetAZs
+  Fn::Join
+  Fn::MemberListToMap
+  Fn::Replace
+  Fn::ResourceFacade
+  Fn::Select
+  Fn::Split
+  Ref
 
 2014-10-16
 ----------
-    The key with value ``2014-10-16`` indicates that the YAML document is a HOT
-    template and it may contain features added and/or removed up until the Juno
-    release.  This version removes most CFN functions that were supported in
-    the Icehouse release, i.e. the ``2013-05-23`` version.  So the supported
-    functions now are::
+The key with value ``2014-10-16`` indicates that the YAML document is a HOT
+template and it may contain features added and/or removed up until the Juno
+release. This version removes most CFN functions that were supported in
+the Icehouse release, i.e. the ``2013-05-23`` version. So the supported
+functions now are::
 
-      get_attr
-      get_file
-      get_param
-      get_resource
-      list_join
-      resource_facade
-      str_replace
-      Fn::Select
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  resource_facade
+  str_replace
+  Fn::Select
 
 2015-04-30
 ----------
-    The key with value ``2015-04-30`` indicates that the YAML document is a HOT
-    template and it may contain features added and/or removed up until the Kilo
-    release. This version adds the ``repeat`` function. So the complete list of
-    supported functions is::
+The key with value ``2015-04-30`` indicates that the YAML document is a HOT
+template and it may contain features added and/or removed up until the Kilo
+release. This version adds the ``repeat`` function. So the complete list of
+supported functions is::
 
-      get_attr
-      get_file
-      get_param
-      get_resource
-      list_join
-      repeat
-      digest
-      resource_facade
-      str_replace
-      Fn::Select
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  repeat
+  digest
+  resource_facade
+  str_replace
+  Fn::Select
 
 2015-10-15
 ----------
-    The key with value ``2015-10-15`` indicates that the YAML document is a HOT
-    template and it may contain features added and/or removed up until the
-    Liberty release. This version removes the *Fn::Select* function, path based
-    ``get_attr``/``get_param`` references should be used instead. Moreover
-    ``get_attr`` since this version returns dict of all attributes for the
-    given resource excluding *show* attribute, if there's no <attribute name>
-    specified, e.g. :code:`{ get_attr: [<resource name>]}`. This version
-    also adds the str_split function and support for passing multiple lists to
-    the existing list_join function. The complete list of supported functions
-    is::
+The key with value ``2015-10-15`` indicates that the YAML document is a HOT
+template and it may contain features added and/or removed up until the
+Liberty release. This version removes the *Fn::Select* function, path based
+``get_attr``/``get_param`` references should be used instead. Moreover
+``get_attr`` since this version returns dict of all attributes for the
+given resource excluding *show* attribute, if there's no <attribute name>
+specified, e.g. :code:`{ get_attr: [<resource name>]}`. This version
+also adds the str_split function and support for passing multiple lists to
+the existing list_join function. The complete list of supported functions
+is::
 
-      get_attr
-      get_file
-      get_param
-      get_resource
-      list_join
-      repeat
-      digest
-      resource_facade
-      str_replace
-      str_split
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  repeat
+  digest
+  resource_facade
+  str_replace
+  str_split
 
 2016-04-08
 ----------
-    The key with value ``2016-04-08`` indicates that the YAML document is a HOT
-    template and it may contain features added and/or removed up until the
-    Mitaka release.  This version also adds the ``map_merge`` function which
-    can be used to merge the contents of maps. The complete list of supported
-    functions is::
+The key with value ``2016-04-08`` indicates that the YAML document is a HOT
+template and it may contain features added and/or removed up until the
+Mitaka release. This version also adds the ``map_merge`` function which
+can be used to merge the contents of maps. The complete list of supported
+functions is::
 
-      digest
-      get_attr
-      get_file
-      get_param
-      get_resource
-      list_join
-      map_merge
-      repeat
-      resource_facade
-      str_replace
-      str_split
+  digest
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  map_merge
+  repeat
+  resource_facade
+  str_replace
+  str_split
 
 2016-10-14 | newton
 -------------------
-    The key with value ``2016-10-14`` or ``newton`` indicates that the YAML
-    document is a HOT template and it may contain features added and/or removed
-    up until the Newton release.  This version adds the ``yaql`` function which
-    can be used for evaluation of complex expressions, the ``map_replace``
-    function that can do key/value replacements on a mapping, and the ``if``
-    function which can be used to return corresponding value based on condition
-    evaluation. The complete list of supported functions is::
+The key with value ``2016-10-14`` or ``newton`` indicates that the YAML
+document is a HOT template and it may contain features added and/or removed
+up until the Newton release. This version adds the ``yaql`` function which
+can be used for evaluation of complex expressions, the ``map_replace``
+function that can do key/value replacements on a mapping, and the ``if``
+function which can be used to return corresponding value based on condition
+evaluation. The complete list of supported functions is::
 
-      digest
-      get_attr
-      get_file
-      get_param
-      get_resource
-      list_join
-      map_merge
-      map_replace
-      repeat
-      resource_facade
-      str_replace
-      str_split
-      yaql
-      if
+  digest
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  map_merge
+  map_replace
+  repeat
+  resource_facade
+  str_replace
+  str_split
+  yaql
+  if
 
-    This version adds ``equals`` condition function which can be used
-    to compare whether two values are equal, the ``not`` condition function
-    which acts as a NOT operator, the ``and`` condition function which acts
-    as an AND operator to evaluate all the specified conditions, the ``or``
-    condition function which acts as an OR operator to evaluate all the
-    specified conditions. The complete list of supported condition
-    functions is::
+This version adds ``equals`` condition function which can be used
+to compare whether two values are equal, the ``not`` condition function
+which acts as a NOT operator, the ``and`` condition function which acts
+as an AND operator to evaluate all the specified conditions, the ``or``
+condition function which acts as an OR operator to evaluate all the
+specified conditions. The complete list of supported condition
+functions is::
 
-      equals
-      get_param
-      not
-      and
-      or
+  equals
+  get_param
+  not
+  and
+  or
+
+2017-02-24 | ocata
+-------------------
+The key with value ``2017-02-24`` or ``ocata`` indicates that the YAML
+document is a HOT template and it may contain features added and/or removed
+up until the Ocata release. This version adds the ``str_replace_strict``
+function which raises errors for missing params and the ``filter`` function
+which filters out values from lists. The complete list of supported
+functions is::
+
+  digest
+  filter
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  map_merge
+  map_replace
+  repeat
+  resource_facade
+  str_replace
+  str_replace_strict
+  str_split
+  yaql
+  if
+
+The complete list of supported condition functions is::
+
+  equals
+  get_param
+  not
+  and
+  or
+
+2017-09-01 | pike
+-----------------
+The key with value ``2017-09-01`` or ``pike`` indicates that the YAML
+document is a HOT template and it may contain features added and/or removed
+up until the Pike release. This version adds the ``make_url`` function for
+assembling URLs, the ``list_concat`` function for combining multiple
+lists, the ``list_concat_unique`` function for combining multiple
+lists without repeating items, the ``string_replace_vstrict`` function
+which raises errors for missing and empty params, and the ``contains``
+function which checks whether specific value is in a sequence. The
+complete list of supported functions is::
+
+  digest
+  filter
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  make_url
+  list_concat
+  list_concat_unique
+  contains
+  map_merge
+  map_replace
+  repeat
+  resource_facade
+  str_replace
+  str_replace_strict
+  str_replace_vstrict
+  str_split
+  yaql
+  if
+
+We support 'yaql' and 'contains' as condition functions in this version.
+The complete list of supported condition functions is::
+
+  equals
+  get_param
+  not
+  and
+  or
+  yaql
+  contains
+
+2018-03-02 | queens
+-------------------
+The key with value ``2018-03-02`` or ``queens`` indicates that the YAML
+document is a HOT template and it may contain features added and/or removed
+up until the Queens release. The complete list of supported functions is::
+
+  digest
+  filter
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  make_url
+  list_concat
+  list_concat_unique
+  contains
+  map_merge
+  map_replace
+  repeat
+  resource_facade
+  str_replace
+  str_replace_strict
+  str_replace_vstrict
+  str_split
+  yaql
+  if
+
+The complete list of supported condition functions is::
+
+  equals
+  get_param
+  not
+  and
+  or
+  yaql
+  contains
+
+2018-08-31 | rocky
+-------------------
+The key with value ``2018-08-31`` or ``rocky`` indicates that the YAML
+document is a HOT template and it may contain features added and/or removed
+up until the Rocky release. The complete list of supported functions is::
+
+  digest
+  filter
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  make_url
+  list_concat
+  list_concat_unique
+  contains
+  map_merge
+  map_replace
+  repeat
+  resource_facade
+  str_replace
+  str_replace_strict
+  str_replace_vstrict
+  str_split
+  yaql
+  if
+
+The complete list of supported condition functions is::
+
+  equals
+  get_param
+  not
+  and
+  or
+  yaql
+  contains
+
+2021-04-16 | wallaby
+--------------------
+The key with value ``2021-04-16`` or ``wallaby`` indicates that the YAML
+document is a HOT template and it may contain features added and/or removed
+up until the Wallaby release.
+
+This version adds a 2-argument variant of the ``if`` function. When the
+condition is false and no third argument is supplied, the entire enclosing item
+(which may be e.g. a list item, a key-value pair in a dict, or a property
+value) will be elided. This allows for e.g. conditional definition of
+properties while keeping the default value when the condition is false.
+
+The complete list of supported functions is::
+
+  digest
+  filter
+  get_attr
+  get_file
+  get_param
+  get_resource
+  list_join
+  make_url
+  list_concat
+  list_concat_unique
+  contains
+  map_merge
+  map_replace
+  repeat
+  resource_facade
+  str_replace
+  str_replace_strict
+  str_replace_vstrict
+  str_split
+  yaql
+  if
+
+The complete list of supported condition functions is::
+
+  equals
+  get_param
+  not
+  and
+  or
+  yaql
+  contains
 
 .. _hot_spec_parameter_groups:
 
@@ -320,6 +521,7 @@ default value defined as nested elements.
       constraints:
         <parameter constraints>
       immutable: <true | false>
+      tags: <list of parameter categories>
 
 param name
     The name of the parameter.
@@ -360,6 +562,11 @@ immutable
     Defines whether the parameter is updatable. Stack update fails, if this is
     set to ``true`` and the parameter value is changed.
     This attribute is optional and defaults to ``false``.
+
+tags
+    A list of strings to specify the category of a parameter. This value is
+    used to categorize a parameter so that users can group the parameters.
+    This attribute is optional.
 
 The table below describes all currently supported types with examples:
 
@@ -465,8 +672,10 @@ with the concrete syntax for each type.
 length
 ++++++
 The ``length`` constraint applies to parameters of type
-``string``. It defines a lower and upper limit for the length of the
-string value.
+``string``, ``comma_delimited_list`` and ``json``.
+
+It defines a lower and upper limit for the length of the string value or
+list/map collection.
 
 The syntax of the ``length`` constraint is
 
@@ -500,6 +709,24 @@ following range constraint would allow for all numeric values between 0 and
 
    range: { min: 0, max: 10 }
 
+modulo
+++++++
+The ``modulo`` constraint applies to parameters of type ``number``. The value
+is valid if it is a multiple of ``step``, starting with ``offset``.
+
+The syntax of the ``modulo`` constraint is
+
+.. code-block:: yaml
+
+   modulo: { step: <step>, offset: <offset> }
+
+Both ``step`` and ``offset`` must be specified.
+
+For example, the following modulo constraint would only allow for odd numbers
+
+.. code-block:: yaml
+
+   modulo: { step: 2, offset: 1 }
 
 allowed_values
 ++++++++++++++
@@ -561,7 +788,7 @@ For example
        description: User name to be configured for the application
        constraints:
          - allowed_pattern: "[A-Z]+[a-zA-Z0-9]*"
-          description: User name must start with an uppercase character
+           description: User name must start with an uppercase character
 
 
 custom_constraint
@@ -840,10 +1067,12 @@ expression
       not
       and
       or
+      yaql
 
     Note: In condition functions, you can reference a value from an input
-    parameter, but you cannot reference resource or its attribute.  We support
+    parameter, but you cannot reference resource or its attribute. We support
     referencing other conditions (by condition name) in condition functions.
+    We support 'yaql' as condition function in the Pike version.
 
 An example of conditions section definition
 
@@ -885,6 +1114,16 @@ An example of conditions section definition
        and:
        - cd1
        - cd2
+     cd9:
+       yaql:
+         expression: $.data.services.contains('heat')
+         data:
+           services:
+             get_param: ServiceNames
+     cd10:
+       contains:
+       - 'neutron'
+       - get_param: ServiceNames
 
 The example below shows how to associate condition with resources
 
@@ -982,7 +1221,7 @@ The following example demonstrates how to use the :code:`get_attr` function:
         value: { get_attr: [my_instance, first_address] }
       instance_private_ip:
         description: Private IP address of the deployed compute instance
-       value: { get_attr: [my_instance, networks, private, 0] }
+        value: { get_attr: [my_instance, networks, private, 0] }
 
 In this example, if the ``networks`` attribute contained the following data::
 
@@ -1079,7 +1318,7 @@ The following example demonstrates the use of the ``get_param`` function
 .. code-block:: yaml
 
     parameters:
-       instance_type:
+      instance_type:
         type: string
         label: Instance Type
         description: Instance type to be used.
@@ -1111,7 +1350,7 @@ get_resource
 The ``get_resource`` function references another resource within the
 same template. At runtime, it is resolved to reference the ID of the referenced
 resource, which is resource type specific. For example, a reference to a
-floating IP resource returns the respective IP address at runtime.  The syntax
+floating IP resource returns the respective IP address at runtime. The syntax
 of the ``get_resource`` function is
 
 .. code-block:: yaml
@@ -1299,6 +1538,44 @@ nested for-loops in most programming languages.
 From HOT version ``2016-10-14`` you may also pass a map as value for the
 ``for_each`` key, in which case the list of map keys will be used as value.
 
+From HOT version ``2017-09-01`` (or pike) you may specify a argument
+``permutations`` to decide whether to iterate nested the over all the
+permutations of the elements in the given lists. If 'permutations' is not
+specified, we set the default value to true to compatible with before behavior.
+The args have to be lists instead of dicts if 'permutations' is False because
+keys in a dict are unordered, and the list args all have to be of the
+same length.
+
+.. code-block:: yaml
+
+    parameters:
+      subnets:
+        type: comma_delimited_list
+        label: subnets
+        default: "sub1, sub2"
+      networks:
+        type: comma_delimited_list
+        label: networks
+        default: "net1, net2"
+
+    resources:
+      my_server:
+        type: OS::Nova:Server
+        properties:
+          networks:
+            repeat:
+              for_each:
+                <%sub%>: { get_param: subnets }
+                <%net%>: { get_param: networks }
+              template:
+                subnet: <%sub%>
+                network: <%net%>
+              permutations: false
+
+After resolved, we will get the networks of server like:
+[{subnet: sub1, network: net1}, {subnet: sub2, network: net2}]
+
+
 resource_facade
 ---------------
 The ``resource_facade`` function retrieves data in a parent
@@ -1395,6 +1672,23 @@ In the example above, one can imagine that MySQL is being configured on a
 compute instance and the root password is going to be set based on a user
 provided parameter. The script for doing this is provided as userdata to the
 compute instance, leveraging the ``str_replace`` function.
+
+
+str_replace_strict
+------------------
+``str_replace_strict`` behaves identically to the ``str_replace``
+function, only an error is raised if any of the params are not present
+in the template. This may help catch typo's or other issues sooner
+rather than later when processing a template.
+
+
+str_replace_vstrict
+-------------------
+``str_replace_vstrict`` behaves identically to the
+``str_replace_strict`` function, only an error is raised if any of the
+params are empty. This may help catch issues (i.e., prevent
+resources from being created with bogus values) sooner rather than later if
+it is known that all the params should be non-empty.
 
 
 str_split
@@ -1589,6 +1883,27 @@ template except for ``if`` conditions. You can use the ``if`` condition
 in the property values in the ``resources`` section and ``outputs`` sections
 of a template.
 
+Beginning with the ``wallaby`` template version, the third argument is
+optional. If only two arguments are passed, the entire enclosing item is
+removed when the condition is false.
+
+For example:
+
+.. code-block:: yaml
+
+    conditions:
+      override_name: {not: {equals: [{get_param: server_name}, ""]}}
+
+    resources:
+      test_server:
+        type: OS::Nova::Server
+        properties:
+          name: {if: [override_name, {get_param: server_name}]}
+
+In this example, the default name for the server (which is generated by Heat
+when the property value is not specified) would be used when the
+``server_name`` parameter value is an empty string.
+
 not
 ---
 The ``not`` function acts as a NOT operator.
@@ -1724,3 +2039,138 @@ Another example reference other conditions
 
 This function returns true if any one of other_condition_1 or
 other_condition_2 evaluate to true, otherwise returns false.
+
+filter
+------
+The ``filter`` function removes values from lists.
+
+The syntax of the ``filter`` function is
+
+.. code-block:: yaml
+
+    filter:
+      - <values>
+      - <list>
+
+For example
+
+.. code-block:: yaml
+
+    parameters:
+      list_param:
+        type: comma_delimited_list
+        default: [1, 2, 3]
+
+    outputs:
+      output_list:
+        value:
+          filter:
+            - [3]
+            - {get_param: list_param}
+
+output_list will be evaluated to [1, 2].
+
+make_url
+--------
+
+The ``make_url`` function builds URLs.
+
+The syntax of the ``make_url`` function is
+
+.. code-block:: yaml
+
+    make_url:
+      scheme: <protocol>
+      username: <username>
+      password: <password>
+      host: <hostname or IP>
+      port: <port>
+      path: <path>
+      query:
+        <key1>: <value1>
+        <key2>: <value2>
+      fragment: <fragment>
+
+
+All parameters are optional.
+
+For example
+
+.. code-block:: yaml
+
+    outputs:
+      server_url:
+        value:
+          make_url:
+            scheme: http
+            host: {get_attr: [server, networks, <network_name>, 0]}
+            port: 8080
+            path: /hello
+            query:
+              recipient: world
+            fragment: greeting
+
+``server_url`` will be evaluated to a URL in the form::
+
+    http://[<server IP>]:8080/hello?recipient=world#greeting
+
+list_concat
+-----------
+
+The ``list_concat`` function concatenates lists together.
+
+The syntax of the ``list_concat`` function is
+
+.. code-block:: yaml
+
+    list_concat:
+      - <list #1>
+      - <list #2>
+      - ...
+
+
+For example
+
+.. code-block:: yaml
+
+    list_concat: [['v1', 'v2'], ['v3', 'v4']]
+
+Will resolve to the list ``['v1', 'v2', 'v3', 'v4']``.
+
+Null values will be ignored.
+
+list_concat_unique
+------------------
+
+The ``list_concat_unique`` function behaves identically to the function
+``list_concat``, only removes the repeating items of lists.
+
+For example
+
+.. code-block:: yaml
+
+    list_concat_unique: [['v1', 'v2'], ['v2', 'v3']]
+
+Will resolve to the list ``['v1', 'v2', 'v3']``.
+
+contains
+--------
+
+The ``contains`` function checks whether the specific value is
+in a sequence.
+
+The syntax of the ``contains`` function is
+
+.. code-block:: yaml
+
+    contains: [<value>, <sequence>]
+
+This function returns true if value is in sequence or false if it isn't.
+
+For example
+
+.. code-block:: yaml
+
+    contains: ['v1', ['v1', 'v2', 'v3']]
+
+Will resolve to boolean true.

@@ -11,14 +11,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
-
-import mock
-from oslo_utils import timeutils
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import template_format
+from heat.engine import node_data
 from heat.engine import resource
 from heat.engine.resources.aws.autoscaling import scaling_policy as aws_sp
 from heat.engine import scheduler
@@ -32,9 +29,6 @@ as_params = inline_templates.as_params
 
 
 class TestAutoScalingPolicy(common.HeatTestCase):
-    def setUp(self):
-        super(TestAutoScalingPolicy, self).setUp()
-
     def create_scaling_policy(self, t, stack, resource_name):
         rsrc = stack[resource_name]
         self.assertIsNone(rsrc.validate())
@@ -68,7 +62,7 @@ class TestAutoScalingPolicy(common.HeatTestCase):
                                self.policy.validate)
         self.assertIn('MinAdjustmentStep property should only '
                       'be specified for AdjustmentType with '
-                      'value PercentChangeInCapacity.', six.text_type(ex))
+                      'value PercentChangeInCapacity.', str(ex))
 
     def test_scaling_policy_bad_group(self):
         t = template_format.parse(inline_templates.as_template_bad_group)
@@ -79,7 +73,7 @@ class TestAutoScalingPolicy(common.HeatTestCase):
 
         ex = self.assertRaises(exception.ResourceFailure, up_policy.signal)
         self.assertIn('Alarm WebServerScaleUpPolicy could '
-                      'not find scaling group', six.text_type(ex))
+                      'not find scaling group', str(ex))
 
     def test_scaling_policy_adjust_no_action(self):
         t = template_format.parse(as_template)
@@ -89,14 +83,7 @@ class TestAutoScalingPolicy(common.HeatTestCase):
         group = stack['WebServerGroup']
         self.patchobject(group, 'adjust',
                          side_effect=resource.NoActionRequired())
-        mock_fin_scaling = self.patchobject(up_policy, '_finished_scaling')
-        with mock.patch.object(up_policy, '_is_scaling_allowed',
-                               return_value=True) as mock_isa:
-            self.assertRaises(resource.NoActionRequired,
-                              up_policy.handle_signal)
-            mock_isa.assert_called_once_with()
-            mock_fin_scaling.assert_called_once_with('ChangeInCapacity : 1',
-                                                     size_changed=False)
+        self.assertRaises(resource.NoActionRequired, up_policy.handle_signal)
 
     def test_scaling_policy_adjust_size_changed(self):
         t = template_format.parse(as_template)
@@ -104,45 +91,45 @@ class TestAutoScalingPolicy(common.HeatTestCase):
         up_policy = self.create_scaling_policy(t, stack,
                                                'WebServerScaleUpPolicy')
         group = stack['WebServerGroup']
-        self.patchobject(group, 'adjust')
-        mock_fin_scaling = self.patchobject(up_policy, '_finished_scaling')
-        with mock.patch.object(up_policy, '_is_scaling_allowed',
-                               return_value=True) as mock_isa:
+        self.patchobject(group, 'resize')
+        self.patchobject(group, '_lb_reload')
+        mock_fin_scaling = self.patchobject(group, '_finished_scaling')
+        with mock.patch.object(group,
+                               '_check_scaling_allowed') as mock_isa:
             self.assertIsNone(up_policy.handle_signal())
-            mock_isa.assert_called_once_with()
-            mock_fin_scaling.assert_called_once_with('ChangeInCapacity : 1',
+            mock_isa.assert_called_once_with(60)
+            mock_fin_scaling.assert_called_once_with(60,
+                                                     'ChangeInCapacity : 1',
                                                      size_changed=True)
 
     def test_scaling_policy_cooldown_toosoon(self):
-        """If _is_scaling_allowed() returns False don't progress."""
         t = template_format.parse(as_template)
         stack = utils.parse_stack(t, params=as_params)
         pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
         group = stack['WebServerGroup']
         test = {'current': 'alarm'}
 
-        with mock.patch.object(group, 'adjust',
-                               side_effect=AssertionError) as dont_call:
-            with mock.patch.object(pol, '_is_scaling_allowed',
-                                   return_value=False) as mock_isa:
-                self.assertRaises(resource.NoActionRequired,
-                                  pol.handle_signal, details=test)
-                mock_isa.assert_called_once_with()
-            self.assertEqual([], dont_call.call_args_list)
+        with mock.patch.object(
+                group, '_check_scaling_allowed',
+                side_effect=resource.NoActionRequired) as mock_isa:
+            self.assertRaises(resource.NoActionRequired,
+                              pol.handle_signal, details=test)
+            mock_isa.assert_called_once_with(60)
 
     def test_scaling_policy_cooldown_ok(self):
         t = template_format.parse(as_template)
         stack = utils.parse_stack(t, params=as_params)
         pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
+        group = stack['WebServerGroup']
         test = {'current': 'alarm'}
+        self.patchobject(group, '_finished_scaling')
+        self.patchobject(group, '_lb_reload')
+        mock_resize = self.patchobject(group, 'resize')
 
-        group = self.patchobject(pol.stack, 'resource_by_refid').return_value
-        group.name = 'fluffy'
-        with mock.patch.object(pol, '_is_scaling_allowed',
-                               return_value=True) as mock_isa:
+        with mock.patch.object(group, '_check_scaling_allowed') as mock_isa:
             pol.handle_signal(details=test)
-            mock_isa.assert_called_once_with()
-        group.adjust.assert_called_once_with(1, 'ChangeInCapacity', None)
+            mock_isa.assert_called_once_with(60)
+        mock_resize.assert_called_once_with(1)
 
     @mock.patch.object(aws_sp.AWSScalingPolicy, '_get_ec2_signed_url')
     def test_scaling_policy_refid_signed_url(self, mock_get_ec2_url):
@@ -161,108 +148,16 @@ class TestAutoScalingPolicy(common.HeatTestCase):
 
     def test_refid_convergence_cache_data(self):
         t = template_format.parse(as_template)
-        cache_data = {'WebServerScaleUpPolicy': {
+        cache_data = {'WebServerScaleUpPolicy': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'reference_id': 'http://convg_signed_url'
-        }}
+        })}
         stack = utils.parse_stack(t, cache_data=cache_data)
-        rsrc = stack['WebServerScaleUpPolicy']
+        rsrc = stack.defn['WebServerScaleUpPolicy']
         self.assertEqual('http://convg_signed_url', rsrc.FnGetRefId())
-
-
-class TestCooldownMixin(common.HeatTestCase):
-    def setUp(self):
-        super(TestCooldownMixin, self).setUp()
-
-    def create_scaling_policy(self, t, stack, resource_name):
-        rsrc = stack[resource_name]
-        self.assertIsNone(rsrc.validate())
-        scheduler.TaskRunner(rsrc.create)()
-        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
-        return rsrc
-
-    def test_cooldown_is_in_progress_toosoon(self):
-        t = template_format.parse(as_template)
-        stack = utils.parse_stack(t, params=as_params)
-        pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
-
-        now = timeutils.utcnow()
-        previous_meta = {'cooldown': {
-            now.isoformat(): 'ChangeInCapacity : 1'}}
-        self.patchobject(pol, 'metadata_get', return_value=previous_meta)
-        self.assertFalse(pol._is_scaling_allowed())
-
-    def test_cooldown_is_in_progress_scaling_unfinished(self):
-        t = template_format.parse(as_template)
-        stack = utils.parse_stack(t, params=as_params)
-        pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
-
-        previous_meta = {'scaling_in_progress': True}
-        self.patchobject(pol, 'metadata_get', return_value=previous_meta)
-        self.assertFalse(pol._is_scaling_allowed())
-
-    def test_cooldown_not_in_progress(self):
-        t = template_format.parse(as_template)
-        stack = utils.parse_stack(t, params=as_params)
-        pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
-
-        awhile_ago = timeutils.utcnow() - datetime.timedelta(seconds=100)
-        previous_meta = {
-            'cooldown': {
-                awhile_ago.isoformat(): 'ChangeInCapacity : 1'
-            },
-            'scaling_in_progress': False
-        }
-        self.patchobject(pol, 'metadata_get', return_value=previous_meta)
-        self.assertTrue(pol._is_scaling_allowed())
-
-    def test_scaling_policy_cooldown_zero(self):
-        t = template_format.parse(as_template)
-
-        # Create the scaling policy (with Cooldown=0) and scale up one
-        properties = t['Resources']['WebServerScaleUpPolicy']['Properties']
-        properties['Cooldown'] = '0'
-
-        stack = utils.parse_stack(t, params=as_params)
-        pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
-
-        now = timeutils.utcnow()
-        previous_meta = {now.isoformat(): 'ChangeInCapacity : 1'}
-        self.patchobject(pol, 'metadata_get', return_value=previous_meta)
-        self.assertTrue(pol._is_scaling_allowed())
-
-    def test_scaling_policy_cooldown_none(self):
-        t = template_format.parse(as_template)
-
-        # Create the scaling policy no Cooldown property, should behave the
-        # same as when Cooldown==0
-        properties = t['Resources']['WebServerScaleUpPolicy']['Properties']
-        del properties['Cooldown']
-
-        stack = utils.parse_stack(t, params=as_params)
-        pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
-
-        now = timeutils.utcnow()
-        previous_meta = {now.isoformat(): 'ChangeInCapacity : 1'}
-        self.patchobject(pol, 'metadata_get', return_value=previous_meta)
-        self.assertTrue(pol._is_scaling_allowed())
-
-    def test_metadata_is_written(self):
-        t = template_format.parse(as_template)
-        stack = utils.parse_stack(t, params=as_params)
-        pol = self.create_scaling_policy(t, stack, 'WebServerScaleUpPolicy')
-
-        nowish = timeutils.utcnow()
-        reason = 'cool as'
-        meta_set = self.patchobject(pol, 'metadata_set')
-        self.patchobject(timeutils, 'utcnow', return_value=nowish)
-        pol._finished_scaling(reason)
-        meta_set.assert_called_once_with(
-            {'cooldown': {nowish.isoformat(): reason},
-             'scaling_in_progress': False})
 
 
 class ScalingPolicyAttrTest(common.HeatTestCase):

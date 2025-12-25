@@ -12,8 +12,8 @@
 #    under the License.
 import collections
 
+from oslo_log import log as logging
 from oslo_serialization import jsonutils
-import six
 
 from heat.common import environment_format as env_fmt
 from heat.common import exception
@@ -22,15 +22,22 @@ from heat.common.i18n import _
 ALLOWED_PARAM_MERGE_STRATEGIES = (OVERWRITE, MERGE, DEEP_MERGE) = (
     'overwrite', 'merge', 'deep_merge')
 
+LOG = logging.getLogger(__name__)
 
-def get_param_merge_strategy(merge_strategies, param_key):
+
+def get_param_merge_strategy(merge_strategies, param_key,
+                             available_strategies=None):
+    if not available_strategies:
+        available_strategies = {}
 
     if merge_strategies is None:
         return OVERWRITE
 
     env_default = merge_strategies.get('default', OVERWRITE)
+    merge_strategy = merge_strategies.get(
+        param_key, available_strategies.get(
+            param_key, env_default))
 
-    merge_strategy = merge_strategies.get(param_key, env_default)
     if merge_strategy in ALLOWED_PARAM_MERGE_STRATEGIES:
         return merge_strategy
 
@@ -55,17 +62,17 @@ def merge_map(old, new, deep_merge=False):
         return new
 
     for k, v in new.items():
-        if v:
+        if v is not None:
             if not deep_merge:
                 old[k] = v
-            elif isinstance(v, collections.Mapping):
+            elif isinstance(v, collections.abc.Mapping):
                 old_v = old.get(k)
                 old[k] = merge_map(old_v, v, deep_merge) if old_v else v
-            elif (isinstance(v, collections.Sequence) and
-                    not isinstance(v, six.string_types)):
+            elif (isinstance(v, collections.abc.Sequence) and
+                    not isinstance(v, str)):
                 old_v = old.get(k)
                 old[k] = merge_list(old_v, v) if old_v else v
-            elif isinstance(v, six.string_types):
+            elif isinstance(v, str):
                 old[k] = ''.join([old.get(k, ''), v])
             else:
                 old[k] = v
@@ -76,20 +83,20 @@ def merge_map(old, new, deep_merge=False):
 def parse_param(p_val, p_schema):
     try:
         if p_schema.type == p_schema.MAP:
-            if not isinstance(p_val, six.string_types):
+            if not isinstance(p_val, str):
                 p_val = jsonutils.dumps(p_val)
             if p_val:
                 return jsonutils.loads(p_val)
-        elif not isinstance(p_val, collections.Sequence):
+        elif not isinstance(p_val, collections.abc.Sequence):
             raise ValueError()
     except (ValueError, TypeError) as err:
-        msg = _("Invalid parameter in environment %(s).") % six.text_type(err)
+        msg = _("Invalid parameter in environment %s.") % str(err)
         raise ValueError(msg)
     return p_val
 
 
-def merge_parameters(old, new, param_schemata,
-                     merge_strategies):
+def merge_parameters(old, new, param_schemata, strategies_in_file,
+                     available_strategies, env_file):
 
     def param_merge(p_key, p_value, p_schema, deep_merge=False):
         p_type = p_schema.type
@@ -106,21 +113,36 @@ def merge_parameters(old, new, param_schemata,
             raise exception.InvalidMergeStrategyForParam(strategy=MERGE,
                                                          param=p_key)
 
+    for key, value in new.items():
+        # if key not in param_schemata ignore it
+        if key in param_schemata and value is not None:
+            param_merge_strategy = get_param_merge_strategy(
+                strategies_in_file, key, available_strategies)
+            if key not in available_strategies:
+                available_strategies[key] = param_merge_strategy
+
+            elif param_merge_strategy != available_strategies[key]:
+                raise exception.ConflictingMergeStrategyForParam(
+                    strategy=param_merge_strategy,
+                    param=key, env_file=env_file)
+
     if not old:
         return new
 
     for key, value in new.items():
         # if key not in param_schemata ignore it
-        if key in param_schemata and value:
-            param_merge_strategy = get_param_merge_strategy(merge_strategies,
-                                                            key)
+        if key in param_schemata and value is not None:
+            param_merge_strategy = available_strategies[key]
             if param_merge_strategy == DEEP_MERGE:
+                LOG.debug("Deep Merging Parameter: %s", key)
                 param_merge(key, value,
                             param_schemata[key],
                             deep_merge=True)
             elif param_merge_strategy == MERGE:
+                LOG.debug("Merging Parameter: %s", key)
                 param_merge(key, value, param_schemata[key])
             else:
+                LOG.debug("Overriding Parameter: %s", key)
                 old[key] = value
 
     return old
@@ -142,27 +164,29 @@ def merge_environments(environment_files, files,
     :param files: mapping of stack filenames to contents
     :type  files: dict
     :param params: parameters describing the stack
-    :type  dict:
+    :type  params: dict
     :param param_schemata: parameter schema dict
     :type  param_schemata: dict
     """
     if not environment_files:
         return
 
+    available_strategies = {}
+
     for filename in environment_files:
         raw_env = files[filename]
         parsed_env = env_fmt.parse(raw_env)
-        merge_strategies = parsed_env.pop(
+        strategies_in_file = parsed_env.pop(
             env_fmt.PARAMETER_MERGE_STRATEGIES, {})
 
         for section_key, section_value in parsed_env.items():
             if section_value:
                 if section_key in (env_fmt.PARAMETERS,
                                    env_fmt.PARAMETER_DEFAULTS):
-                    params[section_key] = merge_parameters(params[section_key],
-                                                           section_value,
-                                                           param_schemata,
-                                                           merge_strategies)
+                    params[section_key] = merge_parameters(
+                        params[section_key], section_value,
+                        param_schemata, strategies_in_file,
+                        available_strategies, filename)
                 else:
                     params[section_key] = merge_map(params[section_key],
                                                     section_value)

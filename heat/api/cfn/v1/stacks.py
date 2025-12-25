@@ -22,7 +22,6 @@ from heat.api.aws import exception
 from heat.api.aws import utils as api_utils
 from heat.common import exception as heat_exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.common import identifier
 from heat.common import policy
 from heat.common import template_format
@@ -50,9 +49,9 @@ class StackController(object):
         raise exception.HeatInvalidActionError()
 
     def _enforce(self, req, action):
-        """Authorize an action against the policy.json."""
+        """Authorize an action against the policy.yaml and policies in code."""
         try:
-            self.policy.enforce(req.context, action)
+            self.policy.enforce(req.context, action, is_registered_policy=True)
         except heat_exception.Forbidden:
             msg = _('Action %s not allowed for user') % action
             raise exception.HeatAccessDeniedError(msg)
@@ -245,7 +244,7 @@ class StackController(object):
             return req.params['TemplateBody']
         elif 'TemplateUrl' in req.params:
             url = req.params['TemplateUrl']
-            LOG.debug('TemplateUrl %s' % url)
+            LOG.debug('TemplateUrl %s', url)
             try:
                 return urlfetch.get(url)
             except IOError as exc:
@@ -426,7 +425,7 @@ class StackController(object):
             msg = _("The Template must be a JSON or YAML document.")
             return exception.HeatInvalidParameterValueError(detail=msg)
 
-        LOG.info(_LI('validate_template'))
+        LOG.info('validate_template')
 
         def format_validate_parameter(key, value):
             """Reformat engine output into AWS "ValidateTemplate" format."""

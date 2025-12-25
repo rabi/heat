@@ -13,8 +13,8 @@
 import hashlib
 import json
 import random
+from urllib import parse
 
-from six.moves.urllib import parse
 from swiftclient import utils as swiftclient_utils
 import yaml
 
@@ -72,10 +72,12 @@ Outputs:
 
     def setUp(self):
         super(AwsStackTest, self).setUp()
+        if not self.is_service_available('object-store'):
+            self.skipTest('object-store service not available, skipping')
         self.object_container_name = test.rand_name()
         self.project_id = self.identity_client.project_id
         self.swift_key = hashlib.sha224(
-            str(random.getrandbits(256))).hexdigest()[:32]
+            str(random.getrandbits(256)).encode('ascii')).hexdigest()[:32]
         key_header = 'x-container-meta-temp-url-key'
         self.object_client.put_container(self.object_container_name,
                                          {key_header: self.swift_key})

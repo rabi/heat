@@ -16,15 +16,14 @@ import re
 import sys
 
 from oslo_log import log
-import six
 
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.engine import constraints
-from heat.engine import resources
+from heat.engine import plugin_manager
 from heat.engine import support
 
 LOG = log.getLogger(__name__)
+
 
 class HeatCustomGuidelines(object):
 
@@ -33,20 +32,23 @@ class HeatCustomGuidelines(object):
     def __init__(self, exclude):
         self.error_count = 0
         self.resources_classes = []
-        global_env = resources.global_env()
-        for resource_type in global_env.get_types():
-            cls = global_env.get_class(resource_type)
-            module = cls.__module__
-            # Skip resources, which defined as template resource in environment
-            if module == 'heat.engine.resources.template_resource':
-                continue
-            # Skip discovered plugin resources
-            if module == 'heat.engine.plugins':
-                continue
-            path = module.replace('.', '/')
-            if any(path.startswith(excl_path) for excl_path in exclude):
-                continue
-            self.resources_classes.append(cls)
+        all_resources = _load_all_resources()
+        for resource_type in all_resources:
+            for rsrc_cls in all_resources[resource_type]:
+                module = rsrc_cls.__module__
+                # Skip hidden resources check guidelines
+                if rsrc_cls.support_status.status == support.HIDDEN:
+                    continue
+                # Skip resources, which defined as template resource in
+                # environment or cotrib resource
+                if module in ('heat.engine.resources.template_resource',
+                              'heat.engine.plugins'):
+                    continue
+                # Skip manually excluded folders
+                path = module.replace('.', '/')
+                if any(path.startswith(excl_path) for excl_path in exclude):
+                    continue
+                self.resources_classes.append(rsrc_cls)
 
     def run_check(self):
         print(_('Heat custom guidelines check started.'))
@@ -98,7 +100,7 @@ class HeatCustomGuidelines(object):
 
     def _check_resource_schemas(self, resource, schema, schema_name,
                                 error_path=None):
-        for key, value in six.iteritems(schema):
+        for key, value in schema.items():
             if error_path is None:
                 error_path = [resource.__name__, key]
             else:
@@ -126,7 +128,7 @@ class HeatCustomGuidelines(object):
             error_path.pop()
 
     def _check_resource_methods(self, resource):
-        for method in six.itervalues(resource.__dict__):
+        for method in resource.__dict__.values():
             # need to skip non-functions attributes
             if not callable(method):
                 continue
@@ -155,8 +157,8 @@ class HeatCustomGuidelines(object):
             try:
                 cls_file = open(cls.__module__.replace('.', '/') + '.py')
             except IOError as ex:
-                LOG.warning(_LW('Cannot perform trailing spaces check on '
-                                'resource module: %s') % six.text_type(ex))
+                LOG.warning('Cannot perform trailing spaces check on '
+                            'resource module: %s', str(ex))
                 continue
             lines = [line.strip() for line in cls_file.readlines()]
             idx = 0
@@ -164,21 +166,21 @@ class HeatCustomGuidelines(object):
             while idx < len(lines):
                 if ('properties_schema' in lines[idx] or
                         'attributes_schema' in lines[idx]):
-                    level = len(re.findall('(\{|\()', lines[idx]))
-                    level -= len(re.findall('(\}|\))', lines[idx]))
+                    level = len(re.findall(r'(\{|\()', lines[idx]))
+                    level -= len(re.findall(r'(\}|\))', lines[idx]))
                     idx += 1
                     while level != 0:
-                        level += len(re.findall('(\{|\()', lines[idx]))
-                        level -= len(re.findall('(\}|\))', lines[idx]))
-                        if re.search("^((\'|\") )", lines[idx]):
+                        level += len(re.findall(r'(\{|\()', lines[idx]))
+                        level -= len(re.findall(r'(\}|\))', lines[idx]))
+                        if re.search(r"^((\'|\") )", lines[idx]):
                             kwargs.update(
                                 {'details': 'line %s' % idx,
                                  'message': _('Trailing whitespace should '
                                               'be on previous line'),
                                  'snippet': lines[idx]})
                             self.print_guideline_error(**kwargs)
-                        elif (re.search("(\S(\'|\"))$", lines[idx - 1]) and
-                              re.search("^((\'|\")\S)", lines[idx])):
+                        elif (re.search(r"(\\S(\'|\"))$", lines[idx - 1]) and
+                              re.search(r"^((\'|\")\\S)", lines[idx])):
                             kwargs.update(
                                 {'details': 'line %s' % (idx - 1),
                                  'message': _('Omitted whitespace at the '
@@ -190,19 +192,19 @@ class HeatCustomGuidelines(object):
 
     def _check_description_summary(self, description, error_kwargs,
                                    error_key):
-        if re.search("^[a-z]", description):
+        if re.search(r"^[a-z]", description):
             error_kwargs.update(
                 {'message': _('%s description summary should start '
                               'with uppercase letter') % error_key.title(),
                  'snippet': description})
             self.print_guideline_error(**error_kwargs)
-        if not description.endswith('.'):
+        if not (description.endswith('.') or description.endswith('.)')):
             error_kwargs.update(
                 {'message': _('%s description summary omitted '
                               'terminator at the end') % error_key.title(),
                  'snippet': description})
             self.print_guideline_error(**error_kwargs)
-        if re.search("\s{2,}", description):
+        if re.search(r"\s{2,}", description):
             error_kwargs.update(
                 {'message': _('%s description contains double or more '
                               'whitespaces') % error_key.title(),
@@ -211,7 +213,7 @@ class HeatCustomGuidelines(object):
 
     def _check_description_details(self, doclines, error_kwargs,
                                    error_key):
-        if re.search("\S", doclines[1]):
+        if re.search(r"\S", doclines[1]):
             error_kwargs.update(
                 {'message': _('%s description summary and '
                               'main resource description should be '
@@ -237,17 +239,17 @@ class HeatCustomGuidelines(object):
 
         params = False
         for line in doclines[1:]:
-                if re.search("\s{2,}", line):
-                    error_kwargs.update(
-                        {'message': _('%s description '
-                                      'contains double or more '
-                                      'whitespaces') % error_key.title(),
-                         'snippet': line})
-                    self.print_guideline_error(**error_kwargs)
-                if re.search("^(:param|:type|:returns|:rtype|:raises)",
-                             line):
-                    params = True
-        if not params and not doclines[-2].endswith('.'):
+            if re.search(r"\s{2,}", line):
+                error_kwargs.update(
+                    {'message': _('%s description '
+                                  'contains double or more '
+                                  'whitespaces') % error_key.title(),
+                     'snippet': line})
+                self.print_guideline_error(**error_kwargs)
+            if re.search(r"^(:param|:type|:returns|:rtype|:raises)", line):
+                params = True
+        if not params and not (doclines[-2].endswith('.') or
+                               doclines[-2].endswith('.)')):
             error_kwargs.update(
                 {'message': _('%s description omitted '
                               'terminator at the end') % error_key.title(),
@@ -269,6 +271,21 @@ class HeatCustomGuidelines(object):
             }
         print(msg)
         self.error_count += 1
+
+
+def _load_all_resources():
+    manager = plugin_manager.PluginManager('heat.engine.resources')
+    resource_mapping = plugin_manager.PluginMapping('resource')
+    res_plugin_mappings = resource_mapping.load_all(manager)
+
+    all_resources = {}
+    for mapping in res_plugin_mappings:
+        name, cls = mapping
+        if all_resources.get(name) is not None:
+            all_resources[name].append(cls)
+        else:
+            all_resources[name] = [cls]
+    return all_resources
 
 
 def parse_args():

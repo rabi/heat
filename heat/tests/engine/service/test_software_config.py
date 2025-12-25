@@ -12,13 +12,13 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 import uuid
 
-import mock
+from oslo_config import cfg
 from oslo_messaging.rpc import dispatcher
 from oslo_serialization import jsonutils as json
 from oslo_utils import timeutils
-import six
 
 from heat.common import crypt
 from heat.common import exception
@@ -81,12 +81,13 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
 
     def _create_software_config(
             self, group='Heat::Shell', name='config_mysql', config=None,
-            inputs=None, outputs=None, options=None):
+            inputs=None, outputs=None, options=None, context=None):
+        cntx = context if context else self.ctx
         inputs = inputs or []
         outputs = outputs or []
         options = options or {}
         return self.engine.create_software_config(
-            self.ctx, group, name, config, inputs, outputs, options)
+            cntx, group, name, config, inputs, outputs, options)
 
     def _create_dummy_config_object(self):
         obj_config = software_config_object.SoftwareConfig()
@@ -107,13 +108,26 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
 
     def test_list_software_configs(self):
         config = self._create_software_config()
-        config_id = config['id']
         self.assertIsNotNone(config)
+        config_id = config['id']
 
         configs = self.engine.list_software_configs(self.ctx)
         self.assertIsNotNone(configs)
         config_ids = [x['id'] for x in configs]
         self.assertIn(config_id, config_ids)
+
+        admin_cntx = utils.dummy_context(is_admin=True)
+
+        admin_config = self._create_software_config(context=admin_cntx)
+        admin_config_id = admin_config['id']
+        configs = self.engine.list_software_configs(admin_cntx)
+        self.assertIsNotNone(configs)
+        config_ids = [x['id'] for x in configs]
+        project_ids = [x['project'] for x in configs]
+        self.assertEqual(2, len(project_ids))
+        self.assertEqual(2, len(config_ids))
+        self.assertIn(config_id, config_ids)
+        self.assertIn(admin_config_id, config_ids)
 
     def test_show_software_config(self):
         config_id = str(uuid.uuid4())
@@ -156,6 +170,28 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
                          config['outputs'])
         self.assertEqual(kwargs['options'], config['options'])
 
+    def test_create_config_exceeds_max_per_tenant(self):
+        cfg.CONF.set_override('max_software_configs_per_tenant', 0)
+        ex = self.assertRaises(dispatcher.ExpectedException,
+                               self._create_software_config)
+        self.assertEqual(exception.RequestLimitExceeded, ex.exc_info[0])
+        self.assertIn("You have reached the maximum software configs "
+                      "per tenant", str(ex.exc_info[1]))
+
+    def test_create_software_config_structured(self):
+        kwargs = {
+            'group': 'json-file',
+            'name': 'config_heat',
+            'config': {'foo': 'bar'},
+            'inputs': [{'name': 'mode'}],
+            'outputs': [{'name': 'endpoint'}],
+            'options': {}
+        }
+        config = self._create_software_config(**kwargs)
+        config_id = config['id']
+        config = self.engine.show_software_config(self.ctx, config_id)
+        self.assertEqual(kwargs['config'], config['config'])
+
     def test_delete_software_config(self):
         config = self._create_software_config()
         self.assertIsNotNone(config)
@@ -174,7 +210,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         try:
             stack.validate()
         except exception.StackValidationFailed as exc:
-            self.fail("Validation should have passed: %s" % six.text_type(exc))
+            self.fail("Validation should have passed: %s" % str(exc))
 
     def _create_software_deployment(self, config_id=None, input_values=None,
                                     action='INIT',
@@ -197,8 +233,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         t = template_format.parse(tools.wp_template)
         stack = utils.parse_stack(t, stack_name=stack_name)
 
-        tools.setup_mocks(self.m, stack)
-        self.m.ReplayAll()
+        fc = tools.setup_mocks_with_mock(self, stack)
         stack.store()
         stack.create()
         server = stack['WebServer']
@@ -223,18 +258,18 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
             self.ctx, server_id=server.resource_id)
         self.assertEqual([deployment], deployments)
 
-        rs = resource_objects.Resource.get_by_physical_resource_id(
+        rsrcs = resource_objects.Resource.get_all_by_physical_resource_id(
             self.ctx, server_id)
         self.assertEqual(deployment['config_id'],
-                         rs.rsrc_metadata.get('deployments')[0]['id'])
+                         rsrcs[0].rsrc_metadata.get('deployments')[0]['id'])
+        tools.validate_setup_mocks_with_mock(stack, fc)
 
     def test_metadata_software_deployments(self):
         stack_name = 'test_metadata_software_deployments'
         t = template_format.parse(tools.wp_template)
         stack = utils.parse_stack(t, stack_name=stack_name)
 
-        tools.setup_mocks(self.m, stack)
-        self.m.ReplayAll()
+        fc = tools.setup_mocks_with_mock(self, stack)
         stack.store()
         stack.create()
         server = stack['WebServer']
@@ -271,9 +306,9 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
 
         # assert that metadata via metadata_software_deployments matches
         # metadata via server resource
-        rs = resource_objects.Resource.get_by_physical_resource_id(
+        rsrcs = resource_objects.Resource.get_all_by_physical_resource_id(
             self.ctx, server_id)
-        self.assertEqual(metadata, rs.rsrc_metadata.get('deployments'))
+        self.assertEqual(metadata, rsrcs[0].rsrc_metadata.get('deployments'))
 
         deployments = self.engine.metadata_software_deployments(
             self.ctx, server_id=str(uuid.uuid4()))
@@ -300,6 +335,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         metadata = self.engine.metadata_software_deployments(
             self.ctx, server_id=server_id)
         self.assertEqual(2, len(metadata))
+        tools.validate_setup_mocks_with_mock(stack, fc)
 
     def test_show_software_deployment(self):
         deployment_id = str(uuid.uuid4())
@@ -477,6 +513,39 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         self.assertEqual(deployment_id, deployment['id'])
         self.assertEqual(kwargs['input_values'], deployment['input_values'])
 
+    def test_create_deployment_exceeds_max_per_tenant(self):
+        cfg.CONF.set_override('max_software_deployments_per_tenant', 0)
+        ex = self.assertRaises(dispatcher.ExpectedException,
+                               self._create_software_deployment)
+        self.assertEqual(exception.RequestLimitExceeded, ex.exc_info[0])
+        self.assertIn("You have reached the maximum software deployments"
+                      " per tenant", str(ex.exc_info[1]))
+
+    def test_create_software_deployment_invalid_stack_user_project_id(self):
+        sc_kwargs = {
+            'group': 'Heat::Chef',
+            'name': 'config_heat',
+            'config': '...',
+            'inputs': [{'name': 'mode'}],
+            'outputs': [{'name': 'endpoint'}],
+            'options': {}
+        }
+        config = self._create_software_config(**sc_kwargs)
+        config_id = config['id']
+        sd_kwargs = {
+            'config_id': config_id,
+            'input_values': {'mode': 'standalone'},
+            'action': 'INIT',
+            'status': 'COMPLETE',
+            'status_reason': '',
+            # stack_user_project should be no more than 64 characters
+            'stack_user_project_id': 'a' * 65
+        }
+        ex = self.assertRaises(dispatcher.ExpectedException,
+                               self._create_software_deployment,
+                               **sd_kwargs)
+        self.assertEqual(exception.Invalid, ex.exc_info[0])
+
     @mock.patch.object(service_software_config.SoftwareConfigService,
                        '_refresh_swift_software_deployment')
     def test_show_software_deployment_refresh(
@@ -572,7 +641,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
             values.update(kwargs)
             updated = self.engine.update_software_deployment(
                 self.ctx, deployment_id, updated_at=None, **values)
-            for key, value in six.iteritems(kwargs):
+            for key, value in kwargs.items():
                 self.assertEqual(value, updated[key])
 
         check_software_deployment_updated(config_id=config_id)
@@ -637,6 +706,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
 
         self.engine.software_config._push_metadata_software_deployments(
             self.ctx, '1234', None)
+
         res_upd.assert_called_once_with(
             self.ctx, '1234', {'rsrc_metadata': result_metadata}, 1)
         put.side_effect = Exception('Unexpected requests.put')
@@ -660,12 +730,15 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         deployments = {'deploy': 'this'}
         md_sd.return_value = deployments
 
+        f = self.engine.software_config._push_metadata_software_deployments
+        self.patchobject(f.retry, 'sleep')
         self.assertRaises(
             exception.ConcurrentTransaction,
-            self.engine.software_config._push_metadata_software_deployments,
+            f,
             self.ctx,
             '1234',
             None)
+
         # retry ten times then the final failure
         self.assertEqual(11, res_upd.call_count)
         put.assert_not_called()
@@ -695,14 +768,18 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
             'original': 'metadata',
             'deployments': {'deploy': 'this'}
         }
-
         self.engine.software_config._push_metadata_software_deployments(
             self.ctx, '1234', None)
-        res_upd.assert_called_once_with(
-            self.ctx, '1234', {'rsrc_metadata': result_metadata}, 1)
+        res_upd.assert_has_calls([
+            mock.call(self.ctx, '1234',
+                      {'rsrc_metadata': result_metadata}, 1),
+            mock.call(self.ctx, '1234',
+                      {}, 2),
+        ])
 
         put.assert_called_once_with(
-            'http://192.168.2.2/foo/bar', json.dumps(result_metadata))
+            'http://192.168.2.2/foo/bar', json.dumps(result_metadata),
+            timeout=60)
 
     @mock.patch.object(service_software_config.SoftwareConfigService,
                        'metadata_software_deployments')
@@ -785,7 +862,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         deployment = self._create_software_deployment(
             status='IN_PROGRESS', config_id=config['id'])
 
-        deployment_id = six.text_type(deployment['id'])
+        deployment_id = str(deployment['id'])
         sd = software_deployment_object.SoftwareDeployment.get_by_id(
             self.ctx, deployment_id)
 
@@ -823,7 +900,7 @@ class SoftwareConfigServiceTest(common.HeatTestCase):
         sc.head_object.assert_called_with(container, object_name)
         sc.get_object.assert_called_once_with(container, object_name)
         # signal_software_deployment called with signal
-        ssd.assert_called_once_with(self.ctx, deployment_id, {u"foo": u"bar"},
+        ssd.assert_called_once_with(self.ctx, deployment_id, {"foo": "bar"},
                                     then.isoformat())
 
         # second poll updated_at populated with first poll last-modified
@@ -930,11 +1007,11 @@ class SoftwareConfigIOSchemaTest(common.HeatTestCase):
         name = 'bar'
         inp = swc_io.InputConfig(name=name, description='test', type='Number',
                                  default=0, replace_on_change=True)
-        self.assertEqual('0', inp.default())
+        self.assertEqual(0, inp.default())
         self.assertIs(True, inp.replace_on_change())
         self.assertEqual(name, inp.name())
         self.assertEqual({'name': name, 'type': 'Number',
-                          'description': 'test', 'default': '0',
+                          'description': 'test', 'default': 0,
                           'replace_on_change': True},
                          inp.as_dict())
         self.assertEqual((name, None), inp.input_data())
@@ -943,11 +1020,11 @@ class SoftwareConfigIOSchemaTest(common.HeatTestCase):
         name = 'baz'
         inp = swc_io.InputConfig(name=name, type='Number',
                                  default=0, value=42)
-        self.assertEqual('0', inp.default())
+        self.assertEqual(0, inp.default())
         self.assertIs(False, inp.replace_on_change())
         self.assertEqual(name, inp.name())
         self.assertEqual({'name': name, 'type': 'Number',
-                          'default': '0', 'value': 42},
+                          'default': 0, 'value': 42},
                          inp.as_dict())
         self.assertEqual((name, 42), inp.input_data())
 
@@ -1027,3 +1104,44 @@ class SoftwareConfigIOSchemaTest(common.HeatTestCase):
     def test_check_io_schema_list_mixed(self):
         self.assertRaises(TypeError, swc_io.check_io_schema_list,
                           [{'name': 'foo'}, ('name', 'bar')])
+
+    def test_input_config_value_json_default(self):
+        name = 'baz'
+        inp = swc_io.InputConfig(name=name, type='Json',
+                                 default={'a': 1}, value=42)
+        self.assertEqual({'a': 1}, inp.default())
+
+    def test_input_config_value_default_coerce(self):
+        name = 'baz'
+        inp = swc_io.InputConfig(name=name, type='Number',
+                                 default='0')
+        self.assertEqual(0, inp.default())
+
+    def test_input_config_value_ignore_string(self):
+        name = 'baz'
+        inp = swc_io.InputConfig(name=name, type='Number',
+                                 default='')
+
+        self.assertEqual({'type': 'Number', 'name': 'baz', 'default': ''},
+                         inp.as_dict())
+
+
+class SoftwareConfigServiceTestWithConstraint(SoftwareConfigServiceTest):
+    """Test cases which require FK constraints"""
+
+    def setUp(self):
+        super(SoftwareConfigServiceTestWithConstraint, self).setUp()
+        self.useFixture(utils.ForeignKeyConstraintFixture())
+
+    def test_create_software_deployment_invalid_config_id(self):
+        kwargs = {
+            'config_id': 'this_is_invalid',
+            'input_values': {'mode': 'standalone'},
+            'action': 'INIT',
+            'status': 'COMPLETE',
+            'status_reason': ''
+        }
+        ex = self.assertRaises(dispatcher.ExpectedException,
+                               self._create_software_deployment,
+                               **kwargs)
+        self.assertEqual(exception.Invalid, ex.exc_info[0])

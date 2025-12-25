@@ -19,14 +19,14 @@ existing package tree, use create_subpackage() to dynamically create a package
 for them before loading them.
 """
 
+import functools
+import importlib.util
 import pkgutil
 import sys
 import types
 
 from oslo_log import log as logging
-import six
 
-from heat.common.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def create_subpackage(path, parent_package_name, subpackage_name="plugins"):
     package_name = _module_name(parent_package_name, subpackage_name)
 
     package = types.ModuleType(package_name)
-    package.__path__ = ([path] if isinstance(path, six.string_types)
+    package.__path__ = ([path] if isinstance(path, str)
                         else list(path))
     sys.modules[package_name] = package
 
@@ -67,16 +67,17 @@ def _import_module(importer, module_name, package):
     if module_name in sys.modules:
         return sys.modules[module_name]
 
-    loader = importer.find_module(module_name)
-    if loader is None:
+    module_spec = importer.find_spec(module_name)
+    if module_spec is None:
         return None
 
-    module = loader.load_module(module_name)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
 
     # Make this accessible through the parent package for static imports
     local_name = module_name.partition(package.__name__ + '.')[2]
     module_components = local_name.split('.')
-    parent = six.moves.reduce(getattr, module_components[:-1], package)
+    parent = functools.reduce(getattr, module_components[:-1], package)
     setattr(parent, module_components[-1], module)
 
     return module
@@ -97,7 +98,7 @@ def load_modules(package, ignore_error=False):
         try:
             module = _import_module(importer, module_name, package)
         except ImportError:
-            LOG.error(_LE('Failed to import module %s'), module_name)
+            LOG.error('Failed to import module %s', module_name)
             if not ignore_error:
                 raise
         else:

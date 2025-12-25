@@ -20,14 +20,14 @@ PARAM_KEYS = (
     PARAM_CLEAR_PARAMETERS, PARAM_GLOBAL_TENANT, PARAM_LIMIT,
     PARAM_NESTED_DEPTH, PARAM_TAGS, PARAM_SHOW_HIDDEN, PARAM_TAGS_ANY,
     PARAM_NOT_TAGS, PARAM_NOT_TAGS_ANY, TEMPLATE_TYPE, PARAM_WITH_DETAIL,
-    RESOLVE_OUTPUTS, PARAM_IGNORE_ERRORS
+    RESOLVE_OUTPUTS, PARAM_IGNORE_ERRORS, PARAM_CONVERGE
 ) = (
     'timeout_mins', 'disable_rollback', 'adopt_stack_data',
     'show_deleted', 'show_nested', 'existing',
     'clear_parameters', 'global_tenant', 'limit',
     'nested_depth', 'tags', 'show_hidden', 'tags_any',
     'not_tags', 'not_tags_any', 'template_type', 'with_detail',
-    'resolve_outputs', 'ignore_errors'
+    'resolve_outputs', 'ignore_errors', 'converge'
 )
 
 STACK_KEYS = (
@@ -127,78 +127,19 @@ NOTIFY_KEYS = (
     STACK_TAGS,
 )
 
-# This is the representation of a watch we expose to the API via RPC
-WATCH_KEYS = (
-    WATCH_ACTIONS_ENABLED, WATCH_ALARM_ACTIONS, WATCH_TOPIC,
-    WATCH_UPDATED_TIME, WATCH_DESCRIPTION, WATCH_NAME,
-    WATCH_COMPARISON, WATCH_DIMENSIONS, WATCH_PERIODS,
-    WATCH_INSUFFICIENT_ACTIONS, WATCH_METRIC_NAME, WATCH_NAMESPACE,
-    WATCH_OK_ACTIONS, WATCH_PERIOD, WATCH_STATE_REASON,
-    WATCH_STATE_REASON_DATA, WATCH_STATE_UPDATED_TIME, WATCH_STATE_VALUE,
-    WATCH_STATISTIC, WATCH_THRESHOLD, WATCH_UNIT, WATCH_STACK_ID,
-) = (
-    'actions_enabled', 'actions', 'topic',
-    'updated_time', 'description', 'name',
-    'comparison', 'dimensions', 'periods',
-    'insufficient_actions', 'metric_name', 'namespace',
-    'ok_actions', 'period', 'state_reason',
-    'state_reason_data', 'state_updated_time', 'state_value',
-    'statistic', 'threshold', 'unit', 'stack_id',
-)
-
-# Alternate representation of a watch rule to align with DB format
-# FIXME : These align with AWS naming for compatibility with the
-# current cfn-push-stats & metadata server, fix when we've ported
-# cfn-push-stats to use the Cloudwatch server and/or moved metric
-# collection into ceilometer, these should just be WATCH_KEYS
-# or each field should be stored separately in the DB watch_data
-# table if we stick to storing watch data in the heat DB
-WATCH_RULE_KEYS = (
-    RULE_ACTIONS_ENABLED, RULE_ALARM_ACTIONS, RULE_TOPIC,
-    RULE_UPDATED_TIME, RULE_DESCRIPTION, RULE_NAME,
-    RULE_COMPARISON, RULE_DIMENSIONS, RULE_PERIODS,
-    RULE_INSUFFICIENT_ACTIONS, RULE_METRIC_NAME, RULE_NAMESPACE,
-    RULE_OK_ACTIONS, RULE_PERIOD, RULE_STATE_REASON,
-    RULE_STATE_REASON_DATA, RULE_STATE_UPDATED_TIME, RULE_STATE_VALUE,
-    RULE_STATISTIC, RULE_THRESHOLD, RULE_UNIT, RULE_STACK_NAME,
-) = (
-    'ActionsEnabled', 'AlarmActions', 'AlarmArn',
-    'AlarmConfigurationUpdatedTimestamp', 'AlarmDescription', 'AlarmName',
-    'ComparisonOperator', 'Dimensions', 'EvaluationPeriods',
-    'InsufficientDataActions', 'MetricName', 'Namespace',
-    'OKActions', 'Period', 'StateReason',
-    'StateReasonData', 'StateUpdatedTimestamp', 'StateValue',
-    'Statistic', 'Threshold', 'Unit', 'StackName',
-)
-
-WATCH_STATES = (
-    WATCH_STATE_OK, WATCH_STATE_ALARM, WATCH_STATE_NODATA,
-    WATCH_STATE_SUSPENDED, WATCH_STATE_CEILOMETER_CONTROLLED
-) = (
-    'NORMAL', 'ALARM', 'NODATA',
-    'SUSPENDED', 'CEILOMETER_CONTROLLED'
-)
-
-WATCH_DATA_KEYS = (
-    WATCH_DATA_ALARM, WATCH_DATA_METRIC, WATCH_DATA_TIME,
-    WATCH_DATA_NAMESPACE, WATCH_DATA
-) = (
-    'watch_name', 'metric_name', 'timestamp',
-    'namespace', 'data'
-)
-
 VALIDATE_PARAM_KEYS = (
     PARAM_TYPE, PARAM_DEFAULT, PARAM_NO_ECHO,
     PARAM_ALLOWED_VALUES, PARAM_ALLOWED_PATTERN, PARAM_MAX_LENGTH,
     PARAM_MIN_LENGTH, PARAM_MAX_VALUE, PARAM_MIN_VALUE,
+    PARAM_STEP, PARAM_OFFSET,
     PARAM_DESCRIPTION, PARAM_CONSTRAINT_DESCRIPTION, PARAM_LABEL,
-    PARAM_CUSTOM_CONSTRAINT, PARAM_VALUE
+    PARAM_CUSTOM_CONSTRAINT, PARAM_VALUE, PARAM_TAG
 ) = (
     'Type', 'Default', 'NoEcho',
     'AllowedValues', 'AllowedPattern', 'MaxLength',
-    'MinLength', 'MaxValue', 'MinValue',
+    'MinLength', 'MaxValue', 'MinValue', 'Step', 'Offset',
     'Description', 'ConstraintDescription', 'Label',
-    'CustomConstraint', 'Value'
+    'CustomConstraint', 'Value', 'Tags'
 )
 
 VALIDATE_PARAM_TYPES = (
@@ -217,7 +158,8 @@ SOFTWARE_CONFIG_KEYS = (
     SOFTWARE_CONFIG_INPUTS,
     SOFTWARE_CONFIG_OUTPUTS,
     SOFTWARE_CONFIG_OPTIONS,
-    SOFTWARE_CONFIG_CREATION_TIME
+    SOFTWARE_CONFIG_CREATION_TIME,
+    SOFTWARE_CONFIG_PROJECT
 ) = (
     'id',
     'name',
@@ -226,7 +168,8 @@ SOFTWARE_CONFIG_KEYS = (
     'inputs',
     'outputs',
     'options',
-    'creation_time'
+    'creation_time',
+    'project'
 )
 
 SOFTWARE_DEPLOYMENT_KEYS = (

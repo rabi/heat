@@ -15,13 +15,12 @@ from oslo_log import log as logging
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
-from heat.common.i18n import _LW
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
 from heat.engine import resource
 from heat.engine import support
+from heat.engine import translation
 
 LOG = logging.getLogger(__name__)
 
@@ -38,6 +37,12 @@ class TroveCluster(resource.Resource):
         ERROR, FAILED, ACTIVE,
     ) = (
         'ERROR', 'FAILED', 'ACTIVE',
+    )
+
+    DELETE_STATUSES = (
+        DELETING, NONE
+    ) = (
+        'DELETING', 'NONE'
     )
 
     TROVE_STATUS_REASON = {
@@ -58,9 +63,15 @@ class TroveCluster(resource.Resource):
     )
 
     _INSTANCE_KEYS = (
-        FLAVOR, VOLUME_SIZE,
+        FLAVOR, VOLUME_SIZE, NETWORKS, AVAILABILITY_ZONE,
     ) = (
-        'flavor', 'volume_size',
+        'flavor', 'volume_size', 'networks', 'availability_zone',
+    )
+
+    _NICS_KEYS = (
+        NET, PORT, V4_FIXED_IP
+    ) = (
+        'network', 'port', 'fixed_ip'
     )
 
     ATTRIBUTES = (
@@ -117,10 +128,55 @@ class TroveCluster(resource.Resource):
                         constraints=[
                             constraints.Range(1, 150),
                         ]
-                    )
+                    ),
+                    NETWORKS: properties.Schema(
+                        properties.Schema.LIST,
+                        _("List of network interfaces to create on instance."),
+                        support_status=support.SupportStatus(version='10.0.0'),
+                        default=[],
+                        schema=properties.Schema(
+                            properties.Schema.MAP,
+                            schema={
+                                NET: properties.Schema(
+                                    properties.Schema.STRING,
+                                    _('Name or UUID of the network to attach '
+                                      'this NIC to. Either %(port)s or '
+                                      '%(net)s must be specified.') % {
+                                        'port': PORT, 'net': NET},
+                                    constraints=[
+                                        constraints.CustomConstraint(
+                                            'neutron.network')
+                                    ]
+                                ),
+                                PORT: properties.Schema(
+                                    properties.Schema.STRING,
+                                    _('Name or UUID of Neutron port to '
+                                      'attach this NIC to. Either %(port)s '
+                                      'or %(net)s must be specified.')
+                                    % {'port': PORT, 'net': NET},
+                                    constraints=[
+                                        constraints.CustomConstraint(
+                                            'neutron.port')
+                                    ],
+                                ),
+                                V4_FIXED_IP: properties.Schema(
+                                    properties.Schema.STRING,
+                                    _('Fixed IPv4 address for this NIC.'),
+                                    constraints=[
+                                        constraints.CustomConstraint('ip_addr')
+                                    ]
+                                ),
+                            },
+                        ),
+                    ),
+                    AVAILABILITY_ZONE: properties.Schema(
+                        properties.Schema.STRING,
+                        _('Name of the availability zone for DB instance.'),
+                        support_status=support.SupportStatus(version='14.0.0'),
+                    ),
                 }
             )
-        )
+        ),
     }
 
     attributes_schema = {
@@ -138,6 +194,30 @@ class TroveCluster(resource.Resource):
 
     entity = 'clusters'
 
+    def translation_rules(self, properties):
+        return [
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                translation_path=[self.INSTANCES, self.NETWORKS, self.NET],
+                client_plugin=self.client_plugin('neutron'),
+                finder='find_resourceid_by_name_or_id',
+                entity='network'),
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                translation_path=[self.INSTANCES, self.NETWORKS, self.PORT],
+                client_plugin=self.client_plugin('neutron'),
+                finder='find_resourceid_by_name_or_id',
+                entity='port'),
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                translation_path=[self.INSTANCES, self.FLAVOR],
+                client_plugin=self.client_plugin(),
+                finder='find_flavor_by_name_or_id'),
+        ]
+
     def _cluster_name(self):
         return self.properties[self.NAME] or self.physical_resource_name()
 
@@ -148,11 +228,17 @@ class TroveCluster(resource.Resource):
         # convert instances to format required by troveclient
         instances = []
         for instance in self.properties[self.INSTANCES]:
-            instances.append({
-                'flavorRef': self.client_plugin().find_flavor_by_name_or_id(
-                    instance[self.FLAVOR]),
-                'volume': {'size': instance[self.VOLUME_SIZE]}
-            })
+            instance_dict = {
+                'flavorRef': instance[self.FLAVOR],
+                'volume': {'size': instance[self.VOLUME_SIZE]},
+            }
+            instance_nics = self.get_instance_nics(instance)
+            if instance_nics:
+                instance_dict["nics"] = instance_nics
+            instance_availability_zone = instance[self.AVAILABILITY_ZONE]
+            if instance_availability_zone:
+                instance_dict["availability_zone"] = instance_availability_zone
+            instances.append(instance_dict)
 
         args = {
             'name': self._cluster_name(),
@@ -164,15 +250,30 @@ class TroveCluster(resource.Resource):
         self.resource_id_set(cluster.id)
         return cluster.id
 
+    def get_instance_nics(self, instance):
+        nics = []
+        for nic in instance[self.NETWORKS]:
+            nic_dict = {}
+            if nic.get(self.NET):
+                nic_dict['net-id'] = nic.get(self.NET)
+            if nic.get(self.PORT):
+                nic_dict['port-id'] = nic.get(self.PORT)
+            ip = nic.get(self.V4_FIXED_IP)
+            if ip:
+                nic_dict['v4-fixed-ip'] = ip
+            nics.append(nic_dict)
+
+        return nics
+
     def _refresh_cluster(self, cluster_id):
         try:
             cluster = self.client().clusters.get(cluster_id)
             return cluster
         except Exception as exc:
             if self.client_plugin().is_over_limit(exc):
-                LOG.warning(_LW("Stack %(name)s (%(id)s) received an "
-                                "OverLimit response during clusters.get():"
-                                " %(exception)s"),
+                LOG.warning("Stack %(name)s (%(id)s) received an "
+                            "OverLimit response during clusters.get():"
+                            " %(exception)s",
                             {'name': self.stack.name,
                              'id': self.stack.id,
                              'exception': exc})
@@ -196,7 +297,21 @@ class TroveCluster(resource.Resource):
             if instance['status'] != self.ACTIVE:
                 return False
 
-        LOG.info(_LI("Cluster '%s' has been created"), cluster.name)
+        LOG.info("Cluster '%s' has been created", cluster.name)
+        return True
+
+    def cluster_delete(self, cluster_id):
+        try:
+            cluster = self.client().clusters.get(cluster_id)
+            cluster_status = cluster.task['name']
+            if cluster_status not in self.DELETE_STATUSES:
+                return False
+            if cluster_status != self.DELETING:
+                # If cluster already started to delete, don't send another one
+                # request for deleting.
+                cluster.delete()
+        except Exception as ex:
+            self.client_plugin().ignore_not_found(ex)
         return True
 
     def handle_delete(self):
@@ -208,12 +323,14 @@ class TroveCluster(resource.Resource):
         except Exception as ex:
             self.client_plugin().ignore_not_found(ex)
         else:
-            cluster.delete()
             return cluster.id
 
     def check_delete_complete(self, cluster_id):
         if not cluster_id:
             return True
+
+        if not self.cluster_delete(cluster_id):
+            return False
 
         try:
             # For some time trove cluster may continue to live
@@ -236,7 +353,22 @@ class TroveCluster(resource.Resource):
             datastore_type, datastore_version,
             self.DATASTORE_TYPE, self.DATASTORE_VERSION)
 
+        for instance in self.properties[self.INSTANCES]:
+            for nic in instance[self.NETWORKS]:
+                if (nic.get(self.NET) is None and
+                        nic.get(self.PORT) is None):
+                    msg = (_("Either %(net)s or %(port)s must be provided.")
+                           % {'net': self.NET, 'port': self.PORT})
+                    raise exception.StackValidationFailed(message=msg)
+
+                if (nic.get(self.NET) is not None and
+                        nic.get(self.PORT) is not None):
+                    raise exception.ResourcePropertyConflict(
+                        self.NET, self.PORT)
+
     def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
         if name == self.INSTANCES_ATTR:
             instances = []
             cluster = self.client().clusters.get(self.resource_id)

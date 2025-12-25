@@ -14,11 +14,9 @@ import os
 
 from oslo_config import cfg
 from oslo_log import log as logging
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.common import template_format
 from heat.engine import attributes
 from heat.engine import constraints
@@ -251,8 +249,8 @@ lb_template_default = r'''
 # Allow user to provide alternative nested stack template to the above
 loadbalancer_opts = [
     cfg.StrOpt('loadbalancer_template',
-               help='Custom template for the built-in '
-                    'loadbalancer nested stack.')]
+               help=_('Custom template for the built-in '
+                      'loadbalancer nested stack.'))]
 cfg.CONF.register_opts(loadbalancer_opts)
 
 
@@ -505,7 +503,7 @@ backend servers
         nova_cp = self.client_plugin('nova')
         for i in instances or []:
             ip = nova_cp.server_to_ipaddress(i) or '0.0.0.0'
-            LOG.debug('haproxy server:%s' % ip)
+            LOG.debug('haproxy server:%s', ip)
             servers.append('%sserver server%d %s:%s%s' % (spaces, n,
                                                           ip, inst_port,
                                                           check))
@@ -526,7 +524,7 @@ backend servers
     def get_parsed_template(self):
         if cfg.CONF.loadbalancer_template:
             with open(cfg.CONF.loadbalancer_template) as templ_fd:
-                LOG.info(_LI('Using custom loadbalancer template %s'),
+                LOG.info('Using custom loadbalancer template %s',
                          cfg.CONF.loadbalancer_template)
                 contents = templ_fd.read()
         else:
@@ -624,12 +622,16 @@ backend servers
                         'Interval must be larger than Timeout'}
 
     def get_reference_id(self):
-        return six.text_type(self.name)
+        return str(self.name)
 
     def _resolve_attribute(self, name):
         """We don't really support any of these yet."""
         if name == self.DNS_NAME:
-            return self.get_output('PublicIp')
+            try:
+                return self.get_output('PublicIp')
+            except exception.NotFound:
+                raise exception.InvalidTemplateAttribute(resource=self.name,
+                                                         key=name)
         elif name in self.attributes_schema:
             # Not sure if we should return anything for the other attribs
             # since they aren't really supported in any meaningful way

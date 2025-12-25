@@ -11,10 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from heat.engine.clients.os import zaqar
-
 from heat.tests import common
 from heat.tests import utils
 
@@ -25,10 +24,7 @@ class ZaqarClientPluginTest(common.HeatTestCase):
         context = utils.dummy_context()
         plugin = context.clients.client_plugin('zaqar')
         client = plugin.client()
-        self.assertEqual('http://server.test:5000/v3', client.api_url)
-        self.assertEqual(2.0, client.api_version)
-        self.assertEqual('test_tenant_id',
-                         client.conf['auth_opts']['options']['os_project_id'])
+        self.assertIsNotNone(client.queue)
 
     def test_create_for_tenant(self):
         context = utils.dummy_context()

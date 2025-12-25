@@ -11,8 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-from six.moves.urllib import parse as urlparse
+from unittest import mock
+from urllib import parse as urlparse
 
 from heat.api.openstack.v1.views import views_common
 from heat.tests import common

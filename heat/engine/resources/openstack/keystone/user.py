@@ -12,11 +12,13 @@
 #    under the License.
 
 from heat.common.i18n import _
+from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
 from heat.engine import resource
 from heat.engine.resources.openstack.keystone import role_assignments
 from heat.engine import support
+from heat.engine import translation
 
 
 class KeystoneUser(resource.Resource,
@@ -52,7 +54,7 @@ class KeystoneUser(resource.Resource,
         ),
         DOMAIN: properties.Schema(
             properties.Schema.STRING,
-            _('Name of keystone domain.'),
+            _('Name or ID of keystone domain.'),
             default='default',
             update_allowed=True,
             constraints=[constraints.CustomConstraint('keystone.domain')]
@@ -81,7 +83,7 @@ class KeystoneUser(resource.Resource,
         ),
         DEFAULT_PROJECT: properties.Schema(
             properties.Schema.STRING,
-            _('Default project of keystone user.'),
+            _('Name or ID of default project of keystone user.'),
             update_allowed=True,
             constraints=[constraints.CustomConstraint('keystone.project')]
         ),
@@ -99,6 +101,66 @@ class KeystoneUser(resource.Resource,
 
     properties_schema.update(
         role_assignments.KeystoneRoleAssignmentMixin.mixin_properties_schema)
+
+    ATTRIBUTES = (
+        NAME_ATTR, DEFAULT_PROJECT_ATTR, DOMAIN_ATTR, ENABLED_ATTR,
+        PASSWORD_EXPIRES_AT_ATTR
+    ) = (
+        'name', 'default_project_id', 'domain_id', 'enabled',
+        'password_expires_at'
+    )
+    attributes_schema = {
+        NAME_ATTR: attributes.Schema(
+            _('User name.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            type=attributes.Schema.STRING
+        ),
+        DEFAULT_PROJECT_ATTR: attributes.Schema(
+            _('Default project id for user.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            type=attributes.Schema.STRING
+        ),
+        DOMAIN_ATTR: attributes.Schema(
+            _('Domain id for user.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            type=attributes.Schema.STRING
+        ),
+        ENABLED_ATTR: attributes.Schema(
+            _('Flag of enable user.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            type=attributes.Schema.BOOLEAN
+        ),
+        PASSWORD_EXPIRES_AT_ATTR: attributes.Schema(
+            _('Show user password expiration time.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            type=attributes.Schema.STRING
+        ),
+    }
+
+    def translation_rules(self, properties):
+        return [
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                [self.DOMAIN],
+                client_plugin=self.client_plugin(),
+                finder='get_domain_id'
+            ),
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                [self.DEFAULT_PROJECT],
+                client_plugin=self.client_plugin(),
+                finder='get_project_id'
+            ),
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                [self.GROUPS],
+                client_plugin=self.client_plugin(),
+                finder='get_group_id'
+            ),
+        ]
 
     def validate(self):
         super(KeystoneUser, self).validate()
@@ -138,54 +200,45 @@ class KeystoneUser(resource.Resource,
             return
 
         values['user'] = user_id
-        domain = (self.client_plugin().get_domain_id(domain))
-
         values['domain'] = domain
 
         return self.client().users.update(**values)
 
     def _add_user_to_groups(self, user_id, groups):
         if groups is not None:
-            group_ids = [self.client_plugin().get_group_id(group)
-                         for group in groups]
-
-            for group_id in group_ids:
+            for group_id in groups:
                 self.client().users.add_to_group(user_id,
                                                  group_id)
 
     def _remove_user_from_groups(self, user_id, groups):
         if groups is not None:
-            group_ids = [self.client_plugin().get_group_id(group)
-                         for group in groups]
-
-            for group_id in group_ids:
+            for group_id in groups:
                 self.client().users.remove_from_group(user_id,
                                                       group_id)
 
     def _find_diff(self, updated_prps, stored_prps):
-        new_group_ids = [self.client_plugin().get_group_id(group)
-                         for group in
-                         (set(updated_prps or []) -
-                          set(stored_prps or []))]
+        new_group_ids = list(set(updated_prps or []) - set(stored_prps or []))
 
-        removed_group_ids = [self.client_plugin().get_group_id(group)
-                             for group in
-                             (set(stored_prps or []) -
-                              set(updated_prps or []))]
+        removed_group_ids = list(set(stored_prps or []) -
+                                 set(updated_prps or []))
 
         return new_group_ids, removed_group_ids
+
+    def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
+        user = self.client().users.get(self.resource_id)
+        return getattr(user, name, None)
 
     def handle_create(self):
         user_name = (self.properties[self.NAME] or
                      self.physical_resource_name())
         description = self.properties[self.DESCRIPTION]
-        domain = self.client_plugin().get_domain_id(
-            self.properties[self.DOMAIN])
+        domain = self.properties[self.DOMAIN]
         enabled = self.properties[self.ENABLED]
         email = self.properties[self.EMAIL]
         password = self.properties[self.PASSWORD]
-        default_project = self.client_plugin().get_project_id(
-            self.properties[self.DEFAULT_PROJECT])
+        default_project = self.properties[self.DEFAULT_PROJECT]
         groups = self.properties[self.GROUPS]
 
         user = self.client().users.create(
@@ -244,15 +297,26 @@ class KeystoneUser(resource.Resource,
             self.update_assignment(prop_diff=prop_diff,
                                    user_id=self.resource_id)
 
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        user_reality = {
+            self.ROLES: self.parse_list_assignments(user_id=self.resource_id),
+            self.DEFAULT_PROJECT: resource_data.get('default_project_id'),
+            self.DOMAIN: resource_data.get('domain_id'),
+            self.GROUPS: [group.id for group in self.client().groups.list(
+                user=self.resource_id)]
+        }
+        props_keys = [self.NAME, self.DESCRIPTION, self.ENABLED, self.EMAIL]
+        for key in props_keys:
+            user_reality.update({key: resource_data.get(key)})
+        return user_reality
+
     def handle_delete(self):
         if self.resource_id is not None:
             with self.client_plugin().ignore_not_found:
                 if self.properties[self.GROUPS] is not None:
                     self._remove_user_from_groups(
                         self.resource_id,
-                        [self.client_plugin().get_group_id(group)
-                         for group in
-                         self.properties[self.GROUPS]])
+                        self.properties[self.GROUPS])
 
                 self.client().users.delete(self.resource_id)
 

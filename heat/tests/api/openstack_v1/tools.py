@@ -11,10 +11,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 from oslo_config import cfg
 from oslo_log import log
 from oslo_messaging._drivers import common as rpc_common
-import six
 import webob.exc
 
 from heat.common import wsgi
@@ -93,7 +94,7 @@ class ControllerTest(object):
         req = wsgi.Request(environ)
         req.context = utils.dummy_context('api_test_user', self.tenant)
         self.context = req.context
-        req.body = six.b(data)
+        req.body = data.encode('latin-1')
         return req
 
     def _post(self, path, data, content_type='application/json'):
@@ -117,7 +118,10 @@ class ControllerTest(object):
             self.mock_enforce.assert_called_with(
                 action=self.action,
                 context=self.context,
-                scope=self.controller.REQUEST_SCOPE)
+                scope=self.controller.REQUEST_SCOPE,
+                target={'project_id': self.tenant},
+                is_registered_policy=mock.ANY
+            )
             self.assertEqual(self.expected_request_count,
                              len(self.mock_enforce.call_args_list))
         super(ControllerTest, self).tearDown()

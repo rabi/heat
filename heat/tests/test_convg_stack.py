@@ -11,12 +11,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+import datetime
+from unittest import mock
+
 from oslo_config import cfg
 
 from heat.common import template_format
 from heat.engine import environment
-from heat.engine import resource as res
 from heat.engine import stack as parser
 from heat.engine import template as templatem
 from heat.objects import raw_template as raw_template_object
@@ -34,7 +35,7 @@ from heat.tests import utils
 class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
     def setUp(self):
         super(StackConvergenceCreateUpdateDeleteTest, self).setUp()
-        cfg.CONF.set_override('convergence_engine', True, enforce_type=True)
+        cfg.CONF.set_override('convergence_engine', True)
         self.stack = None
 
     @mock.patch.object(parser.Stack, 'mark_complete')
@@ -43,6 +44,7 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         stack = parser.Stack(utils.dummy_context(), 'empty_tmpl_stack',
                              empty_tmpl, convergence=True)
         stack.store()
+        stack.thread_group_mgr = tools.DummyThreadGroupManager()
         stack.converge_stack(template=stack.t, action=stack.CREATE)
         self.assertFalse(mock_cr.called)
         mock_mc.assert_called_once_with()
@@ -54,8 +56,8 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
 
         stack.converge_stack(template=stack.t, action=stack.CREATE)
         self.assertIsNone(stack.ext_rsrcs_db)
-        self.assertEqual('Dependencies([((1, True), None)])',
-                         repr(stack.convergence_dependencies))
+        self.assertEqual([((1, True), None)],
+                         list(stack.convergence_dependencies._graph.edges()))
 
         stack_db = stack_object.Stack.get_by_id(stack.context, stack.id)
         self.assertIsNotNone(stack_db.current_traversal)
@@ -65,14 +67,14 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
 
         self.assertTrue(stack_db.convergence)
         self.assertEqual({'edges': [[[1, True], None]]}, stack_db.current_deps)
-        leaves = stack.convergence_dependencies.leaves()
+        leaves = set(stack.convergence_dependencies.leaves())
         expected_calls = []
-        for rsrc_id, is_update in leaves:
+        for rsrc_id, is_update in sorted(leaves, key=lambda n: n.is_update):
             expected_calls.append(
                 mock.call.worker_client.WorkerClient.check_resource(
                     stack.context, rsrc_id, stack.current_traversal,
                     {'input_data': {}},
-                    is_update, None))
+                    is_update, None, False))
         self.assertEqual(expected_calls, mock_cr.mock_calls)
 
     def test_conv_string_five_instance_stack_create(self, mock_cr):
@@ -82,12 +84,11 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         stack.store()
         stack.converge_stack(template=stack.t, action=stack.CREATE)
         self.assertIsNone(stack.ext_rsrcs_db)
-        self.assertEqual('Dependencies(['
-                         '((1, True), (3, True)), '
-                         '((2, True), (3, True)), '
-                         '((3, True), (4, True)), '
-                         '((3, True), (5, True))])',
-                         repr(stack.convergence_dependencies))
+        self.assertEqual([((1, True), (3, True)),
+                          ((2, True), (3, True)),
+                          ((3, True), (4, True)),
+                          ((3, True), (5, True))],
+                         sorted(stack.convergence_dependencies._graph.edges()))
 
         stack_db = stack_object.Stack.get_by_id(stack.context, stack.id)
         self.assertIsNotNone(stack_db.current_traversal)
@@ -100,20 +101,6 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
                                  [[2, True], [3, True]]]),  # D, C
                          sorted(stack_db.current_deps['edges']))
 
-        # check if needed_by is stored properly
-        expected_needed_by = {'A': [3], 'B': [3],
-                              'C': [1, 2],
-                              'D': [], 'E': []}
-        rsrcs_db = resource_objects.Resource.get_all_by_stack(
-            stack_db._context, stack_db.id
-        )
-        self.assertEqual(5, len(rsrcs_db))
-        for rsrc_name, rsrc_obj in rsrcs_db.items():
-            self.assertEqual(sorted(expected_needed_by[rsrc_name]),
-                             sorted(rsrc_obj.needed_by))
-            self.assertEqual(stack_db.raw_template_id,
-                             rsrc_obj.current_template_id)
-
         # check if sync_points were stored
         for entity_id in [5, 4, 3, 2, 1, stack_db.id]:
             sync_point = sync_point_object.SyncPoint.get_by_key(
@@ -122,14 +109,14 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
             self.assertIsNotNone(sync_point)
             self.assertEqual(stack_db.id, sync_point.stack_id)
 
-        leaves = stack.convergence_dependencies.leaves()
+        leaves = set(stack.convergence_dependencies.leaves())
         expected_calls = []
-        for rsrc_id, is_update in leaves:
+        for rsrc_id, is_update in sorted(leaves, key=lambda n: n.is_update):
             expected_calls.append(
                 mock.call.worker_client.WorkerClient.check_resource(
                     stack.context, rsrc_id, stack.current_traversal,
                     {'input_data': {}},
-                    is_update, None))
+                    is_update, None, False))
         self.assertEqual(expected_calls, mock_cr.mock_calls)
 
     def _mock_convg_db_update_requires(self):
@@ -175,21 +162,22 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         with mock.patch.object(
                 parser.Stack, 'db_active_resources_get',
                 side_effect=self._mock_convg_db_update_requires):
+            curr_stack.thread_group_mgr = tools.DummyThreadGroupManager()
             curr_stack.converge_stack(template=template2, action=stack.UPDATE)
 
         self.assertIsNotNone(curr_stack.ext_rsrcs_db)
-        self.assertEqual('Dependencies(['
-                         '((3, False), (1, False)), '
-                         '((3, False), (2, False)), '
-                         '((4, False), (3, False)), '
-                         '((4, False), (4, True)), '
-                         '((5, False), (3, False)), '
-                         '((5, False), (5, True)), '
-                         '((6, True), (8, True)), '
-                         '((7, True), (8, True)), '
-                         '((8, True), (4, True)), '
-                         '((8, True), (5, True))])',
-                         repr(curr_stack.convergence_dependencies))
+        deps = curr_stack.convergence_dependencies
+        self.assertEqual([((3, False), (1, False)),
+                          ((3, False), (2, False)),
+                          ((4, False), (3, False)),
+                          ((4, False), (4, True)),
+                          ((5, False), (3, False)),
+                          ((5, False), (5, True)),
+                          ((6, True), (8, True)),
+                          ((7, True), (8, True)),
+                          ((8, True), (4, True)),
+                          ((8, True), (5, True))],
+                         sorted(deps._graph.edges()))
 
         stack_db = stack_object.Stack.get_by_id(curr_stack.context,
                                                 curr_stack.id)
@@ -208,7 +196,7 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
                                  [[4, False], [3, False]],
                                  [[4, False], [4, True]]]),
                          sorted(stack_db.current_deps['edges']))
-        '''
+        r'''
         To visualize:
 
         G(7, True)       H(6, True)
@@ -225,23 +213,6 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
 
         Leaves are at the bottom
         '''
-
-        # check if needed_by are stored properly
-        # For A & B:
-        # needed_by=C, F
-
-        expected_needed_by = {'A': [3, 8], 'B': [3, 8],
-                              'C': [1, 2],
-                              'D': [], 'E': [],
-                              'F': [6, 7],
-                              'G': [], 'H': []}
-        rsrcs_db = resource_objects.Resource.get_all_by_stack(
-            stack_db._context, stack_db.id
-        )
-        self.assertEqual(8, len(rsrcs_db))
-        for rsrc_name, rsrc_obj in rsrcs_db.items():
-            self.assertEqual(sorted(expected_needed_by[rsrc_name]),
-                             sorted(rsrc_obj.needed_by))
 
         # check if sync_points are created for forward traversal
         # [F, H, G, A, B, Stack]
@@ -261,22 +232,22 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
             self.assertIsNotNone(sync_point)
             self.assertEqual(stack_db.id, sync_point.stack_id)
 
-        leaves = stack.convergence_dependencies.leaves()
+        leaves = set(stack.convergence_dependencies.leaves())
         expected_calls = []
-        for rsrc_id, is_update in leaves:
+        for rsrc_id, is_update in sorted(leaves, key=lambda n: n.is_update):
             expected_calls.append(
                 mock.call.worker_client.WorkerClient.check_resource(
                     stack.context, rsrc_id, stack.current_traversal,
                     {'input_data': {}},
-                    is_update, None))
+                    is_update, None, False))
 
-        leaves = curr_stack.convergence_dependencies.leaves()
-        for rsrc_id, is_update in leaves:
+        leaves = set(curr_stack.convergence_dependencies.leaves())
+        for rsrc_id, is_update in sorted(leaves, key=lambda n: n.is_update):
             expected_calls.append(
                 mock.call.worker_client.WorkerClient.check_resource(
                     curr_stack.context, rsrc_id, curr_stack.current_traversal,
                     {'input_data': {}},
-                    is_update, None))
+                    is_update, None, False))
         self.assertEqual(expected_calls, mock_cr.mock_calls)
 
     def test_conv_empty_template_stack_update_delete(self, mock_cr):
@@ -300,15 +271,16 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         with mock.patch.object(
                 parser.Stack, 'db_active_resources_get',
                 side_effect=self._mock_convg_db_update_requires):
+            curr_stack.thread_group_mgr = tools.DummyThreadGroupManager()
             curr_stack.converge_stack(template=template2, action=stack.DELETE)
 
         self.assertIsNotNone(curr_stack.ext_rsrcs_db)
-        self.assertEqual('Dependencies(['
-                         '((3, False), (1, False)), '
-                         '((3, False), (2, False)), '
-                         '((4, False), (3, False)), '
-                         '((5, False), (3, False))])',
-                         repr(curr_stack.convergence_dependencies))
+        deps = curr_stack.convergence_dependencies
+        self.assertEqual([((3, False), (1, False)),
+                          ((3, False), (2, False)),
+                          ((4, False), (3, False)),
+                          ((5, False), (3, False))],
+                         sorted(deps._graph.edges()))
 
         stack_db = stack_object.Stack.get_by_id(curr_stack.context,
                                                 curr_stack.id)
@@ -319,17 +291,6 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
                                  [[5, False], [3, False]],
                                  [[4, False], [3, False]]]),
                          sorted(stack_db.current_deps['edges']))
-
-        expected_needed_by = {'A': [3], 'B': [3],
-                              'C': [1, 2],
-                              'D': [], 'E': []}
-        rsrcs_db = resource_objects.Resource.get_all_by_stack(
-            stack_db._context, stack_db.id
-        )
-        self.assertEqual(5, len(rsrcs_db))
-        for rsrc_name, rsrc_obj in rsrcs_db.items():
-            self.assertEqual(sorted(expected_needed_by[rsrc_name]),
-                             sorted(rsrc_obj.needed_by))
 
         # check if sync_points are created for cleanup traversal
         # [A, B, C, D, E, Stack]
@@ -343,22 +304,22 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
             self.assertIsNotNone(sync_point, 'entity %s' % entity_id)
             self.assertEqual(stack_db.id, sync_point.stack_id)
 
-        leaves = stack.convergence_dependencies.leaves()
+        leaves = set(stack.convergence_dependencies.leaves())
         expected_calls = []
-        for rsrc_id, is_update in leaves:
+        for rsrc_id, is_update in sorted(leaves, key=lambda n: n.is_update):
             expected_calls.append(
                 mock.call.worker_client.WorkerClient.check_resource(
                     stack.context, rsrc_id, stack.current_traversal,
                     {'input_data': {}},
-                    is_update, None))
+                    is_update, None, False))
 
-        leaves = curr_stack.convergence_dependencies.leaves()
-        for rsrc_id, is_update in leaves:
+        leaves = set(curr_stack.convergence_dependencies.leaves())
+        for rsrc_id, is_update in sorted(leaves, key=lambda n: n.is_update):
             expected_calls.append(
                 mock.call.worker_client.WorkerClient.check_resource(
                     curr_stack.context, rsrc_id, curr_stack.current_traversal,
                     {'input_data': {}},
-                    is_update, None))
+                    is_update, None, False))
         self.assertEqual(expected_calls, mock_cr.mock_calls)
 
     def test_mark_complete_purges_db(self, mock_cr):
@@ -375,8 +336,9 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         stack = tools.get_stack('test_stack', utils.dummy_context(),
                                 template=tools.string_template_five,
                                 convergence=True)
+        stack.status = stack.FAILED
         stack.store()
-        stack.state_set(stack.action, stack.FAILED, 'test-reason')
+        stack.purge_db()
         self.assertEqual('', stack.current_traversal)
 
     @mock.patch.object(raw_template_object.RawTemplate, 'delete')
@@ -465,47 +427,65 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         stack = tools.get_stack('test_stack', utils.dummy_context(),
                                 template=tools.string_template_five,
                                 convergence=True)
-        stack.store()
         stack.prev_raw_template_id = 2
         stack.t.id = 3
-        dummy_res = stack.resources['A']
-        a_res_2 = res.Resource('A', dummy_res.t, stack)
-        a_res_2.current_template_id = 2
-        a_res_2.id = 2
-        a_res_3 = res.Resource('A', dummy_res.t, stack)
-        a_res_3.current_template_id = 3
-        a_res_3.id = 3
-        a_res_1 = res.Resource('A', dummy_res.t, stack)
-        a_res_1.current_template_id = 1
-        a_res_1.id = 1
-        existing_res = {2: a_res_2,
-                        3: a_res_3,
-                        1: a_res_1}
+
+        def db_resource(current_template_id,
+                        created_at=None,
+                        updated_at=None):
+            db_res = resource_objects.Resource(stack.context)
+            db_res['id'] = current_template_id
+            db_res['name'] = 'A'
+            db_res['current_template_id'] = current_template_id
+            db_res['action'] = 'UPDATE' if updated_at else 'CREATE'
+            db_res['status'] = 'COMPLETE'
+            db_res['updated_at'] = updated_at
+            db_res['created_at'] = created_at
+            db_res['replaced_by'] = None
+            return db_res
+
+        start_time = datetime.datetime.fromtimestamp(
+            0, tz=datetime.timezone.utc).replace(tzinfo=None)
+
+        def t(minutes):
+            return start_time + datetime.timedelta(minutes=minutes)
+
+        a_res_2 = db_resource(2)
+        a_res_3 = db_resource(3)
+        a_res_0 = db_resource(0, created_at=t(0), updated_at=t(1))
+        a_res_1 = db_resource(1, created_at=t(2))
+        existing_res = {a_res_2.id: a_res_2,
+                        a_res_3.id: a_res_3,
+                        a_res_0.id: a_res_0,
+                        a_res_1.id: a_res_1}
         stack.ext_rsrcs_db = existing_res
         best_res = stack._get_best_existing_rsrc_db('A')
         # should return resource with template id 3 which is current template
         self.assertEqual(a_res_3.id, best_res.id)
 
         # no resource with current template id as 3
-        existing_res = {1: a_res_1,
-                        2: a_res_2}
-        stack.ext_rsrcs_db = existing_res
+        del existing_res[3]
         best_res = stack._get_best_existing_rsrc_db('A')
         # should return resource with template id 2 which is prev template
         self.assertEqual(a_res_2.id, best_res.id)
 
         # no resource with current template id as 3 or 2
-        existing_res = {1: a_res_1}
-        stack.ext_rsrcs_db = existing_res
+        del existing_res[2]
         best_res = stack._get_best_existing_rsrc_db('A')
-        # should return resource with template id 1 existing in DB
+        # should return resource with template id 1 which is the newest
         self.assertEqual(a_res_1.id, best_res.id)
+
+        del existing_res[1]
+        best_res = stack._get_best_existing_rsrc_db('A')
+        # should return resource with template id 0 existing in the db
+        self.assertEqual(a_res_0.id, best_res.id)
 
     @mock.patch.object(parser.Stack, '_converge_create_or_update')
     def test_updated_time_stack_create(self, mock_ccu, mock_cr):
         stack = parser.Stack(utils.dummy_context(), 'convg_updated_time_test',
                              templatem.Template.create_empty_template(),
                              convergence=True)
+        stack.thread_group_mgr = tools.DummyThreadGroupManager()
         stack.converge_stack(template=stack.t, action=stack.CREATE)
         self.assertIsNone(stack.updated_time)
         self.assertTrue(mock_ccu.called)
@@ -516,6 +496,7 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
                 'Resources': {'R1': {'Type': 'GenericResourceType'}}}
         stack = parser.Stack(utils.dummy_context(), 'updated_time_test',
                              templatem.Template(tmpl), convergence=True)
+        stack.thread_group_mgr = tools.DummyThreadGroupManager()
         stack.converge_stack(template=stack.t, action=stack.UPDATE)
         self.assertIsNotNone(stack.updated_time)
         self.assertTrue(mock_ccu.called)
@@ -526,7 +507,9 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
     def test_sync_point_delete_stack_create(self, mock_syncpoint_del,
                                             mock_ccu, mock_cr):
         stack = parser.Stack(utils.dummy_context(), 'convg_updated_time_test',
-                             templatem.Template.create_empty_template())
+                             templatem.Template.create_empty_template(),
+                             convergence=True)
+        stack.thread_group_mgr = tools.DummyThreadGroupManager()
         stack.converge_stack(template=stack.t, action=stack.CREATE)
         self.assertFalse(mock_syncpoint_del.called)
         self.assertTrue(mock_ccu.called)
@@ -539,7 +522,8 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         tmpl = {'HeatTemplateFormatVersion': '2012-12-12',
                 'Resources': {'R1': {'Type': 'GenericResourceType'}}}
         stack = parser.Stack(utils.dummy_context(), 'updated_time_test',
-                             templatem.Template(tmpl))
+                             templatem.Template(tmpl), convergence=True)
+        stack.thread_group_mgr = tools.DummyThreadGroupManager()
         stack.current_traversal = 'prev_traversal'
         stack.converge_stack(template=stack.t, action=stack.UPDATE)
         self.assertTrue(mock_syncpoint_del.called)
@@ -549,14 +533,15 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
         tmpl = {'HeatTemplateFormatVersion': '2012-12-12',
                 'Resources': {'R1': {'Type': 'GenericResourceType'}}}
         stack = parser.Stack(utils.dummy_context(), 'updated_time_test',
-                             templatem.Template(tmpl))
+                             templatem.Template(tmpl), convergence=True)
         stack.current_traversal = 'prev_traversal'
         stack.action, stack.status = stack.CREATE, stack.COMPLETE
         stack.store()
+        stack.thread_group_mgr = tools.DummyThreadGroupManager()
         snapshot_values = {
             'stack_id': stack.id,
             'name': 'fake_snapshot',
-            'tenant': stack.context.tenant_id,
+            'tenant': stack.context.project_id,
             'status': 'COMPLETE',
             'data': None
         }
@@ -564,14 +549,14 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
 
         # Ensure that snapshot is not deleted on stack update
         stack.converge_stack(template=stack.t, action=stack.UPDATE)
-        db_snapshot_obj = snapshot_objects.Snapshot.get_all(
+        db_snapshot_obj = snapshot_objects.Snapshot.get_all_by_stack(
             stack.context, stack.id)
         self.assertEqual('fake_snapshot', db_snapshot_obj[0].name)
         self.assertEqual(stack.id, db_snapshot_obj[0].stack_id)
 
         # Ensure that snapshot is deleted on stack delete
         stack.converge_stack(template=stack.t, action=stack.DELETE)
-        self.assertEqual([], snapshot_objects.Snapshot.get_all(
+        self.assertEqual([], snapshot_objects.Snapshot.get_all_by_stack(
             stack.context, stack.id))
         self.assertTrue(mock_cr.called)
 
@@ -580,7 +565,7 @@ class StackConvergenceCreateUpdateDeleteTest(common.HeatTestCase):
 class TestConvgStackStateSet(common.HeatTestCase):
     def setUp(self):
         super(TestConvgStackStateSet, self).setUp()
-        cfg.CONF.set_override('convergence_engine', True, enforce_type=True)
+        cfg.CONF.set_override('convergence_engine', True)
         self.stack = tools.get_stack(
             'test_stack', utils.dummy_context(),
             template=tools.wp_template, convergence=True)
@@ -620,49 +605,43 @@ class TestConvgStackStateSet(common.HeatTestCase):
 
     def test_state_set_stack_suspend(self, mock_ps):
         mock_ps.return_value = 'updated'
-        ret_val = self.stack.state_set(
-            self.stack.SUSPEND, self.stack.IN_PROGRESS, 'Suspend started')
+        self.stack.state_set(self.stack.SUSPEND, self.stack.IN_PROGRESS,
+                             'Suspend started')
         self.assertTrue(mock_ps.called)
-        # Ensure that state_set returns None for other actions in convergence
-        self.assertIsNone(ret_val)
         mock_ps.reset_mock()
-        ret_val = self.stack.state_set(
-            self.stack.SUSPEND, self.stack.COMPLETE, 'Suspend complete')
+        self.stack.state_set(self.stack.SUSPEND, self.stack.COMPLETE,
+                             'Suspend complete')
         self.assertFalse(mock_ps.called)
-        self.assertIsNone(ret_val)
 
     def test_state_set_stack_resume(self, mock_ps):
-        ret_val = self.stack.state_set(
-            self.stack.RESUME, self.stack.IN_PROGRESS, 'Resume started')
+        self.stack.state_set(self.stack.RESUME, self.stack.IN_PROGRESS,
+                             'Resume started')
         self.assertTrue(mock_ps.called)
-        self.assertIsNone(ret_val)
         mock_ps.reset_mock()
-        ret_val = self.stack.state_set(self.stack.RESUME, self.stack.COMPLETE,
-                                       'Resume complete')
+        self.stack.state_set(self.stack.RESUME, self.stack.COMPLETE,
+                             'Resume complete')
         self.assertFalse(mock_ps.called)
-        self.assertIsNone(ret_val)
 
     def test_state_set_stack_snapshot(self, mock_ps):
-        ret_val = self.stack.state_set(
-            self.stack.SNAPSHOT, self.stack.IN_PROGRESS, 'Snapshot started')
+        self.stack.state_set(self.stack.SNAPSHOT, self.stack.IN_PROGRESS,
+                             'Snapshot started')
         self.assertTrue(mock_ps.called)
-        self.assertIsNone(ret_val)
         mock_ps.reset_mock()
-        ret_val = self.stack.state_set(
-            self.stack.SNAPSHOT, self.stack.COMPLETE, 'Snapshot complete')
+        self.stack.state_set(self.stack.SNAPSHOT, self.stack.COMPLETE,
+                             'Snapshot complete')
         self.assertFalse(mock_ps.called)
-        self.assertIsNone(ret_val)
 
     def test_state_set_stack_restore(self, mock_ps):
+        mock_ps.return_value = 'updated'
         ret_val = self.stack.state_set(
             self.stack.RESTORE, self.stack.IN_PROGRESS, 'Restore started')
         self.assertTrue(mock_ps.called)
-        self.assertIsNone(ret_val)
+        self.assertEqual('updated', ret_val)
         mock_ps.reset_mock()
         ret_val = self.stack.state_set(
             self.stack.RESTORE, self.stack.COMPLETE, 'Restore complete')
-        self.assertFalse(mock_ps.called)
-        self.assertIsNone(ret_val)
+        self.assertTrue(mock_ps.called)
+        self.assertEqual('updated', ret_val)
 
 
 class TestConvgStackRollback(common.HeatTestCase):
@@ -744,12 +723,11 @@ class TestConvgComputeDependencies(common.HeatTestCase):
         self.stack._compute_convg_dependencies(self.stack.ext_rsrcs_db,
                                                self.stack.dependencies,
                                                self.current_resources)
-        self.assertEqual('Dependencies(['
-                         '((1, True), (3, True)), '
-                         '((2, True), (3, True)), '
-                         '((3, True), (4, True)), '
-                         '((3, True), (5, True))])',
-                         repr(self.stack._convg_deps))
+        self.assertEqual([((1, True), (3, True)),
+                          ((2, True), (3, True)),
+                          ((3, True), (4, True)),
+                          ((3, True), (5, True))],
+                         sorted(self.stack._convg_deps._graph.edges()))
 
     def test_dependencies_update_same_template(self):
         t = template_format.parse(tools.string_template_five)
@@ -762,21 +740,20 @@ class TestConvgComputeDependencies(common.HeatTestCase):
         self.stack._compute_convg_dependencies(db_resources,
                                                self.stack.dependencies,
                                                curr_resources)
-        self.assertEqual('Dependencies(['
-                         '((1, False), (1, True)), '
-                         '((1, True), (3, True)), '
-                         '((2, False), (2, True)), '
-                         '((2, True), (3, True)), '
-                         '((3, False), (1, False)), '
-                         '((3, False), (2, False)), '
-                         '((3, False), (3, True)), '
-                         '((3, True), (4, True)), '
-                         '((3, True), (5, True)), '
-                         '((4, False), (3, False)), '
-                         '((4, False), (4, True)), '
-                         '((5, False), (3, False)), '
-                         '((5, False), (5, True))])',
-                         repr(self.stack._convg_deps))
+        self.assertEqual([((1, False), (1, True)),
+                          ((1, True), (3, True)),
+                          ((2, False), (2, True)),
+                          ((2, True), (3, True)),
+                          ((3, False), (1, False)),
+                          ((3, False), (2, False)),
+                          ((3, False), (3, True)),
+                          ((3, True), (4, True)),
+                          ((3, True), (5, True)),
+                          ((4, False), (3, False)),
+                          ((4, False), (4, True)),
+                          ((5, False), (3, False)),
+                          ((5, False), (5, True))],
+                         sorted(self.stack._convg_deps._graph.edges()))
 
     def test_dependencies_update_new_template(self):
         t = template_format.parse(tools.string_template_five_update)
@@ -799,18 +776,17 @@ class TestConvgComputeDependencies(common.HeatTestCase):
         self.stack._compute_convg_dependencies(db_resources,
                                                self.stack.dependencies,
                                                curr_resources)
-        self.assertEqual('Dependencies(['
-                         '((3, False), (1, False)), '
-                         '((3, False), (2, False)), '
-                         '((4, False), (3, False)), '
-                         '((4, False), (4, True)), '
-                         '((5, False), (3, False)), '
-                         '((5, False), (5, True)), '
-                         '((6, True), (8, True)), '
-                         '((7, True), (8, True)), '
-                         '((8, True), (4, True)), '
-                         '((8, True), (5, True))])',
-                         repr(self.stack._convg_deps))
+        self.assertEqual([((3, False), (1, False)),
+                          ((3, False), (2, False)),
+                          ((4, False), (3, False)),
+                          ((4, False), (4, True)),
+                          ((5, False), (3, False)),
+                          ((5, False), (5, True)),
+                          ((6, True), (8, True)),
+                          ((7, True), (8, True)),
+                          ((8, True), (4, True)),
+                          ((8, True), (5, True))],
+                         sorted(self.stack._convg_deps._graph.edges()))
 
     def test_dependencies_update_replace_rollback(self):
         t = template_format.parse(tools.string_template_five)
@@ -826,7 +802,7 @@ class TestConvgComputeDependencies(common.HeatTestCase):
         res = mock.MagicMock()
         res.id = 6
         res.name = 'E'
-        res.requires = [3]
+        res.requires = {3}
         res.replaces = 1
         res.current_template_id = 2
         db_resources[6] = res
@@ -837,23 +813,22 @@ class TestConvgComputeDependencies(common.HeatTestCase):
         self.stack._compute_convg_dependencies(db_resources,
                                                self.stack.dependencies,
                                                curr_resources)
-        self.assertEqual('Dependencies(['
-                         '((1, False), (1, True)), '
-                         '((1, False), (6, False)), '
-                         '((1, True), (3, True)), '
-                         '((2, False), (2, True)), '
-                         '((2, True), (3, True)), '
-                         '((3, False), (1, False)), '
-                         '((3, False), (2, False)), '
-                         '((3, False), (3, True)), '
-                         '((3, False), (6, False)), '
-                         '((3, True), (4, True)), '
-                         '((3, True), (5, True)), '
-                         '((4, False), (3, False)), '
-                         '((4, False), (4, True)), '
-                         '((5, False), (3, False)), '
-                         '((5, False), (5, True))])',
-                         repr(self.stack._convg_deps))
+        self.assertEqual([((1, False), (1, True)),
+                          ((1, False), (6, False)),
+                          ((1, True), (3, True)),
+                          ((2, False), (2, True)),
+                          ((2, True), (3, True)),
+                          ((3, False), (1, False)),
+                          ((3, False), (2, False)),
+                          ((3, False), (3, True)),
+                          ((3, False), (6, False)),
+                          ((3, True), (4, True)),
+                          ((3, True), (5, True)),
+                          ((4, False), (3, False)),
+                          ((4, False), (4, True)),
+                          ((5, False), (3, False)),
+                          ((5, False), (5, True))],
+                         sorted(self.stack._convg_deps._graph.edges()))
 
     def test_dependencies_update_delete(self):
         tmpl = templatem.Template.create_empty_template(
@@ -866,12 +841,11 @@ class TestConvgComputeDependencies(common.HeatTestCase):
         self.stack._compute_convg_dependencies(db_resources,
                                                self.stack.dependencies,
                                                curr_resources)
-        self.assertEqual('Dependencies(['
-                         '((3, False), (1, False)), '
-                         '((3, False), (2, False)), '
-                         '((4, False), (3, False)), '
-                         '((5, False), (3, False))])',
-                         repr(self.stack._convg_deps))
+        self.assertEqual([((3, False), (1, False)),
+                          ((3, False), (2, False)),
+                          ((4, False), (3, False)),
+                          ((5, False), (3, False))],
+                         sorted(self.stack._convg_deps._graph.edges()))
 
 
 class TestConvergenceMigration(common.HeatTestCase):
@@ -881,7 +855,7 @@ class TestConvergenceMigration(common.HeatTestCase):
                                      template=tools.string_template_five)
         self.stack.store()
         for r in self.stack.resources.values():
-            r._store()
+            r.store()
         self.stack.migrate_to_convergence()
         self.stack = self.stack.load(self.ctx, self.stack.id)
 

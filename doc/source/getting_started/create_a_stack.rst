@@ -26,12 +26,21 @@ sourced::
 
 You can confirm that Heat is available with this command::
 
-    $ heat stack-list
+    $ openstack stack list
 
 This should return an empty line
 
 Preparing to create a stack
 ---------------------------
+
+Download and register the image::
+
+    $ wget https://download.fedoraproject.org/pub/fedora/linux/releases/37/Cloud/x86_64/images/Fedora-Cloud-Base-37-1.7.x86_64.qcow2
+    $ openstack image create \
+                          --disk-format=qcow2 \
+                          --container-format=bare \
+                          --file=Fedora-Cloud-Base-37-1.7.x86_64.qcow2 \
+                          my-fedora-image
 
 Your cloud will have different flavors and images available for
 launching instances, you can discover what is available by running::
@@ -50,14 +59,14 @@ Launching a stack
 -----------------
 Now lets launch a stack, using an example template from the heat-templates repository::
 
-    $ heat stack-create -u http://git.openstack.org/cgit/openstack/heat-templates/plain/hot/F20/WordPress_Native.yaml -P key_name=heat_key -P image_id=my-fedora-image -P instance_type=m1.small teststack
+    $ openstack stack create -t https://opendev.org/openstack/heat-templates/src/branch/master/hot/F20/WordPress_Native.yaml --parameter key_name=heat_key --parameter image_id=my-fedora-image --parameter instance_type=m1.small teststack
 
 Which will respond::
 
     +--------------------------------------+-----------+--------------------+----------------------+
     | ID                                   | Name      | Status             | Created              |
     +--------------------------------------+-----------+--------------------+----------------------+
-    | (uuid)                               | teststack | CREATE_IN_PROGRESS | (timestamp)          |
+    | 718a712a-2571-4eac-aa03-426de00ecb43 | teststack | CREATE_IN_PROGRESS | 2017-04-11T03:06:24Z |
     +--------------------------------------+-----------+--------------------+----------------------+
 
 
@@ -66,23 +75,27 @@ Which will respond::
    template. In case if it be a "html" page with template, Heat will return
    an error.
 
+.. note::
+   You cannot rename a stack after it has been launched.
+
+
 List stacks
 ~~~~~~~~~~~
 List the stacks in your tenant::
 
-    $ heat stack-list
+    $ openstack stack list
 
 List stack events
 ~~~~~~~~~~~~~~~~~
 List the events related to a particular stack::
 
-   $ heat event-list teststack
+   $ openstack stack event list teststack
 
 Describe the wordpress stack
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Show detailed state of a stack::
 
-   $ heat stack-show teststack
+   $ openstack stack show teststack
 
 Note: After a few seconds, the stack_status should change from ``IN_PROGRESS``
 to ``CREATE_COMPLETE``.
@@ -93,21 +106,19 @@ Because the software takes some time to install from the repository, it may be
 a few minutes before the Wordpress instance is in a running state.
 
 Point a web browser at the location given by the ``WebsiteURL`` output as shown
-by ``heat output-show``::
+by ``openstack stack output show``::
 
-    $ WebsiteURL=$(heat output-show --format raw teststack WebsiteURL)
+    $ WebsiteURL=$(openstack stack output show teststack WebsiteURL -c output_value -f value)
     $ curl $WebsiteURL
 
 Delete the instance when done
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Note: The list operation will show no running stack.::
 
-    $ heat stack-delete teststack
-    $ heat stack-list
+    $ openstack stack delete teststack
+    $ openstack stack list
 
 You can explore other heat commands by referring to the
-`Heat chapter
-<http://docs.openstack.org/cli-reference/heat.html>`_
-of the `OpenStack Command-Line Interface Reference
-<http://docs.openstack.org/cli-reference/index.html>`_ then read
+:python-heatclient-doc:`Heat command reference <cli/>` for the
+:python-openstackclient-doc:`OpenStack Command-Line Interface <>`; then read
 the :ref:`template-guide` and start authoring your own templates.

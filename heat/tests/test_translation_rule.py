@@ -11,8 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+import copy
+from unittest import mock
 
 from heat.common import exception
 from heat.engine.cfn import functions as cfn_funcs
@@ -26,6 +26,10 @@ from heat.tests import common
 
 class TestTranslationRule(common.HeatTestCase):
 
+    def setUp(self):
+        super(TestTranslationRule, self).setUp()
+        self.props = mock.Mock(spec=properties.Properties)
+
     def test_translation_rule(self):
         for r in translation.TranslationRule.RULE_KEYS:
             props = properties.Properties({}, {})
@@ -33,7 +37,7 @@ class TestTranslationRule(common.HeatTestCase):
                 props,
                 r,
                 ['any'],
-                ['value'] if r == 'Add' else 'value',
+                ['value'] if r == 'Add' else None,
                 'value_name' if r == 'Replace' else None,
                 'client_plugin' if r == 'Resolve' else None,
                 'finder' if r == 'Resolve' else None)
@@ -41,21 +45,45 @@ class TestTranslationRule(common.HeatTestCase):
             self.assertEqual(rule.rule, r)
             if r == 'Add':
                 self.assertEqual(['value'], rule.value)
-            else:
-                self.assertEqual('value', rule.value)
             if r == 'Replace':
                 self.assertEqual('value_name', rule.value_name)
             else:
                 self.assertIsNone(rule.value_name)
 
+    def test_cmp_rules(self):
+        rules = [
+            translation.TranslationRule(
+                mock.Mock(spec=properties.Properties),
+                translation.TranslationRule.DELETE,
+                ['any']
+            ),
+            translation.TranslationRule(
+                mock.Mock(spec=properties.Properties),
+                translation.TranslationRule.ADD,
+                ['any']
+            ),
+            translation.TranslationRule(
+                mock.Mock(spec=properties.Properties),
+                translation.TranslationRule.RESOLVE,
+                ['any'],
+                client_plugin=mock.ANY,
+                finder=mock.ANY
+            ),
+            translation.TranslationRule(
+                mock.Mock(spec=properties.Properties),
+                translation.TranslationRule.REPLACE,
+                ['any']
+            )
+        ]
+        expected = [translation.TranslationRule.ADD,
+                    translation.TranslationRule.REPLACE,
+                    translation.TranslationRule.RESOLVE,
+                    translation.TranslationRule.DELETE]
+        result = [rule.rule for rule in sorted(rules)]
+        self.assertEqual(expected, result)
+
     def test_invalid_translation_rule(self):
         props = properties.Properties({}, {})
-        exc = self.assertRaises(ValueError,
-                                translation.TranslationRule,
-                                'proppy', mock.ANY,
-                                mock.ANY)
-        self.assertEqual('Properties must be Properties type. '
-                         'Found %s.' % str, six.text_type(exc))
 
         exc = self.assertRaises(ValueError,
                                 translation.TranslationRule,
@@ -65,7 +93,7 @@ class TestTranslationRule(common.HeatTestCase):
                                 mock.ANY)
         self.assertEqual('There is no rule EatTheCookie. List of allowed '
                          'rules is: Add, Replace, Delete, Resolve.',
-                         six.text_type(exc))
+                         str(exc))
 
         exc = self.assertRaises(ValueError,
                                 translation.TranslationRule,
@@ -73,8 +101,9 @@ class TestTranslationRule(common.HeatTestCase):
                                 translation.TranslationRule.ADD,
                                 'networks.network',
                                 'value')
-        self.assertEqual('translation_path should be a list with path instead '
-                         'of %s.' % str, six.text_type(exc))
+        self.assertEqual('"translation_path" should be non-empty list '
+                         'with path to translate.',
+                         str(exc))
 
         exc = self.assertRaises(ValueError,
                                 translation.TranslationRule,
@@ -82,8 +111,9 @@ class TestTranslationRule(common.HeatTestCase):
                                 translation.TranslationRule.ADD,
                                 [],
                                 mock.ANY)
-        self.assertEqual('translation_path must be non-empty list with path.',
-                         six.text_type(exc))
+        self.assertEqual('"translation_path" should be non-empty list '
+                         'with path to translate.',
+                         str(exc))
 
         exc = self.assertRaises(ValueError,
                                 translation.TranslationRule,
@@ -91,10 +121,11 @@ class TestTranslationRule(common.HeatTestCase):
                                 translation.TranslationRule.ADD,
                                 ['any'],
                                 'value',
-                                'value_name')
-        self.assertEqual('Either value or value_name should be specified for '
-                         'rule Add.',
-                         six.text_type(exc))
+                                'value_name',
+                                'some_path')
+        self.assertEqual('"value_path", "value" and "value_name" are '
+                         'mutually exclusive and cannot be specified '
+                         'at the same time.', str(exc))
 
         exc = self.assertRaises(ValueError,
                                 translation.TranslationRule,
@@ -102,8 +133,8 @@ class TestTranslationRule(common.HeatTestCase):
                                 translation.TranslationRule.ADD,
                                 ['any'],
                                 'value')
-        self.assertEqual('value must be list type when rule is Add.',
-                         six.text_type(exc))
+        self.assertEqual('"value" must be list type when rule is Add.',
+                         str(exc))
 
     def test_add_rule_exist(self):
         schema = {
@@ -128,16 +159,22 @@ class TestTranslationRule(common.HeatTestCase):
             ],
             'bar': 'dak'
         }
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, copy.copy(data))
 
         rule = translation.TranslationRule(
             props,
             translation.TranslationRule.ADD,
             ['far'],
             [{'red': props.get('bar')}])
-        rule.execute_rule()
 
-        self.assertIn({'red': 'dak'}, props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual([{'red': 'blue'}, {'red': 'dak'}], result)
+        self.assertEqual([{'red': 'blue'}, {'red': 'dak'}],
+                         tran.resolved_translations['far'])
 
     def test_add_rule_dont_exist(self):
         schema = {
@@ -159,16 +196,21 @@ class TestTranslationRule(common.HeatTestCase):
         data = {
             'bar': 'dak'
         }
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, copy.copy(data))
 
         rule = translation.TranslationRule(
             props,
             translation.TranslationRule.ADD,
             ['far'],
             [{'red': props.get('bar')}])
-        rule.execute_rule()
 
-        self.assertEqual([{'red': 'dak'}], props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far')
+        self.assertEqual([{'red': 'dak'}], result)
+        self.assertEqual([{'red': 'dak'}], tran.resolved_translations['far'])
 
     def test_add_rule_invalid(self):
         schema = {
@@ -195,10 +237,15 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.ADD,
             ['far'],
             [props.get('bar')])
-        exc = self.assertRaises(ValueError, rule.execute_rule)
 
-        self.assertEqual('Add rule must be used only for lists.',
-                         six.text_type(exc))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far'))
+        ex = self.assertRaises(ValueError, tran.translate, 'far', 'tran')
+        self.assertEqual('Incorrect translation rule using - cannot '
+                         'resolve Add rule for non-list translation '
+                         'value "far".', str(ex))
 
     def test_replace_rule_map_exist(self):
         schema = {
@@ -225,9 +272,14 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.REPLACE,
             ['far', 'red'],
             props.get('bar'))
-        rule.execute_rule()
 
-        self.assertEqual({'red': 'dak'}, props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.red', data['far']['red'])
+        self.assertEqual('dak', result)
+        self.assertEqual('dak', tran.resolved_translations['far.red'])
 
     def test_replace_rule_map_dont_exist(self):
         schema = {
@@ -253,9 +305,14 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.REPLACE,
             ['far', 'red'],
             props.get('bar'))
-        rule.execute_rule()
 
-        self.assertEqual({'red': 'dak'}, props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.red')
+        self.assertEqual('dak', result)
+        self.assertEqual('dak', tran.resolved_translations['far.red'])
 
     def test_replace_rule_list_different(self):
         schema = {
@@ -286,9 +343,14 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.REPLACE,
             ['far', 'red'],
             props.get('bar'))
-        rule.execute_rule()
 
-        self.assertEqual([{'red': 'dak'}, {'red': 'dak'}], props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.0.red', data['far'][0]['red'])
+        self.assertEqual('dak', result)
+        self.assertEqual('dak', tran.resolved_translations['far.0.red'])
 
     def test_replace_rule_list_same(self):
         schema = {
@@ -319,11 +381,22 @@ class TestTranslationRule(common.HeatTestCase):
             ['far', 'red'],
             None,
             'blue')
-        rule.execute_rule()
 
-        self.assertEqual([{'red': 'white', 'blue': None},
-                          {'blue': None, 'red': 'roses'}],
-                         props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('far.0.red'))
+        result = tran.translate('far.0.red', data['far'][0].get('red'),
+                                data['far'][0])
+        self.assertEqual('white', result)
+        self.assertEqual('white', tran.resolved_translations['far.0.red'])
+        self.assertIsNone(tran.resolved_translations['far.0.blue'])
+        self.assertTrue(tran.has_translation('far.1.red'))
+        result = tran.translate('far.1.red', data['far'][1]['red'],
+                                data['far'][1])
+        self.assertEqual('roses', result)
+        self.assertEqual('roses', tran.resolved_translations['far.1.red'])
+        self.assertIsNone(tran.resolved_translations['far.1.blue'])
 
     def test_replace_rule_str(self):
         schema = {
@@ -340,10 +413,14 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.REPLACE,
             ['bar'],
             props.get('far'))
-        rule.execute_rule()
 
-        self.assertEqual('one', props.get('bar'))
-        self.assertEqual('one', props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('bar'))
+        result = tran.translate('bar', data['bar'])
+        self.assertEqual('one', result)
+        self.assertEqual('one', tran.resolved_translations['bar'])
 
     def test_replace_rule_str_value_path_error(self):
         schema = {
@@ -360,11 +437,15 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.REPLACE,
             ['bar'],
             value_path=['far'])
-        ex = self.assertRaises(exception.ResourcePropertyConflict,
-                               rule.execute_rule)
-        self.assertEqual("Cannot define the following properties at the "
-                         "same time: ['bar', 'far'].",
-                         six.text_type(ex))
+
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('bar'))
+        ex = self.assertRaises(exception.StackValidationFailed,
+                               tran.translate, 'bar', data['bar'])
+        self.assertEqual('Cannot define the following properties at '
+                         'the same time: bar, far', str(ex))
 
     def test_replace_rule_str_value_path(self):
         schema = {
@@ -372,19 +453,23 @@ class TestTranslationRule(common.HeatTestCase):
             'bar': properties.Schema(properties.Schema.STRING)
         }
 
-        data = {'far': 'one'}
-
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, {'far': 'one'})
 
         rule = translation.TranslationRule(
             props,
             translation.TranslationRule.REPLACE,
             ['bar'],
             value_path=['far'])
-        rule.execute_rule()
 
-        self.assertEqual('one', props.get('bar'))
-        self.assertIsNone(props.get('far'))
+        props = properties.Properties(schema, {'far': 'one'})
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+
+        self.assertTrue(tran.has_translation('bar'))
+        result = tran.translate('bar')
+        self.assertEqual('one', result)
+        self.assertEqual('one', tran.resolved_translations['bar'])
+        self.assertIsNone(tran.resolved_translations['far'])
 
     def test_replace_rule_str_invalid(self):
         schema = {
@@ -401,12 +486,11 @@ class TestTranslationRule(common.HeatTestCase):
             translation.TranslationRule.REPLACE,
             ['bar'],
             props.get('far'))
-        rule.execute_rule()
-
+        props.update_translation([rule])
         exc = self.assertRaises(exception.StackValidationFailed,
                                 props.validate)
         self.assertEqual("Property error: bar: Value 'one' is not an integer",
-                         six.text_type(exc))
+                         str(exc))
 
     def test_delete_rule_list(self):
         schema = {
@@ -416,6 +500,9 @@ class TestTranslationRule(common.HeatTestCase):
                     properties.Schema.MAP,
                     schema={
                         'red': properties.Schema(
+                            properties.Schema.STRING
+                        ),
+                        'check': properties.Schema(
                             properties.Schema.STRING
                         )
                     }
@@ -432,9 +519,12 @@ class TestTranslationRule(common.HeatTestCase):
             props,
             translation.TranslationRule.DELETE,
             ['far', 'red'])
-        rule.execute_rule()
 
-        self.assertEqual([{'red': None}, {'red': None}], props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.red'))
+        self.assertIsNone(tran.translate('far.red'))
+        self.assertIsNone(tran.resolved_translations['far.red'])
 
     def test_delete_rule_other(self):
         schema = {
@@ -449,14 +539,20 @@ class TestTranslationRule(common.HeatTestCase):
             props,
             translation.TranslationRule.DELETE,
             ['far'])
-        rule.execute_rule()
 
-        self.assertIsNone(props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        self.assertIsNone(tran.translate('far'))
+        self.assertIsNone(tran.resolved_translations['far'])
 
-    def _test_resolve_rule(self, is_list=False):
+    def _test_resolve_rule(self, is_list=False,
+                           check_error=False):
         class FakeClientPlugin(object):
             def find_name_id(self, entity=None,
                              src_value='far'):
+                if check_error:
+                    raise exception.NotFound()
                 if entity == 'rose':
                     return 'pink'
                 return 'yellow'
@@ -495,9 +591,70 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id'
             )
-        rule.execute_rule()
-        self.assertEqual([{'red': 'yellow'}, {'red': 'yellow'}],
-                         props.get('far'))
+
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.0.red', data['far'][0]['red'])
+        self.assertEqual('yellow', result)
+        self.assertEqual('yellow', tran.resolved_translations['far.0.red'])
+
+    def test_resolve_rule_nested_list_populated(self):
+        client_plugin, schema = self._test_resolve_rule_nested_list()
+        data = {
+            'instances': [{'networks': [{'port': 'port1', 'net': 'net1'}]}]
+        }
+        props = properties.Properties(schema, data)
+        rule = translation.TranslationRule(
+            props,
+            translation.TranslationRule.RESOLVE,
+            ['instances', 'networks', 'port'],
+            client_plugin=client_plugin,
+            finder='find_name_id',
+            entity='port'
+        )
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('instances.networks.port'))
+        result = tran.translate('instances.0.networks.0.port',
+                                data['instances'][0]['networks'][0]['port'])
+        self.assertEqual('port1_id', result)
+        self.assertEqual('port1_id', tran.resolved_translations[
+            'instances.0.networks.0.port'])
+
+    def _test_resolve_rule_nested_list(self):
+        class FakeClientPlugin(object):
+            def find_name_id(self, entity=None, value=None):
+                if entity == 'net':
+                    return 'net1_id'
+                if entity == 'port':
+                    return 'port1_id'
+
+        schema = {
+            'instances': properties.Schema(
+                properties.Schema.LIST,
+                schema=properties.Schema(
+                    properties.Schema.MAP,
+                    schema={
+                        'networks': properties.Schema(
+                            properties.Schema.LIST,
+                            schema=properties.Schema(
+                                properties.Schema.MAP,
+                                schema={
+                                    'port': properties.Schema(
+                                        properties.Schema.STRING,
+                                    ),
+                                    'net': properties.Schema(
+                                        properties.Schema.STRING,
+                                    ),
+                                }
+                            )
+                        )
+                    }
+                )
+            )}
+
+        return FakeClientPlugin(), schema
 
     def test_resolve_rule_list_with_function(self):
         client_plugin, schema = self._test_resolve_rule(is_list=True)
@@ -516,15 +673,22 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id'
             )
-        rule.execute_rule()
-        self.assertEqual([{'red': 'yellow'}, {'red': 'yellow'}],
-                         props.get('far'))
+
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.0.red', data['far'][0]['red'])
+        self.assertEqual('yellow', result)
+        self.assertEqual('yellow', tran.resolved_translations['far.0.red'])
 
     def test_resolve_rule_list_with_ref(self):
         client_plugin, schema = self._test_resolve_rule(is_list=True)
 
         class rsrc(object):
             action = INIT = "INIT"
+
+            def FnGetRefId(self):
+                return 'resource_id'
 
         class DummyStack(dict):
             pass
@@ -544,8 +708,13 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id'
             )
-        rule.execute_rule()
-        self.assertEqual(data, props.data)
+
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.0.red', data['far'][0]['red'])
+        self.assertEqual('yellow', result)
+        self.assertEqual('yellow', tran.resolved_translations['far.0.red'])
 
     def test_resolve_rule_list_strings(self):
         client_plugin, schema = self._test_resolve_rule()
@@ -564,25 +733,30 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id')
 
-        rule.execute_rule()
-        self.assertEqual(['yellow', 'pink'], props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual(['yellow', 'pink'], result)
+        self.assertEqual(['yellow', 'pink'], tran.resolved_translations['far'])
 
-    def test_resolve_rule_list_empty(self):
-        client_plugin, schema = self._test_resolve_rule(is_list=True)
-        data = {
-            'far': [],
-        }
+    def test_resolve_rule_ignore_error(self):
+        client_plugin, schema = self._test_resolve_rule(check_error=True)
+        data = {'far': 'one'}
         props = properties.Properties(schema, data)
-
         rule = translation.TranslationRule(
             props,
             translation.TranslationRule.RESOLVE,
-            ['far', 'red'],
+            ['far'],
             client_plugin=client_plugin,
-            finder='find_name_id'
-            )
-        rule.execute_rule()
-        self.assertEqual([], props.get('far'))
+            finder='find_name_id')
+
+        tran = translation.Translation(props)
+        tran.set_rules([rule], ignore_resolve_error=True)
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual('one', result)
+        self.assertEqual('one', tran.resolved_translations['far'])
 
     def test_resolve_rule_other(self):
         client_plugin, schema = self._test_resolve_rule()
@@ -595,14 +769,21 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id')
 
-        rule.execute_rule()
-        self.assertEqual('yellow', props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual('yellow', result)
+        self.assertEqual('yellow', tran.resolved_translations['far'])
 
     def test_resolve_rule_other_with_ref(self):
         client_plugin, schema = self._test_resolve_rule()
 
         class rsrc(object):
             action = INIT = "INIT"
+
+            def FnGetRefId(self):
+                return 'resource_id'
 
         class DummyStack(dict):
             pass
@@ -619,8 +800,11 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id')
 
-        rule.execute_rule()
-        self.assertEqual(data, props.data)
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual('yellow', result)
 
     def test_resolve_rule_other_with_function(self):
         client_plugin, schema = self._test_resolve_rule()
@@ -635,8 +819,12 @@ class TestTranslationRule(common.HeatTestCase):
             client_plugin=client_plugin,
             finder='find_name_id')
 
-        rule.execute_rule()
-        self.assertEqual(data, props.data)
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual('yellow', result)
+        self.assertEqual('yellow', tran.resolved_translations['far'])
 
     def test_resolve_rule_other_with_get_attr(self):
         client_plugin, schema = self._test_resolve_rule()
@@ -658,14 +846,14 @@ class TestTranslationRule(common.HeatTestCase):
             ['far'],
             client_plugin=client_plugin,
             finder='find_name_id')
-        rule.execute_rule(client_resolve=False)
-        self.assertEqual(data, props.data)
 
-        mock_getatt = self.patchobject(attr_func, 'result',
-                                       return_value='rose')
-        rule.execute_rule()
-        self.assertEqual('pink', props.get('far'))
-        self.assertEqual(1, mock_getatt.call_count)
+        tran = translation.Translation(props)
+        tran.set_rules([rule], client_resolve=False)
+        self.assertFalse(tran.store_translated_values)
+        self.assertFalse(tran.has_translation('far'))
+        result = tran.translate('far', 'no_check', data['far'])
+        self.assertEqual('no_check', result)
+        self.assertIsNone(tran.resolved_translations.get('far'))
 
     def test_resolve_rule_other_with_entity(self):
         client_plugin, schema = self._test_resolve_rule()
@@ -679,8 +867,12 @@ class TestTranslationRule(common.HeatTestCase):
             finder='find_name_id',
             entity='rose')
 
-        rule.execute_rule()
-        self.assertEqual('pink', props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', data['far'])
+        self.assertEqual('pink', result)
+        self.assertEqual('pink', tran.resolved_translations['far'])
 
     def test_property_json_param_correct_translation(self):
         """Test case when property with sub-schema takes json param."""
@@ -711,7 +903,7 @@ class TestTranslationRule(common.HeatTestCase):
                 '{"dar": "rad"}').value()}
         data = {'far': param}
 
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, data, resolver=function.resolve)
 
         rule = translation.TranslationRule(
             props,
@@ -719,9 +911,13 @@ class TestTranslationRule(common.HeatTestCase):
             ['far', 'bar'],
             value_path=['far', 'dar'])
 
-        rule.execute_rule()
-
-        self.assertEqual('rad', props.get('far').get('bar'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.bar'))
+        prop_data = props['far']
+        result = tran.translate('far.bar', prop_data['bar'], prop_data)
+        self.assertEqual('rad', result)
+        self.assertEqual('rad', tran.resolved_translations['far.bar'])
 
     def test_property_json_param_to_list_correct_translation(self):
         """Test case when list property with sub-schema takes json param."""
@@ -755,7 +951,7 @@ class TestTranslationRule(common.HeatTestCase):
                 '{"dar": "rad"}').value()}
         data = {'far': [param]}
 
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, data, resolver=function.resolve)
 
         rule = translation.TranslationRule(
             props,
@@ -763,9 +959,14 @@ class TestTranslationRule(common.HeatTestCase):
             ['far', 'bar'],
             value_name='dar')
 
-        rule.execute_rule()
-
-        self.assertEqual([{'dar': None, 'bar': 'rad'}], props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.0.bar'))
+        prop_data = props['far']
+        result = tran.translate('far.0.bar', prop_data[0]['bar'],
+                                prop_data[0])
+        self.assertEqual('rad', result)
+        self.assertEqual('rad', tran.resolved_translations['far.0.bar'])
 
     def test_property_commadelimitedlist_param_correct_translation(self):
         """Test when property with sub-schema takes comma_delimited_list."""
@@ -795,54 +996,21 @@ class TestTranslationRule(common.HeatTestCase):
                 "white,roses").value()}
         data = {'far': param, 'boo': 'chrysanthemums'}
 
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, data, resolver=function.resolve)
 
         rule = translation.TranslationRule(
             props,
             translation.TranslationRule.ADD,
             ['far'],
             [props.get('boo')])
-        rule.execute_rule()
 
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far'))
+        result = tran.translate('far', props['far'])
+        self.assertEqual(['white', 'roses', 'chrysanthemums'], result)
         self.assertEqual(['white', 'roses', 'chrysanthemums'],
-                         props.get('far'))
-
-    def test_property_no_translation_if_user_parameter_missing(self):
-        """Test translation in the case of missing parameter"""
-        schema = {
-            'source': properties.Schema(
-                properties.Schema.STRING
-            ),
-            'destination': properties.Schema(
-                properties.Schema.STRING
-            )}
-
-        class DummyStack(dict):
-            @property
-            def parameters(self):
-                return mock.Mock()
-
-        param = hot_funcs.GetParam(DummyStack(),
-                                   'get_param',
-                                   'source_param')
-
-        param.parameters = {}
-
-        data = {'source': param, 'destination': ''}
-        props = properties.Properties(schema, data,
-                                      resolver=function.resolve)
-
-        rule = translation.TranslationRule(
-            props,
-            translation.TranslationRule.REPLACE,
-            ['destination'],
-            value_path=['source'])
-
-        rule.execute_rule()
-
-        # ensure that translation rule was not applied
-        self.assertEqual({'source': param, 'destination': ''},
-                         data)
+                         tran.resolved_translations['far'])
 
     def test_list_list_add_translation_rule(self):
         schema = {
@@ -863,7 +1031,7 @@ class TestTranslationRule(common.HeatTestCase):
 
         data = {'far': [{'bar': ['shar'], 'car': 'man'}, {'car': 'first'}]}
 
-        props = properties.Properties(schema, data)
+        props = properties.Properties(schema, data, resolver=function.resolve)
 
         rule = translation.TranslationRule(
             props,
@@ -871,10 +1039,18 @@ class TestTranslationRule(common.HeatTestCase):
             ['far', 'bar'],
             value_name='car'
         )
-        rule.execute_rule()
 
-        self.assertIn({'bar': ['shar', 'man'], 'car': 'man'}, props.get('far'))
-        self.assertIn({'bar': ['first'], 'car': 'first'}, props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.0.bar'))
+        result = tran.translate('far.0.bar', props['far'][0]['bar'],
+                                props['far'][0])
+        self.assertEqual(['shar', 'man'], result)
+        self.assertEqual(['shar', 'man'],
+                         tran.resolved_translations['far.0.bar'])
+        result = tran.translate('far.1.bar', prop_data=props['far'][1])
+        self.assertEqual(['first'], result)
+        self.assertEqual(['first'], tran.resolved_translations['far.1.bar'])
 
     def test_replace_rule_map_with_custom_value_path(self):
         schema = {
@@ -903,10 +1079,13 @@ class TestTranslationRule(common.HeatTestCase):
             value_path=['bar'],
             custom_value_path=['red']
         )
-        rule.execute_rule()
 
-        self.assertEqual({'red': 'dak'}, props.get('far'))
-        self.assertEqual({}, props.get('bar'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.red'))
+        result = tran.translate('far.red')
+        self.assertEqual('dak', result)
+        self.assertEqual('dak', tran.resolved_translations['far.red'])
 
     def test_replace_rule_list_with_custom_value_path(self):
         schema = {
@@ -938,11 +1117,13 @@ class TestTranslationRule(common.HeatTestCase):
             value_name='blue',
             custom_value_path=['black', 'white']
         )
-        rule.execute_rule()
 
-        self.assertEqual([{'red': 'daisy', 'blue': {'black': {}}},
-                          {'blue': None, 'red': 'roses'}],
-                         props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.0.red'))
+        result = tran.translate('far.0.red', prop_data=data['far'][0])
+        self.assertEqual('daisy', result)
+        self.assertEqual('daisy', tran.resolved_translations['far.0.red'])
 
     def test_add_rule_list_with_custom_value_path(self):
         schema = {
@@ -975,58 +1156,86 @@ class TestTranslationRule(common.HeatTestCase):
             value_name='blue',
             custom_value_path=['black', 'check']
         )
-        rule.execute_rule()
 
-        self.assertEqual([{'red': ['one'],
-                           'blue': {'black': {'white': 'daisy',
-                                              'check': ['one']}}},
-                          {'blue': None, 'red': ['roses']}],
-                         props.get('far'))
+        tran = translation.Translation(props)
+        tran.set_rules([rule])
+        self.assertTrue(tran.has_translation('far.0.red'))
+        result = tran.translate('far.0.red', data['far'][0].get('red'),
+                                data['far'][0])
+        self.assertEqual(['one'], result)
+        self.assertEqual(['one'], tran.resolved_translations['far.0.red'])
+        self.assertEqual(['roses'], tran.translate('far.1.red',
+                                                   data['far'][1]['red'],
+                                                   data['far'][1]))
 
-        # check whether if data will contain list-type property to add
-        data = {
-            'far': [{'red': ['roses'], 'blue': {'black': {'check': ['two']}}}]}
-        props = properties.Properties(schema, data)
-        rule.properties = props
-        rule.execute_rule()
-        self.assertEqual([{'red': ['roses', 'two'],
-                           'blue': {'black': {'check': ['two']}}}],
-                         props.get('far'))
+    def test_set_rules_none(self):
+        tran = translation.Translation()
+        self.assertEqual({}, tran._rules)
 
-    def test_list_list_error_translation_rule(self):
-        schema = {
-            'far': properties.Schema(
-                properties.Schema.LIST,
-                schema=properties.Schema(
-                    properties.Schema.MAP,
-                    schema={
-                        'car': properties.Schema(properties.Schema.STRING),
-                        'dar': properties.Schema(properties.Schema.STRING),
-                    }
-                )
-            ),
-            'bar': properties.Schema(
-                properties.Schema.LIST,
-                schema=properties.Schema(
-                    properties.Schema.MAP,
-                    schema={
-                        'car': properties.Schema(properties.Schema.STRING),
-                        'dar': properties.Schema(properties.Schema.STRING),
-                    }
-                )
-            ),
-        }
+    def test_set_no_resolve_rules(self):
+        rules = [
+            translation.TranslationRule(
+                self.props,
+                translation.TranslationRule.RESOLVE,
+                ['a'],
+                client_plugin=mock.ANY,
+                finder='finder'
+            )
+        ]
 
-        data = {'far': [{'car': 'man'}], 'bar': [{'dar': 'check'}]}
+        tran = translation.Translation()
+        tran.set_rules(rules, client_resolve=False)
+        self.assertEqual({}, tran._rules)
 
-        props = properties.Properties(schema, data)
+    def test_translate_add(self):
+        rules = [
+            translation.TranslationRule(
+                self.props,
+                translation.TranslationRule.ADD,
+                ['a', 'b'],
+                value=['check']
+            )
+        ]
 
-        rule = translation.TranslationRule(
-            props,
-            translation.TranslationRule.REPLACE,
-            ['far'],
-            value_path=['bar', 'car']
-        )
-        ex = self.assertRaises(ValueError, rule.execute_rule)
-        self.assertEqual('Cannot use value_path for properties inside '
-                         'list-type properties', six.text_type(ex))
+        tran = translation.Translation()
+        tran.set_rules(rules)
+
+        result = tran.translate('a.b', ['test'])
+        self.assertEqual(['test', 'check'], result)
+        self.assertEqual(['test', 'check'], tran.resolved_translations['a.b'])
+
+        # Test without storing
+        tran.resolved_translations = {}
+        tran.store_translated_values = False
+        result = tran.translate('a.b', ['test'])
+        self.assertEqual(['test', 'check'], result)
+        self.assertEqual({}, tran.resolved_translations)
+        tran.store_translated_values = True
+
+        # Test no prop_value
+        self.assertEqual(['check'], tran.translate('a.b', None))
+
+        # Check digits in path skipped for rule
+        self.assertEqual(['test', 'check'], tran.translate('a.0.b', ['test']))
+
+    def test_translate_delete(self):
+        rules = [
+            translation.TranslationRule(
+                self.props,
+                translation.TranslationRule.DELETE,
+                ['a']
+            )
+        ]
+
+        tran = translation.Translation()
+        tran.set_rules(rules)
+
+        self.assertIsNone(tran.translate('a'))
+        self.assertIsNone(tran.resolved_translations['a'])
+
+        # Test without storing
+        tran.resolved_translations = {}
+        tran.store_translated_values = False
+        self.assertIsNone(tran.translate('a'))
+        self.assertEqual({}, tran.resolved_translations)
+        tran.store_translated_values = True

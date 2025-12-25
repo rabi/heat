@@ -15,9 +15,9 @@
 #    under the License.
 
 
+from unittest import mock
+
 import fixtures
-import mock
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -39,12 +39,23 @@ class TestHeatException(common.HeatTestCase):
     def test_format_string_error_message(self):
         message = "This format %(message)s should work"
         err = exception.Error(message)
-        self.assertEqual(message, six.text_type(err))
+        self.assertEqual(message, str(err))
 
 
 class TestStackValidationFailed(common.HeatTestCase):
 
     scenarios = [
+        ('test_error_as_exception', dict(
+            kwargs=dict(
+                error=exception.StackValidationFailed(
+                    error='Error',
+                    path=['some', 'path'],
+                    message='Some message')),
+            expected='Error: some.path: Some message',
+            called_error='Error',
+            called_path=['some', 'path'],
+            called_msg='Some message'
+        )),
         ('test_full_exception', dict(
             kwargs=dict(
                 error='Error',
@@ -124,8 +135,8 @@ class TestStackValidationFailed(common.HeatTestCase):
         try:
             raise exception.StackValidationFailed(**self.kwargs)
         except exception.StackValidationFailed as ex:
-            self.assertEqual(self.expected, six.text_type(ex))
-            self.assertEqual(self.called_error, ex.error)
+            self.assertIn(self.expected, str(ex))
+            self.assertIn(self.called_error, ex.error)
             self.assertEqual(self.called_path, ex.path)
             self.assertEqual(self.called_msg, ex.error_message)
 

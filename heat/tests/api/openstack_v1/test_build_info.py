@@ -11,8 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
 
 import heat.api.middleware.fault as fault
 import heat.api.openstack.v1.build_info as build_info
@@ -72,4 +71,4 @@ class BuildInfoControllerTest(tools.ControllerTest, common.HeatTestCase):
             self.controller.build_info,
             req, tenant_id=self.tenant)
         self.assertEqual(403, resp.status_int)
-        self.assertIn('403 Forbidden', six.text_type(resp))
+        self.assertIn('403 Forbidden', str(resp))

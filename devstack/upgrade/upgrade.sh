@@ -58,6 +58,7 @@ source $TARGET_DEVSTACK_DIR/stackrc
 source $TARGET_DEVSTACK_DIR/lib/tls
 source $TARGET_DEVSTACK_DIR/lib/stack
 source $TARGET_DEVSTACK_DIR/lib/apache
+source $TARGET_DEVSTACK_DIR/lib/rpc_backend
 
 # Get heat functions from devstack plugin
 source $HEAT_DEVSTACK_DIR/lib/heat
@@ -72,20 +73,26 @@ set -o xtrace
 # Install the target heat
 source $HEAT_DEVSTACK_DIR/plugin.sh stack install
 
+# Change transport-url in the host which runs upgrade script (primary)
+if [[ "${HOST_TOPOLOGY}" == "multinode" ]]; then
+    vhost="newvhost"
+    rpc_backend_add_vhost $vhost
+    iniset_rpc_backend heat $HEAT_CONF DEFAULT $vhost
+fi
+
 # calls upgrade-heat for specific release
 upgrade_project heat $RUN_DIR $BASE_DEVSTACK_BRANCH $TARGET_DEVSTACK_BRANCH
 
 # Simulate init_heat()
-create_heat_cache_dir
-
-HEAT_BIN_DIR=$(dirname $(which heat-manage))
+HEAT_BIN_DIR=$(get_python_exec_prefix)
 $HEAT_BIN_DIR/heat-manage --config-file $HEAT_CONF db_sync || die $LINENO "DB sync error"
 
 # Start Heat
-start_heat_with_plugin
+start_heat
 
 # Don't succeed unless the services come up
-ensure_services_started heat-api heat-engine heat-api-cloudwatch heat-api-cfn
+# Truncating some service names to 11 characters
+ensure_services_started heat-api heat-engine h-api-cfn
 
 set +o xtrace
 echo "*********************************************************************"

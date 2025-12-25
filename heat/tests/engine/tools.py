@@ -10,24 +10,21 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import sys
-
-import mox
-import six
+import functools
 
 from heat.common import template_format
 from heat.engine.clients.os import glance
 from heat.engine.clients.os import keystone
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.engine.clients.os import nova
 from heat.engine import environment
 from heat.engine.resources.aws.ec2 import instance as instances
 from heat.engine import stack as parser
 from heat.engine import template as templatem
-from heat.tests import fakes as test_fakes
 from heat.tests.openstack.nova import fakes as fakes_nova
 from heat.tests import utils
 
-wp_template = u'''
+wp_template = '''
 heat_template_version: 2014-10-16
 description: WordPress
 parameters:
@@ -151,7 +148,7 @@ resources:
 
 
 def get_stack(stack_name, ctx, template=None, with_params=True,
-              convergence=False):
+              convergence=False, **kwargs):
     if template is None:
         t = template_format.parse(wp_template)
         if with_params:
@@ -162,52 +159,45 @@ def get_stack(stack_name, ctx, template=None, with_params=True,
     else:
         t = template_format.parse(template)
         tmpl = templatem.Template(t)
-    stack = parser.Stack(ctx, stack_name, tmpl, convergence=convergence)
+    stack = parser.Stack(ctx, stack_name, tmpl, convergence=convergence,
+                         **kwargs)
+    stack.thread_group_mgr = DummyThreadGroupManager()
     return stack
 
 
-def setup_keystone_mocks(mocks, stack):
-    fkc = test_fakes.FakeKeystoneClient()
+def setup_keystone_mocks_with_mock(test_case, stack):
+    fkc = fake_ks.FakeKeystoneClient()
 
-    mocks.StubOutWithMock(keystone.KeystoneClientPlugin, '_create')
-    keystone.KeystoneClientPlugin._create().AndReturn(fkc)
-
-
-def setup_mock_for_image_constraint(mocks, imageId_input,
-                                    imageId_output=744):
-    mocks.StubOutWithMock(glance.GlanceClientPlugin,
-                          'find_image_by_name_or_id')
-    glance.GlanceClientPlugin.find_image_by_name_or_id(
-        imageId_input).MultipleTimes().AndReturn(imageId_output)
+    test_case.patchobject(keystone.KeystoneClientPlugin, '_create')
+    keystone.KeystoneClientPlugin._create.return_value = fkc
 
 
-def setup_mocks(mocks, stack, mock_image_constraint=True,
-                mock_keystone=True):
-    fc = fakes_nova.FakeClient()
-    mocks.StubOutWithMock(instances.Instance, 'client')
-    instances.Instance.client().MultipleTimes().AndReturn(fc)
-    mocks.StubOutWithMock(nova.NovaClientPlugin, '_create')
-    nova.NovaClientPlugin._create().AndReturn(fc)
+def setup_mock_for_image_constraint_with_mock(test_case, imageId_input,
+                                              imageId_output=744):
+    test_case.patchobject(glance.GlanceClientPlugin,
+                          'find_image_by_name_or_id',
+                          return_value=imageId_output)
+
+
+def validate_setup_mocks_with_mock(stack, fc, mock_image_constraint=True,
+                                   validate_create=True):
     instance = stack['WebServer']
     metadata = instance.metadata_get()
     if mock_image_constraint:
-        setup_mock_for_image_constraint(mocks,
-                                        instance.properties['ImageId'])
-
-    if mock_keystone:
-        setup_keystone_mocks(mocks, stack)
+        m_image = glance.GlanceClientPlugin.find_image_by_name_or_id
+        m_image.assert_called_with(
+            instance.properties['ImageId'])
 
     user_data = instance.properties['UserData']
     server_userdata = instance.client_plugin().build_userdata(
         metadata, user_data, 'ec2-user')
-    mocks.StubOutWithMock(nova.NovaClientPlugin, 'build_userdata')
-    nova.NovaClientPlugin.build_userdata(
-        metadata,
-        user_data,
-        'ec2-user').AndReturn(server_userdata)
+    nova.NovaClientPlugin.build_userdata.assert_called_with(
+        metadata, user_data, 'ec2-user')
 
-    mocks.StubOutWithMock(fc.servers, 'create')
-    fc.servers.create(
+    if not validate_create:
+        return
+
+    fc.servers.create.assert_called_once_with(
         image=744,
         flavor=3,
         key_name='test',
@@ -218,36 +208,54 @@ def setup_mocks(mocks, stack, mock_image_constraint=True,
         meta=None,
         nics=None,
         availability_zone=None,
-        block_device_mapping=None).AndReturn(fc.servers.list()[4])
+        block_device_mapping=None)
+
+
+def setup_mocks_with_mock(testcase, stack, mock_image_constraint=True,
+                          mock_keystone=True):
+    fc = fakes_nova.FakeClient()
+    testcase.patchobject(instances.Instance, 'client', return_value=fc)
+    testcase.patchobject(nova.NovaClientPlugin, 'client', return_value=fc)
+    instance = stack['WebServer']
+    metadata = instance.metadata_get()
+    if mock_image_constraint:
+        setup_mock_for_image_constraint_with_mock(
+            testcase, instance.properties['ImageId'])
+
+    if mock_keystone:
+        setup_keystone_mocks_with_mock(testcase, stack)
+
+    user_data = instance.properties['UserData']
+    server_userdata = instance.client_plugin().build_userdata(
+        metadata, user_data, 'ec2-user')
+    testcase.patchobject(nova.NovaClientPlugin, 'build_userdata',
+                         return_value=server_userdata)
+
+    testcase.patchobject(fc.servers, 'create')
+
+    fc.servers.create.return_value = fc.servers.list()[4]
     return fc
 
 
-def setup_stack(stack_name, ctx, create_res=True, convergence=False):
+def setup_stack_with_mock(test_case, stack_name, ctx, create_res=True,
+                          convergence=False):
     stack = get_stack(stack_name, ctx, convergence=convergence)
     stack.store()
     if create_res:
-        m = mox.Mox()
-        setup_mocks(m, stack)
-        m.ReplayAll()
+        fc = setup_mocks_with_mock(test_case, stack)
         stack.create()
         stack._persist_state()
-        m.UnsetStubs()
+        validate_setup_mocks_with_mock(stack, fc)
     return stack
 
 
-def clean_up_stack(stack, delete_res=True):
+def clean_up_stack(test_case, stack, delete_res=True):
     if delete_res:
-        m = mox.Mox()
         fc = fakes_nova.FakeClient()
-        m.StubOutWithMock(instances.Instance, 'client')
-        instances.Instance.client().MultipleTimes().AndReturn(fc)
-        m.StubOutWithMock(fc.servers, 'delete')
-        fc.servers.delete(mox.IgnoreArg()).AndRaise(
-            fakes_nova.fake_exception())
-        m.ReplayAll()
+        test_case.patchobject(instances.Instance, 'client', return_value=fc)
+        test_case.patchobject(fc.servers, 'delete',
+                              side_effect=fakes_nova.fake_exception())
     stack.delete()
-    if delete_res:
-        m.UnsetStubs()
 
 
 def stack_context(stack_name, create_res=True, convergence=False):
@@ -258,29 +266,28 @@ def stack_context(stack_name, create_res=True, convergence=False):
     of test success/failure.
     """
     def stack_delete(test_fn):
-        @six.wraps(test_fn)
+        @functools.wraps(test_fn)
         def wrapped_test(test_case, *args, **kwargs):
             def create_stack():
                 ctx = getattr(test_case, 'ctx', None)
                 if ctx is not None:
-                    stack = setup_stack(stack_name, ctx,
-                                        create_res, convergence)
+                    stack = setup_stack_with_mock(test_case, stack_name, ctx,
+                                                  create_res, convergence)
                     setattr(test_case, 'stack', stack)
 
             def delete_stack():
                 stack = getattr(test_case, 'stack', None)
                 if stack is not None and stack.id is not None:
-                    clean_up_stack(stack, delete_res=create_res)
+                    clean_up_stack(test_case, stack, delete_res=create_res)
 
             create_stack()
             try:
                 test_fn(test_case, *args, **kwargs)
-            except Exception:
-                exc_class, exc_val, exc_tb = sys.exc_info()
+            except Exception as err:
                 try:
                     delete_stack()
                 finally:
-                    six.reraise(exc_class, exc_val, exc_tb)
+                    raise err from None
             else:
                 delete_stack()
 
@@ -316,11 +323,19 @@ class DummyThreadGroup(object):
     def wait(self):
         pass
 
+    def stopall(self):
+        pass
+
 
 class DummyThreadGroupManager(object):
     def __init__(self):
         self.msg_queues = []
         self.messages = []
+
+    def start(self, stack, func, *args, **kwargs):
+        # Just run the function, so we know it's completed in the test
+        func(*args, **kwargs)
+        return DummyThread()
 
     def start_with_lock(self, cnxt, stack, engine_id, func, *args, **kwargs):
         # Just run the function, so we know it's completed in the test

@@ -11,47 +11,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+# SQLAlchemy helper functions
 
-class LazyPluggable(object):
-    """A pluggable backend loaded lazily based on some value."""
-
-    def __init__(self, pivot, **backends):
-        self.__backends = backends
-        self.__pivot = pivot
-        self.__backend = None
-
-    def __get_backend(self):
-        if not self.__backend:
-            backend_name = 'sqlalchemy'
-            backend = self.__backends[backend_name]
-            if isinstance(backend, tuple):
-                name = backend[0]
-                fromlist = backend[1]
-            else:
-                name = backend
-                fromlist = backend
-
-            self.__backend = __import__(name, None, None, fromlist)
-        return self.__backend
-
-    def __getattr__(self, key):
-        backend = self.__get_backend()
-        return getattr(backend, key)
+from sqlalchemy.orm import exc
+import tenacity
 
 
-IMPL = LazyPluggable('backend',
-                     sqlalchemy='heat.db.sqlalchemy.api')
-
-
-def purge_deleted(age, granularity='days', project_id=None):
-    IMPL.purge_deleted(age, granularity, project_id)
-
-
-def encrypt_parameters_and_properties(ctxt, encryption_key, verbose):
-    IMPL.db_encrypt_parameters_and_properties(ctxt, encryption_key,
-                                              verbose=verbose)
-
-
-def decrypt_parameters_and_properties(ctxt, encryption_key, verbose):
-    IMPL.db_decrypt_parameters_and_properties(ctxt, encryption_key,
-                                              verbose=verbose)
+def retry_on_stale_data_error(func):
+    wrapper = tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        retry=tenacity.retry_if_exception_type(exc.StaleDataError),
+        reraise=True)
+    return wrapper(func)

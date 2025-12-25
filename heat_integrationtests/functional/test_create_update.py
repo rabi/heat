@@ -14,10 +14,11 @@
 import copy
 import json
 
+from heat_integrationtests.common import test
 from heat_integrationtests.functional import functional_base
 
 test_template_one_resource = {
-    'heat_template_version': '2013-05-23',
+    'heat_template_version': 'pike',
     'description': 'Test template to create one instance.',
     'resources': {
         'test1': {
@@ -36,7 +37,7 @@ test_template_one_resource = {
 }
 
 test_template_two_resource = {
-    'heat_template_version': '2013-05-23',
+    'heat_template_version': 'pike',
     'description': 'Test template to create two instance.',
     'resources': {
         'test1': {
@@ -61,22 +62,60 @@ test_template_two_resource = {
     }
 }
 
+test_template_updatae_flavor_and_volume_size = '''
+
+heat_template_version: 2013-05-23
+
+parameters:
+  volume_size:
+    default: 10
+    type: number
+  flavor:
+    type: string
+  network:
+    type: string
+  image:
+    type: string
+
+resources:
+  my_instance:
+    type: OS::Nova::Server
+    # BUG We add dependency to avoid bug in story/2008936.
+    # And should remove this after bug fixed.
+    depends_on: data_volume
+    properties:
+      image:  {get_param: image}
+      flavor: {get_param: flavor}
+      admin_pass: 1
+      networks:
+        - network: {get_param: network}
+  data_volume_attachment:
+    depends_on: my_instance
+    type: 'OS::Cinder::VolumeAttachment'
+    properties:
+      instance_uuid:
+        get_resource: my_instance
+      volume_id:
+        get_resource: data_volume
+  data_volume:
+    type: 'OS::Cinder::Volume'
+    properties:
+      name: myvolume
+      size: {get_param: volume_size}
+'''
+
 
 def _change_rsrc_properties(template, rsrcs, values):
-        modified_template = copy.deepcopy(template)
-        for rsrc_name in rsrcs:
-            rsrc_prop = modified_template['resources'][
-                rsrc_name]['properties']
-            for prop in rsrc_prop:
-                if prop in values:
-                    rsrc_prop[prop] = values[prop]
-        return modified_template
+    modified_template = copy.deepcopy(template)
+    for rsrc_name in rsrcs:
+        rsrc_prop = modified_template['resources'][
+            rsrc_name]['properties']
+        for prop, new_val in values.items():
+            rsrc_prop[prop] = new_val
+    return modified_template
 
 
 class CreateStackTest(functional_base.FunctionalTestsBase):
-    def setUp(self):
-        super(CreateStackTest, self).setUp()
-
     def test_create_rollback(self):
         values = {'fail': True, 'value': 'test_create_rollback'}
         template = _change_rsrc_properties(test_template_one_resource,
@@ -153,9 +192,6 @@ resources:
       wait_secs: 1
 '''
 
-    def setUp(self):
-        super(UpdateStackTest, self).setUp()
-
     def test_stack_update_nochange(self):
         template = _change_rsrc_properties(test_template_one_resource,
                                            ['test1'],
@@ -170,6 +206,26 @@ resources:
         self.update_stack(stack_identifier, template)
         self.assertEqual(expected_resources,
                          self.list_resources(stack_identifier))
+
+    def test_stack_update_flavor_volume(self):
+
+        parms = {'flavor': self.conf.minimal_instance_type,
+                 'volume_size': 10,
+                 'image': self.conf.minimal_image_ref,
+                 'network': self.conf.fixed_network_name}
+
+        stack_identifier = self.stack_create(
+            template=test_template_updatae_flavor_and_volume_size,
+            parameters=parms
+        )
+
+        parms_updated = parms
+        parms_updated['volume_size'] = 20
+        parms_updated['flavor'] = self.conf.instance_type
+        self.update_stack(
+            stack_identifier,
+            template=test_template_updatae_flavor_and_volume_size,
+            parameters=parms_updated)
 
     def test_stack_in_place_update(self):
         template = _change_rsrc_properties(test_template_one_resource,
@@ -284,6 +340,31 @@ resources:
                              'test2': 'OS::Heat::TestResource'}
         self.assertEqual(updated_resources,
                          self.list_resources(stack_identifier))
+
+    @test.requires_convergence
+    def test_stack_update_replace_manual_rollback(self):
+        template = _change_rsrc_properties(test_template_one_resource,
+                                           ['test1'],
+                                           {'update_replace_value': '1'})
+        stack_identifier = self.stack_create(template=template)
+        original_resource_id = self.get_physical_resource_id(stack_identifier,
+                                                             'test1')
+
+        tmpl_update = _change_rsrc_properties(test_template_one_resource,
+                                              ['test1'],
+                                              {'update_replace_value': '2',
+                                               'fail': True})
+        # Update with bad template, we should fail
+        self.update_stack(stack_identifier, tmpl_update,
+                          expected_status='UPDATE_FAILED',
+                          disable_rollback=True)
+        # Manually roll back to previous template
+        self.update_stack(stack_identifier, template)
+        final_resource_id = self.get_physical_resource_id(stack_identifier,
+                                                          'test1')
+        # Original resource was good, and replacement was never created, so it
+        # should be kept.
+        self.assertEqual(original_resource_id, final_resource_id)
 
     def test_stack_update_provider(self):
         template = _change_rsrc_properties(
@@ -419,7 +500,7 @@ resources:
 
         # Parent resources should be unchanged and the nested stack
         # should have been updated in-place without replacement
-        self.assertEqual({u'test1': u'My::TestResource2'},
+        self.assertEqual({'test1': 'My::TestResource2'},
                          self.list_resources(stack_identifier))
         rsrc = self.client.resources.get(stack_identifier, 'test1')
         self.assertEqual(rsrc.physical_resource_id, nested_id)
@@ -470,7 +551,7 @@ resources:
             provider_stack = self.client.stacks.get(rsrc.physical_resource_id)
             provider_identifier = '%s/%s' % (provider_stack.stack_name,
                                              provider_stack.id)
-            provider_resources = {u'test1': u'OS::Heat::TestResource'}
+            provider_resources = {'test1': 'OS::Heat::TestResource'}
             self.assertEqual(provider_resources,
                              self.list_resources(provider_identifier))
 
@@ -597,7 +678,7 @@ resources:
         self.update_stack(stack_identifier,
                           parameters={'do_fail': False},
                           existing=True)
-        self.assertEqual({u'aresource': u'OS::Heat::TestResource'},
+        self.assertEqual({'aresource': 'OS::Heat::TestResource'},
                          self.list_resources(stack_identifier))
 
     def test_stack_update_with_new_env(self):
@@ -625,9 +706,183 @@ resources:
         # Fixing the template should fix the stack
         template = _change_rsrc_properties(template,
                                            ['test1'], {'fail': False})
+        template['resources']['test2'][
+            'properties'] = {'action_wait_secs': {'update': 1}}
         self.update_stack(stack_identifier,
                           template=template,
                           environment=env)
         self.assertEqual({'test1': 'OS::Heat::TestResource',
                           'test2': 'My::TestResource'},
                          self.list_resources(stack_identifier))
+
+    def test_stack_update_with_new_version(self):
+        """Update handles new template version in failure.
+
+        If a stack update fails while changing the template version, update is
+        able to handle the new version fine.
+        """
+        stack_identifier = self.stack_create(
+            template=test_template_one_resource)
+
+        # Update with a new function and make the update fails
+        template = _change_rsrc_properties(test_template_two_resource,
+                                           ['test1'], {'fail': True})
+
+        template['heat_template_version'] = '2015-10-15'
+        template['resources']['test2']['properties']['value'] = {
+            'list_join': [',', ['a'], ['b']]}
+        self.update_stack(stack_identifier,
+                          template=template,
+                          expected_status='UPDATE_FAILED')
+
+        template = _change_rsrc_properties(template,
+                                           ['test2'], {'value': 'Test2'})
+        template['resources']['test1'][
+            'properties']['action_wait_secs'] = {'create': 1}
+        self.update_stack(stack_identifier,
+                          template=template,
+                          expected_status='UPDATE_FAILED')
+        self._stack_delete(stack_identifier)
+
+    def test_stack_update_with_old_version(self):
+        """Update handles old template version in failure.
+
+        If a stack update fails while changing the template version, update is
+        able to handle the old version fine.
+        """
+        template = _change_rsrc_properties(
+            test_template_one_resource,
+            ['test1'], {'value': {'list_join': [',', ['a'], ['b']]}})
+        template['heat_template_version'] = '2015-10-15'
+        stack_identifier = self.stack_create(
+            template=template)
+
+        # Update with a new function and make the update fails
+        template = _change_rsrc_properties(test_template_one_resource,
+                                           ['test1'], {'fail': True})
+        self.update_stack(stack_identifier,
+                          template=template,
+                          expected_status='UPDATE_FAILED')
+        self._stack_delete(stack_identifier)
+
+    def _test_conditional(self, test3_resource):
+        """Update manages new conditions added.
+
+        When a new resource is added during updates, the stacks handles the new
+        conditions correctly, and doesn't fail to load them while the update is
+        still in progress.
+        """
+        stack_identifier = self.stack_create(
+            template=test_template_one_resource)
+
+        updated_template = copy.deepcopy(test_template_two_resource)
+        updated_template['conditions'] = {'cond1': True}
+        updated_template['resources']['test3'] = test3_resource
+        test2_props = updated_template['resources']['test2']['properties']
+        test2_props['action_wait_secs'] = {'create': 30}
+
+        self.update_stack(stack_identifier,
+                          template=updated_template,
+                          expected_status='UPDATE_IN_PROGRESS')
+
+        def check_resources():
+            def is_complete(r):
+                return r.resource_status in {'CREATE_COMPLETE',
+                                             'UPDATE_COMPLETE'}
+
+            resources = self.list_resources(stack_identifier, is_complete)
+            if len(resources) < 2:
+                return False
+            self.assertIn('test3', resources)
+            return True
+
+        self.assertTrue(test.call_until_true(20, 2, check_resources))
+
+    def test_stack_update_with_if_conditions(self):
+        test3 = {
+            'type': 'OS::Heat::TestResource',
+            'properties': {
+                'value': {'if': ['cond1', 'val3', 'val4']}
+            }
+        }
+        self._test_conditional(test3)
+
+    def test_stack_update_with_conditions(self):
+        test3 = {
+            'type': 'OS::Heat::TestResource',
+            'condition': 'cond1',
+            'properties': {
+                'value': 'foo',
+            }
+        }
+        self._test_conditional(test3)
+
+    def test_inplace_update_old_ref_deleted_failed_stack(self):
+        template = '''
+heat_template_version: rocky
+resources:
+  test1:
+    type: OS::Heat::TestResource
+    properties:
+      value: test
+  test2:
+    type: OS::Heat::TestResource
+    properties:
+      value: {get_attr: [test1, output]}
+  test3:
+    type: OS::Heat::TestResource
+    properties:
+      value: test3
+      fail: false
+      action_wait_secs:
+        update: 5
+'''
+        stack_identifier = self.stack_create(
+            template=template)
+
+        _template = template.replace('test1:',
+                                     'test-1:').replace('fail: false',
+                                                        'fail: true')
+        updated_template = _template.replace(
+            '{get_attr: [test1',
+            '{get_attr: [test-1').replace('value: test3',
+                                          'value: test-3')
+        self.update_stack(stack_identifier,
+                          template=updated_template,
+                          expected_status='UPDATE_FAILED')
+        self.update_stack(stack_identifier, template=template,
+                          expected_status='UPDATE_COMPLETE')
+
+    @test.requires_convergence
+    def test_update_failed_changed_env_list_resources(self):
+        template = {
+            'heat_template_version': 'rocky',
+            'resources': {
+                'test1': {
+                    'type': 'OS::Heat::TestResource',
+                    'properties': {
+                        'value': 'foo'
+                    }
+                },
+                'my_res': {
+                    'type': 'My::TestResource',
+                    'depends_on': 'test1'
+                },
+                'test2': {
+                    'depends_on': 'my_res',
+                    'type': 'OS::Heat::TestResource'
+                }
+            }
+        }
+        env = {'resource_registry':
+               {'My::TestResource': 'OS::Heat::TestResource'}}
+        stack_identifier = self.stack_create(
+            template=template, environment=env)
+        update_template = copy.deepcopy(template)
+        update_template['resources']['test1']['properties']['fail'] = 'true'
+        update_template['resources']['test2']['depends_on'] = 'test1'
+        del update_template['resources']['my_res']
+        self.update_stack(stack_identifier,
+                          template=update_template,
+                          expected_status='UPDATE_FAILED')
+        self.assertEqual(3, len(self.list_resources(stack_identifier)))

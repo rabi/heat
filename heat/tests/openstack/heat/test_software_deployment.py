@@ -11,12 +11,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
 import copy
 import re
+from unittest import mock
 import uuid
-
-import mock
-import six
 
 from oslo_serialization import jsonutils
 
@@ -26,6 +25,7 @@ from heat.common import template_format
 from heat.engine.clients.os import nova
 from heat.engine.clients.os import swift
 from heat.engine.clients.os import zaqar
+from heat.engine import node_data
 from heat.engine import resource
 from heat.engine.resources.openstack.heat import software_deployment as sd
 from heat.engine import rsrc_defn
@@ -136,6 +136,21 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         }
     }
 
+    template_update_only = {
+        'HeatTemplateFormatVersion': '2012-12-12',
+        'Resources': {
+            'deployment_mysql': {
+                'Type': 'OS::Heat::SoftwareDeployment',
+                'Properties': {
+                    'server': '9f1f0e00-05d2-4ca5-8602-95021f19c9d0',
+                    'config': '48e8ade1-9196-42d5-89a2-f709fde42632',
+                    'input_values': {'foo': 'bar'},
+                    'actions': ['UPDATE'],
+                }
+            }
+        }
+    }
+
     template_no_config = {
         'HeatTemplateFormatVersion': '2012-12-12',
         'Resources': {
@@ -184,9 +199,17 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         get_ec2_signed_url.return_value = 'http://192.0.2.2/signed_url'
 
         self.deployment = self.stack['deployment_mysql']
-
         self.rpc_client = mock.MagicMock()
         self.deployment._rpc_client = self.rpc_client
+
+        @contextlib.contextmanager
+        def exc_filter(*args):
+            try:
+                yield
+            except exc.NotFound:
+                pass
+
+        self.rpc_client.ignore_error_by_name.side_effect = exc_filter
 
     def test_validate(self):
         template = dict(self.template_with_server)
@@ -205,7 +228,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         err = self.assertRaises(exc.StackValidationFailed, deployment.validate)
         self.assertEqual("Property error: "
                          "Resources.deployment_mysql.Properties: "
-                         "Property server not assigned", six.text_type(err))
+                         "Property server not assigned", str(err))
 
     def test_validate_failed(self):
         template = dict(self.template_with_server)
@@ -217,7 +240,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         self.assertEqual("Resource server's property "
                          "user_data_format should be set to "
                          "SOFTWARE_CONFIG since there are "
-                         "software deployments on it.", six.text_type(err))
+                         "software deployments on it.", str(err))
 
     def mock_software_config(self):
         config = {
@@ -657,7 +680,30 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         err = self.assertRaises(
             exc.Error, self.deployment.check_create_complete, mock_sd)
         self.assertEqual(
-            'Deployment to server failed: something wrong', six.text_type(err))
+            'Deployment to server failed: something wrong', str(err))
+
+    def test_handle_create_cancel(self):
+        self._create_stack(self.template)
+        mock_sd = self.mock_deployment()
+        self.rpc_client.show_software_deployment.return_value = mock_sd
+        self.deployment.resource_id = 'c8a19429-7fde-47ea-a42f-40045488226c'
+
+        # status in_progress
+        mock_sd['status'] = self.deployment.IN_PROGRESS
+        self.deployment.handle_create_cancel(None)
+        self.assertEqual(
+            'FAILED',
+            self.rpc_client.update_software_deployment.call_args[1]['status'])
+
+        # status failed
+        mock_sd['status'] = self.deployment.FAILED
+        self.deployment.handle_create_cancel(None)
+
+        # deployment not created
+        mock_sd = None
+        self.deployment.handle_create_cancel(None)
+        self.assertEqual(1,
+                         self.rpc_client.update_software_deployment.call_count)
 
     def test_handle_delete(self):
         self._create_stack(self.template)
@@ -809,7 +855,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
             'config_id': '9966c8e7-bc9c-42de-aa7d-f2447a952cb2',
             'input_values': {'foo': 'bar'},
             'status': 'IN_PROGRESS',
-            'status_reason': u'Deploy data available'},
+            'status_reason': 'Deploy data available'},
             self.rpc_client.update_software_deployment.call_args[1])
 
     def test_handle_update_no_replace_on_change(self):
@@ -837,7 +883,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
             'config_id': '9966c8e7-bc9c-42de-aa7d-f2447a952cb2',
             'input_values': {'trigger_replace': 'default_value'},
             'status': 'IN_PROGRESS',
-            'status_reason': u'Deploy data available'},
+            'status_reason': 'Deploy data available'},
             self.rpc_client.update_software_deployment.call_args[1])
 
         self.assertEqual([
@@ -880,6 +926,19 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         self.assertRaises(resource.UpdateReplace,
                           self.deployment.handle_update,
                           snippet, None, prop_diff)
+
+    def test_handle_update_with_update_only(self):
+        self._create_stack(self.template_update_only)
+        rsrc = self.stack['deployment_mysql']
+        prop_diff = {
+            'input_values': {'foo': 'different'}
+        }
+        props = copy.copy(rsrc.properties.data)
+        props.update(prop_diff)
+        snippet = rsrc_defn.ResourceDefinition(rsrc.name, rsrc.type(), props)
+        self.deployment.handle_update(
+            json_snippet=snippet, tmpl_diff=None, prop_diff=prop_diff)
+        self.rpc_client.show_software_deployment.assert_not_called()
 
     def test_handle_suspend_resume(self):
         self._create_stack(self.template_delete_suspend_resume)
@@ -1035,6 +1094,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
 
     def test_fn_get_att(self):
         self._create_stack(self.template)
+        self.deployment.resource_id = 'c8a19429-7fde-47ea-a42f-40045488226c'
         mock_sd = {
             'outputs': [
                 {'name': 'failed', 'error_output': True},
@@ -1057,18 +1117,20 @@ class SoftwareDeploymentTest(common.HeatTestCase):
         self.assertEqual(0, self.deployment.FnGetAtt('deploy_status_code'))
 
     def test_fn_get_att_convg(self):
-        cache_data = {'deployment_mysql': {
+        cache_data = {'deployment_mysql': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'attrs': {'foo': 'bar'}
-        }}
+        })}
         self._create_stack(self.template, cache_data=cache_data)
-        self.assertEqual('bar', self.deployment.FnGetAtt('foo'))
+        self.assertEqual('bar',
+                         self.stack.defn[self.deployment.name].FnGetAtt('foo'))
 
     def test_fn_get_att_error(self):
         self._create_stack(self.template)
+        self.deployment.resource_id = 'c8a19429-7fde-47ea-a42f-40045488226c'
 
         mock_sd = {
             'outputs': [],
@@ -1081,7 +1143,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
             self.deployment.FnGetAtt, 'foo2')
         self.assertEqual(
             'The Referenced Attribute (deployment_mysql foo2) is incorrect.',
-            six.text_type(err))
+            str(err))
 
     def test_handle_action(self):
         self._create_stack(self.template)
@@ -1159,7 +1221,11 @@ class SoftwareDeploymentTest(common.HeatTestCase):
             }],
             'outputs': [],
         }
-        self.rpc_client.show_software_config.return_value = config
+
+        def show_sw_config(*args):
+            return config.copy()
+
+        self.rpc_client.show_software_config.side_effect = show_sw_config
         mock_sd = self.mock_deployment()
 
         self.rpc_client.show_software_deployment.return_value = mock_sd
@@ -1252,7 +1318,7 @@ class SoftwareDeploymentTest(common.HeatTestCase):
              mock.call('swift_signal_url')],
             self.deployment.data_delete.mock_calls)
 
-        del(dep_data['swift_signal_object_name'])
+        del dep_data['swift_signal_object_name']
         self.deployment.physical_resource_name = mock.Mock()
         self.deployment._delete_swift_signal_url()
         self.assertFalse(self.deployment.physical_resource_name.called)
@@ -1469,132 +1535,121 @@ class SoftwareDeploymentGroupTest(common.HeatTestCase):
         self.assertEqual(templ, resg._assemble_nested(['server1',
                                                        'server2']).t)
 
-    def test_attributes(self):
-        stack = utils.parse_stack(self.template)
-        snip = stack.t.resource_definitions(stack)['deploy_mysql']
-        resg = sd.SoftwareDeploymentGroup('test', snip, stack)
-        nested = self.patchobject(resg, 'nested')
-        server1 = mock.MagicMock()
-        server2 = mock.MagicMock()
-        nested.return_value = {
-            'server1': server1,
-            'server2': server2
-        }
-
-        server1.FnGetAtt.return_value = 'Thing happened on server1'
-        server2.FnGetAtt.return_value = 'ouch'
-        self.assertEqual({
-            'server1': 'Thing happened on server1',
-            'server2': 'ouch'
-        }, resg.FnGetAtt('deploy_stdouts'))
-
-        server1.FnGetAtt.return_value = ''
-        server2.FnGetAtt.return_value = 'Its gone Pete Tong'
-        self.assertEqual({
-            'server1': '',
-            'server2': 'Its gone Pete Tong'
-        }, resg.FnGetAtt('deploy_stderrs'))
-
-        server1.FnGetAtt.return_value = 0
-        server2.FnGetAtt.return_value = 1
-        self.assertEqual({
-            'server1': 0,
-            'server2': 1
-        }, resg.FnGetAtt('deploy_status_codes'))
-
-        server1.FnGetAtt.assert_has_calls([
-            mock.call('deploy_stdout'),
-            mock.call('deploy_stderr'),
-            mock.call('deploy_status_code'),
-        ])
-
-        server2.FnGetAtt.assert_has_calls([
-            mock.call('deploy_stdout'),
-            mock.call('deploy_stderr'),
-            mock.call('deploy_status_code'),
-        ])
-
-    def test_attributes_path(self):
-        stack = utils.parse_stack(self.template)
-        snip = stack.t.resource_definitions(stack)['deploy_mysql']
-        resg = sd.SoftwareDeploymentGroup('test', snip, stack)
-        nested = self.patchobject(resg, 'nested')
-        server1 = mock.MagicMock()
-        server2 = mock.MagicMock()
-        nested.return_value = {
-            'server1': server1,
-            'server2': server2
-        }
-
-        server1.FnGetAtt.return_value = 'Thing happened on server1'
-        server2.FnGetAtt.return_value = 'ouch'
-        self.assertEqual('Thing happened on server1',
-                         resg.FnGetAtt('deploy_stdouts', 'server1'))
-        self.assertEqual('ouch',
-                         resg.FnGetAtt('deploy_stdouts', 'server2'))
-
-        server1.FnGetAtt.return_value = ''
-        server2.FnGetAtt.return_value = 'Its gone Pete Tong'
-        self.assertEqual('', resg.FnGetAtt('deploy_stderrs', 'server1'))
-        self.assertEqual('Its gone Pete Tong',
-                         resg.FnGetAtt('deploy_stderrs', 'server2'))
-
-        server1.FnGetAtt.return_value = 0
-        server2.FnGetAtt.return_value = 1
-        self.assertEqual(0, resg.FnGetAtt('deploy_status_codes', 'server1'))
-        self.assertEqual(1, resg.FnGetAtt('deploy_status_codes', 'server2'))
-
-        server1.FnGetAtt.assert_has_calls([
-            mock.call('deploy_stdout'),
-            mock.call('deploy_stdout'),
-            mock.call('deploy_stderr'),
-            mock.call('deploy_stderr'),
-            mock.call('deploy_status_code'),
-            mock.call('deploy_status_code'),
-        ])
-
-        server2.FnGetAtt.assert_has_calls([
-            mock.call('deploy_stdout'),
-            mock.call('deploy_stdout'),
-            mock.call('deploy_stderr'),
-            mock.call('deploy_stderr'),
-            mock.call('deploy_status_code'),
-            mock.call('deploy_status_code'),
-        ])
-
-    def test_attributes_passthrough_key(self):
-        '''Prove attributes not in the schema pass-through.'''
-        stack = utils.parse_stack(self.template)
-        snip = stack.t.resource_definitions(stack)['deploy_mysql']
-        resg = sd.SoftwareDeploymentGroup('test', snip, stack)
-        nested = self.patchobject(resg, 'nested')
-        server1 = mock.MagicMock()
-        server2 = mock.MagicMock()
-        nested.return_value = {
-            'server1': server1,
-            'server2': server2
-        }
-
-        server1.FnGetAtt.return_value = 'attr1'
-        server2.FnGetAtt.return_value = 'attr2'
-        self.assertEqual({
-            'server1': 'attr1',
-            'server2': 'attr2'
-        }, resg.FnGetAtt('some_attr'))
-
-        server1.FnGetAtt.assert_has_calls([
-            mock.call('some_attr'),
-        ])
-
-        server2.FnGetAtt.assert_has_calls([
-            mock.call('some_attr'),
-        ])
-
     def test_validate(self):
         stack = utils.parse_stack(self.template)
         snip = stack.t.resource_definitions(stack)['deploy_mysql']
         resg = sd.SoftwareDeploymentGroup('deploy_mysql', snip, stack)
         self.assertIsNone(resg.validate())
+
+
+class SoftwareDeploymentGroupAttrTest(common.HeatTestCase):
+    scenarios = [
+        ('stdouts', dict(group_attr='deploy_stdouts',
+                         nested_attr='deploy_stdout',
+                         values=['Thing happened on server1', 'ouch'])),
+        ('stderrs', dict(group_attr='deploy_stderrs',
+                         nested_attr='deploy_stderr',
+                         values=['', "It's gone Pete Tong"])),
+        ('status_codes', dict(group_attr='deploy_status_codes',
+                              nested_attr='deploy_status_code',
+                              values=[0, 1])),
+        ('passthrough', dict(group_attr='some_attr',
+                             nested_attr='some_attr',
+                             values=['attr1', 'attr2'])),
+    ]
+
+    template = {
+        'heat_template_version': '2013-05-23',
+        'resources': {
+            'deploy_mysql': {
+                'type': 'OS::Heat::SoftwareDeploymentGroup',
+                'properties': {
+                    'config': 'config_uuid',
+                    'servers': {'server1': 'uuid1', 'server2': 'uuid2'},
+                    'input_values': {'foo': 'bar'},
+                    'name': '10_config'
+                }
+            }
+        }
+    }
+
+    def setUp(self):
+        super(SoftwareDeploymentGroupAttrTest, self).setUp()
+        self.server_names = ['server1', 'server2']
+        self.servers = [mock.MagicMock() for s in self.server_names]
+        self.stack = utils.parse_stack(self.template)
+
+    def test_attributes(self):
+        resg = self.create_dummy_stack()
+        self.assertEqual(dict(zip(self.server_names, self.values)),
+                         resg.FnGetAtt(self.group_attr))
+        self.check_calls()
+
+    def test_attributes_path(self):
+        resg = self.create_dummy_stack()
+        for i, r in enumerate(self.server_names):
+            self.assertEqual(self.values[i],
+                             resg.FnGetAtt(self.group_attr, r))
+        self.check_calls(len(self.server_names))
+
+    def create_dummy_stack(self):
+        snip = self.stack.t.resource_definitions(self.stack)['deploy_mysql']
+        resg = sd.SoftwareDeploymentGroup('test', snip, self.stack)
+        resg.resource_id = 'test-test'
+        nested = self.patchobject(resg, 'nested')
+        nested.return_value = dict(zip(self.server_names, self.servers))
+        self._stub_get_attr(resg)
+        return resg
+
+    def _stub_get_attr(self, resg):
+        def ref_id_fn(args):
+            self.fail('Getting member reference ID for some reason')
+
+        def attr_fn(args):
+            res_name = args[0]
+            return self.values[self.server_names.index(res_name)]
+
+        def get_output(output_name):
+            outputs = resg._nested_output_defns(resg._resource_names(),
+                                                attr_fn, ref_id_fn)
+            op_defns = {od.name: od for od in outputs}
+            self.assertIn(output_name, op_defns)
+            return op_defns[output_name].get_value()
+
+        orig_get_attr = resg.FnGetAtt
+
+        def get_attr(attr_name, *path):
+            if not path:
+                attr = attr_name
+            else:
+                attr = (attr_name,) + path
+            # Mock referenced_attrs() so that _nested_output_definitions()
+            # will include the output required for this attribute
+            resg.referenced_attrs = mock.Mock(return_value=[attr])
+
+            # Pass through to actual function under test
+            return orig_get_attr(attr_name, *path)
+
+        resg.FnGetAtt = mock.Mock(side_effect=get_attr)
+        resg.get_output = mock.Mock(side_effect=get_output)
+
+    def check_calls(self, count=1):
+        pass
+
+
+class SoftwareDeploymentGroupAttrFallbackTest(SoftwareDeploymentGroupAttrTest):
+    def _stub_get_attr(self, resg):
+        # Raise NotFound when getting output, to force fallback to old-school
+        # grouputils functions
+        resg.get_output = mock.Mock(side_effect=exc.NotFound)
+
+        for server, value in zip(self.servers, self.values):
+            server.FnGetAtt.return_value = value
+
+    def check_calls(self, count=1):
+        calls = [mock.call(c) for c in [self.nested_attr] * count]
+        for server in self.servers:
+            server.FnGetAtt.assert_has_calls(calls)
 
 
 class SDGReplaceTest(common.HeatTestCase):

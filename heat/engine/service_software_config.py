@@ -11,22 +11,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import itertools
 import uuid
 
+from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-from oslo_service import service
 from oslo_utils import timeutils
 import requests
-import six
-from six.moves.urllib import parse as urlparse
+from urllib import parse
 
 from heat.common import crypt
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.db import api as db_api
 from heat.engine import api
+from heat.engine import resource
 from heat.engine import scheduler
 from heat.engine import software_config_io as swc_io
 from heat.objects import resource as resource_objects
@@ -36,8 +36,10 @@ from heat.rpc import api as rpc_api
 
 LOG = logging.getLogger(__name__)
 
+cfg.CONF.import_opt('metadata_put_timeout', 'heat.common.config')
 
-class SoftwareConfigService(service.Service):
+
+class SoftwareConfigService(object):
 
     def show_software_config(self, cnxt, config_id):
         sc = software_config_object.SoftwareConfig.get_by_id(cnxt, config_id)
@@ -48,8 +50,13 @@ class SoftwareConfigService(service.Service):
             cnxt,
             limit=limit,
             marker=marker)
-        result = [api.format_software_config(sc, detail=False) for sc in scs]
+        result = [api.format_software_config(sc, detail=False,
+                                             include_project=cnxt.is_admin)
+                  for sc in scs]
         return result
+
+    def count_software_config(self, cnxt):
+        return software_config_object.SoftwareConfig.count_all(cnxt)
 
     def create_software_config(self, cnxt, group, name, config,
                                inputs, outputs, options):
@@ -68,7 +75,7 @@ class SoftwareConfigService(service.Service):
                 rpc_api.SOFTWARE_CONFIG_OPTIONS: options,
                 rpc_api.SOFTWARE_CONFIG_CONFIG: config
             },
-            'tenant': cnxt.tenant_id})
+            'tenant': cnxt.project_id})
         return api.format_software_config(sc)
 
     def delete_software_config(self, cnxt, config_id):
@@ -80,6 +87,10 @@ class SoftwareConfigService(service.Service):
         result = [api.format_software_deployment(sd) for sd in all_sd]
         return result
 
+    def count_software_deployment(self, cnxt):
+        return software_deployment_object.SoftwareDeployment.count_all(
+            cnxt)
+
     def metadata_software_deployments(self, cnxt, server_id):
         if not server_id:
             raise ValueError(_('server_id must be specified'))
@@ -87,8 +98,7 @@ class SoftwareConfigService(service.Service):
             cnxt, server_id)
 
         # filter out the sds with None config
-        flt_sd = six.moves.filterfalse(lambda sd: sd.config is None,
-                                       all_sd)
+        flt_sd = itertools.filterfalse(lambda sd: sd.config is None, all_sd)
         # sort the configs by config name, to give the list of metadata a
         # deterministic and controllable order.
         flt_sd_s = sorted(flt_sd, key=lambda sd: sd.config.name)
@@ -101,14 +111,11 @@ class SoftwareConfigService(service.Service):
         rs = db_api.resource_get_by_physical_resource_id(cnxt, server_id)
         if not rs:
             return
+        if rs.action == resource.Resource.DELETE:
+            return
         deployments = self.metadata_software_deployments(cnxt, server_id)
         md = rs.rsrc_metadata or {}
         md['deployments'] = deployments
-        rows_updated = db_api.resource_update(
-            cnxt, rs.id, {'rsrc_metadata': md}, rs.atomic_key)
-        if not rows_updated:
-            action = _('deployments of server %s') % server_id
-            raise exception.ConcurrentTransaction(action=action)
 
         metadata_put_url = None
         metadata_queue_id = None
@@ -117,17 +124,45 @@ class SoftwareConfigService(service.Service):
                 metadata_put_url = rd.value
             if rd.key == 'metadata_queue_id':
                 metadata_queue_id = rd.value
+
+        action = _('deployments of server %s') % server_id
+        atomic_key = rs.atomic_key
+        rows_updated = db_api.resource_update(
+            cnxt, rs.id, {'rsrc_metadata': md}, atomic_key)
+        if not rows_updated:
+            LOG.debug('Retrying server %s deployment metadata update',
+                      server_id)
+            raise exception.ConcurrentTransaction(action=action)
+
+        LOG.debug('Updated server %s deployment metadata', server_id)
+
         if metadata_put_url:
             json_md = jsonutils.dumps(md)
-            requests.put(metadata_put_url, json_md)
+            try:
+                resp = requests.put(metadata_put_url, json_md,
+                                    timeout=cfg.CONF.metadata_put_timeout)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                LOG.error('Failed to deliver deployment data to '
+                          'server %s: %s', server_id, exc)
         if metadata_queue_id:
             project = stack_user_project_id
             queue = self._get_zaqar_queue(cnxt, rs, project, metadata_queue_id)
             zaqar_plugin = cnxt.clients.client_plugin('zaqar')
             queue.post({'body': md, 'ttl': zaqar_plugin.DEFAULT_TTL})
 
+        # Bump the atomic key again to serialise updates to the data sent to
+        # the server via Swift.
+        if metadata_put_url is not None:
+            rows_updated = db_api.resource_update(cnxt, rs.id, {},
+                                                  atomic_key + 1)
+            if not rows_updated:
+                LOG.debug('Concurrent update to server %s deployments data '
+                          'detected - retrying.', server_id)
+                raise exception.ConcurrentTransaction(action=action)
+
     def _refresh_swift_software_deployment(self, cnxt, sd, deploy_signal_id):
-        container, object_name = urlparse.urlparse(
+        container, object_name = parse.urlparse(
             deploy_signal_id).path.split('/')[-2:]
         swift_plugin = cnxt.clients.client_plugin('swift')
         swift = swift_plugin.client()
@@ -137,7 +172,7 @@ class SoftwareConfigService(service.Service):
         except Exception as ex:
             # ignore not-found, in case swift is not consistent yet
             if swift_plugin.is_not_found(ex):
-                LOG.info(_LI('Signal object not found: %(c)s %(o)s'), {
+                LOG.info('Signal object not found: %(c)s %(o)s', {
                     'c': container, 'o': object_name})
                 return sd
             raise
@@ -159,8 +194,8 @@ class SoftwareConfigService(service.Service):
         except Exception as ex:
             # ignore not-found, in case swift is not consistent yet
             if swift_plugin.is_not_found(ex):
-                LOG.info(_LI(
-                    'Signal object not found: %(c)s %(o)s'), {
+                LOG.info(
+                    'Signal object not found: %(c)s %(o)s', {
                         'c': container, 'o': object_name})
                 return sd
             raise
@@ -243,7 +278,11 @@ class SoftwareConfigService(service.Service):
                                    input_values, action, status,
                                    status_reason, stack_user_project_id,
                                    deployment_id=None):
-
+        if stack_user_project_id is not None:
+            if len(stack_user_project_id) > 64:
+                raise exception.Invalid(
+                    reason='"stack_user_project_id" '
+                           'should be no more than 64 characters')
         if deployment_id is None:
             deployment_id = str(uuid.uuid4())
         sd = software_deployment_object.SoftwareDeployment.create(cnxt, {
@@ -251,11 +290,11 @@ class SoftwareConfigService(service.Service):
             'config_id': config_id,
             'server_id': server_id,
             'input_values': input_values,
-            'tenant': cnxt.tenant_id,
+            'tenant': cnxt.project_id,
             'stack_user_project_id': stack_user_project_id,
             'action': action,
             'status': status,
-            'status_reason': status_reason})
+            'status_reason': str(status_reason)})
         self._push_metadata_software_deployments(
             cnxt, server_id, stack_user_project_id)
         return api.format_software_deployment(sd)
@@ -306,7 +345,7 @@ class SoftwareConfigService(service.Service):
         if status == rpc_api.SOFTWARE_DEPLOYMENT_FAILED:
             # build a status reason out of all of the values of outputs
             # flagged as error_output
-            status_reasons = [' : '.join((k, six.text_type(status_reasons[k])))
+            status_reasons = [' : '.join((k, str(status_reasons[k])))
                               for k in status_reasons]
             status_reason = ', '.join(status_reasons)
         else:
@@ -336,7 +375,7 @@ class SoftwareConfigService(service.Service):
         if status:
             update_data['status'] = status
         if status_reason:
-            update_data['status_reason'] = status_reason
+            update_data['status_reason'] = str(status_reason)
         if updated_at:
             update_data['updated_at'] = timeutils.normalize_time(
                 timeutils.parse_isotime(updated_at))

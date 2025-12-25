@@ -18,8 +18,8 @@ Unit Tests for heat.rpc.client
 """
 
 import copy
+from unittest import mock
 
-import mock
 from oslo_messaging._drivers import common as rpc_common
 from oslo_utils import reflection
 
@@ -56,22 +56,23 @@ class EngineRpcAPITestCase(common.HeatTestCase):
                          reflection.get_class_name(exr, fully_qualified=False))
         self.assertEqual('NotFound', self.rpcapi.local_error_name(exr))
 
-    def test_ignore_error_named(self):
+    def test_ignore_error_by_name(self):
         ex = exception.NotFound()
         exr = self._to_remote_error(ex)
 
-        self.rpcapi.ignore_error_named(ex, 'NotFound')
-        self.rpcapi.ignore_error_named(exr, 'NotFound')
-        self.assertRaises(
-            exception.NotFound,
-            self.rpcapi.ignore_error_named,
-            ex,
-            'NotSupported')
-        self.assertRaises(
-            exception.NotFound,
-            self.rpcapi.ignore_error_named,
-            exr,
-            'NotSupported')
+        filter_exc = self.rpcapi.ignore_error_by_name('NotFound')
+
+        with filter_exc:
+            raise ex
+        with filter_exc:
+            raise exr
+
+        def should_raise(exc):
+            with self.rpcapi.ignore_error_by_name('NotSupported'):
+                raise exc
+
+        self.assertRaises(exception.NotFound, should_raise, ex)
+        self.assertRaises(exception.NotFound, should_raise, exr)
 
     def _test_engine_api(self, method, rpc_method, **kwargs):
         ctxt = utils.dummy_context()
@@ -85,8 +86,8 @@ class EngineRpcAPITestCase(common.HeatTestCase):
             expected_message = self.rpcapi.make_msg(method, **kwargs)
 
         cast_and_call = ['delete_stack']
-        if rpc_method == 'call' and method in cast_and_call:
-            kwargs['cast'] = False
+        if method in cast_and_call:
+            kwargs['cast'] = rpc_method != 'call'
 
         with mock.patch.object(self.rpcapi, rpc_method) as mock_rpc_method:
             mock_rpc_method.return_value = expected_retval
@@ -143,19 +144,21 @@ class EngineRpcAPITestCase(common.HeatTestCase):
 
     def test_preview_stack(self):
         self._test_engine_api('preview_stack', 'call', stack_name='wordpress',
-                              template={u'Foo': u'bar'},
-                              params={u'InstanceType': u'm1.xlarge'},
-                              files={u'a_file': u'the contents'},
+                              template={'Foo': 'bar'},
+                              params={'InstanceType': 'm1.xlarge'},
+                              files={'a_file': 'the contents'},
                               environment_files=['foo.yaml'],
-                              args={'timeout_mins': u'30'})
+                              files_container=None,
+                              args={'timeout_mins': '30'})
 
     def test_create_stack(self):
         kwargs = dict(stack_name='wordpress',
-                      template={u'Foo': u'bar'},
-                      params={u'InstanceType': u'm1.xlarge'},
-                      files={u'a_file': u'the contents'},
+                      template={'Foo': 'bar'},
+                      params={'InstanceType': 'm1.xlarge'},
+                      files={'a_file': 'the contents'},
                       environment_files=['foo.yaml'],
-                      args={'timeout_mins': u'30'})
+                      files_container=None,
+                      args={'timeout_mins': '30'})
         call_kwargs = copy.deepcopy(kwargs)
         call_kwargs['owner_id'] = None
         call_kwargs['nested_depth'] = 0
@@ -169,10 +172,11 @@ class EngineRpcAPITestCase(common.HeatTestCase):
 
     def test_update_stack(self):
         kwargs = dict(stack_identity=self.identity,
-                      template={u'Foo': u'bar'},
-                      params={u'InstanceType': u'm1.xlarge'},
+                      template={'Foo': 'bar'},
+                      params={'InstanceType': 'm1.xlarge'},
                       files={},
                       environment_files=['foo.yaml'],
+                      files_container=None,
                       args=mock.ANY)
         call_kwargs = copy.deepcopy(kwargs)
         call_kwargs['template_id'] = None
@@ -184,10 +188,11 @@ class EngineRpcAPITestCase(common.HeatTestCase):
     def test_preview_update_stack(self):
         self._test_engine_api('preview_update_stack', 'call',
                               stack_identity=self.identity,
-                              template={u'Foo': u'bar'},
-                              params={u'InstanceType': u'm1.xlarge'},
+                              template={'Foo': 'bar'},
+                              params={'InstanceType': 'm1.xlarge'},
                               files={},
                               environment_files=['foo.yaml'],
+                              files_container=None,
                               args=mock.ANY)
 
     def test_get_template(self):
@@ -204,10 +209,11 @@ class EngineRpcAPITestCase(common.HeatTestCase):
 
     def test_validate_template(self):
         self._test_engine_api('validate_template', 'call',
-                              template={u'Foo': u'bar'},
-                              params={u'Egg': u'spam'},
+                              template={'Foo': 'bar'},
+                              params={'Egg': 'spam'},
                               files=None,
                               environment_files=['foo.yaml'],
+                              files_container=None,
                               ignorable_errors=None,
                               show_nested=False,
                               version='1.24')
@@ -247,12 +253,12 @@ class EngineRpcAPITestCase(common.HeatTestCase):
 
     def test_find_physical_resource(self):
         self._test_engine_api('find_physical_resource', 'call',
-                              physical_resource_id=u'404d-a85b-5315293e67de')
+                              physical_resource_id='404d-a85b-5315293e67de')
 
     def test_describe_stack_resources(self):
         self._test_engine_api('describe_stack_resources', 'call',
                               stack_identity=self.identity,
-                              resource_name=u'WikiDatabase')
+                              resource_name='WikiDatabase')
 
     def test_list_stack_resources(self):
         self._test_engine_api('list_stack_resources', 'call',
@@ -280,25 +286,8 @@ class EngineRpcAPITestCase(common.HeatTestCase):
         self._test_engine_api('resource_signal', 'call',
                               stack_identity=self.identity,
                               resource_name='LogicalResourceId',
-                              details={u'wordpress': []},
+                              details={'wordpress': []},
                               sync_call=True)
-
-    def test_create_watch_data(self):
-        self._test_engine_api('create_watch_data', 'call',
-                              watch_name='watch1',
-                              stats_data={})
-
-    def test_show_watch(self):
-        self._test_engine_api('show_watch', 'call',
-                              watch_name='watch1')
-
-    def test_show_watch_metric(self):
-        self._test_engine_api('show_watch_metric', 'call',
-                              metric_namespace=None, metric_name=None)
-
-    def test_set_watch_state(self):
-        self._test_engine_api('set_watch_state', 'call',
-                              watch_name='watch1', state="xyz")
 
     def test_list_software_configs(self):
         self._test_engine_api('list_software_configs', 'call',

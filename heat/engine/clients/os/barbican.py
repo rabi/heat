@@ -10,13 +10,18 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
 from barbicanclient import client as barbican_client
-from barbicanclient import containers
 from barbicanclient import exceptions
+from barbicanclient.v1 import containers
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from heat.common import exception
 from heat.engine.clients import client_plugin
 from heat.engine import constraints
+
+LOG = logging.getLogger(__name__)
 
 CLIENT_NAME = 'barbican'
 
@@ -30,7 +35,9 @@ class BarbicanClientPlugin(client_plugin.ClientPlugin):
         client = barbican_client.Client(
             session=self.context.keystone_session,
             service_type=self.KEY_MANAGER,
-            interface=interface)
+            interface=interface,
+            connect_retries=cfg.CONF.client_retry_limit,
+            region_name=self._get_region_name())
         return client
 
     def is_not_found(self, ex):
@@ -60,7 +67,12 @@ class BarbicanClientPlugin(client_plugin.ClientPlugin):
                 raise exception.EntityNotFound(
                     entity="Secret",
                     name=secret_ref)
+            LOG.info('Failed to get Barbican secret from reference %s',
+                     secret_ref)
             raise
+
+    def get_secret_payload_by_ref(self, secret_ref):
+        return self.get_secret_by_ref(secret_ref).payload
 
     def get_container_by_ref(self, container_ref):
         try:

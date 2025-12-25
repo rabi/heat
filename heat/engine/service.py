@@ -12,13 +12,19 @@
 #    under the License.
 
 import collections
+import copy
 import datetime
 import functools
 import itertools
 import os
+import pydoc
+import queue
+import signal
 import socket
+import sys
+import threading
+import time
 
-import eventlet
 from oslo_config import cfg
 from oslo_context import context as oslo_context
 from oslo_log import log as logging
@@ -29,7 +35,6 @@ from oslo_service import threadgroup
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
 from osprofiler import profiler
-import six
 import webob
 
 from heat.common import context
@@ -37,9 +42,6 @@ from heat.common import environment_format as env_fmt
 from heat.common import environment_util as env_util
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LE
-from heat.common.i18n import _LI
-from heat.common.i18n import _LW
 from heat.common import identifier
 from heat.common import messaging as rpc_messaging
 from heat.common import policy
@@ -54,32 +56,100 @@ from heat.engine import parameter_groups
 from heat.engine import properties
 from heat.engine import resources
 from heat.engine import service_software_config
-from heat.engine import service_stack_watch
 from heat.engine import stack as parser
 from heat.engine import stack_lock
+from heat.engine import stk_defn
 from heat.engine import support
 from heat.engine import template as templatem
+from heat.engine import template_files
 from heat.engine import update
-from heat.engine import watchrule
 from heat.engine import worker
 from heat.objects import event as event_object
 from heat.objects import resource as resource_objects
 from heat.objects import service as service_objects
 from heat.objects import snapshot as snapshot_object
 from heat.objects import stack as stack_object
-from heat.objects import watch_data
-from heat.objects import watch_rule
 from heat.rpc import api as rpc_api
 from heat.rpc import worker_api as rpc_worker_api
 
 cfg.CONF.import_opt('engine_life_check_timeout', 'heat.common.config')
 cfg.CONF.import_opt('max_resources_per_stack', 'heat.common.config')
 cfg.CONF.import_opt('max_stacks_per_tenant', 'heat.common.config')
+cfg.CONF.import_opt('max_snapshots_per_stack', 'heat.common.config')
+cfg.CONF.import_opt('max_software_configs_per_tenant', 'heat.common.config')
+cfg.CONF.import_opt('max_software_deployments_per_tenant',
+                    'heat.common.config')
 cfg.CONF.import_opt('enable_stack_abandon', 'heat.common.config')
 cfg.CONF.import_opt('enable_stack_adopt', 'heat.common.config')
 cfg.CONF.import_opt('convergence_engine', 'heat.common.config')
 
+# Time to wait for a stack to stop when cancelling running threads, before
+# giving up on being able to start a delete.
+STOP_STACK_TIMEOUT = 30
+
 LOG = logging.getLogger(__name__)
+
+
+class ThreadWithCallback(threading.Thread):
+    """Thread that supports callback functions on completion."""
+    def __init__(self, target, args=(), kwargs=None):
+        super().__init__()
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.callbacks = []
+        self._finished = threading.Event()
+
+    def link(self, callback, *args, **kwargs):
+        """Add a callback to be executed when thread completes."""
+        self.callbacks.append((callback, args, kwargs))
+        # If thread is already finished, run callback immediately
+        if self._finished.is_set():
+            try:
+                callback(self, *args, **kwargs)
+            except Exception:
+                callback_name = getattr(
+                    callback, '__name__', str(callback))
+                LOG.exception(
+                    'Exception in callback execution of %s',
+                    callback_name)
+
+    def run(self):
+        try:
+            self.target(*self.args, **self.kwargs)
+        except Exception:
+            target_name = getattr(
+                self.target, '__name__', str(self.target))
+            LOG.exception(
+                'Exception in thread execution of %s',
+                target_name)
+        except BaseException:
+            raise
+        finally:
+            self._finished.set()
+            # Run all callbacks
+            for callback, args, kwargs in self.callbacks:
+                try:
+                    callback(self, *args, **kwargs)
+                except Exception:
+                    callback_name = getattr(
+                        callback, '__name__', str(callback))
+                    LOG.exception(
+                        'Exception in callback execution of %s',
+                        callback_name)
+
+
+class ThreadGroup(threadgroup.ThreadGroup):
+    def add_thread(self, func, *args, **kwargs):
+        """Start a new thread in the group."""
+        if len(self.threads) >= self.max_threads:
+            raise RuntimeError(
+                "Maximum number of threads reached")
+        with self._lock:
+            th = ThreadWithCallback(target=func, args=args, kwargs=kwargs)
+            th.start()
+            self.threads.append(th)
+        return th
 
 
 class ThreadGroupManager(object):
@@ -88,19 +158,7 @@ class ThreadGroupManager(object):
         super(ThreadGroupManager, self).__init__()
         self.groups = {}
         self.msg_queues = collections.defaultdict(list)
-
-        # Create dummy service task, because when there is nothing queued
-        # on self.tg the process exits
-        self.add_timer(cfg.CONF.periodic_interval, self._service_task)
-
-    def _service_task(self):
-        """Dummy task which gets queued on the service.Service threadgroup.
-
-        Without this, service.Service sees nothing running i.e has nothing to
-        wait() on, so the process exits. This could also be used to trigger
-        periodic non-stack-specific housekeeping tasks.
-        """
-        pass
+        self._lock = threading.Lock()
 
     def _serialize_profile_info(self):
         prof = profiler.get()
@@ -122,22 +180,14 @@ class ThreadGroupManager(object):
 
     def start(self, stack_id, func, *args, **kwargs):
         """Run the given method in a sub-thread."""
-        if stack_id not in self.groups:
-            self.groups[stack_id] = threadgroup.ThreadGroup()
-
-        def log_exceptions(gt):
-            try:
-                gt.wait()
-            except Exception:
-                LOG.exception(_LE('Unhandled error in asynchronous task'))
-            except BaseException:
-                pass
+        with self._lock:
+            if stack_id not in self.groups:
+                self.groups[stack_id] = ThreadGroup()
 
         req_cnxt = oslo_context.get_current()
         th = self.groups[stack_id].add_thread(self._start_with_trace, req_cnxt,
                                               self._serialize_profile_info(),
                                               func, *args, **kwargs)
-        th.link(log_exceptions)
         return th
 
     def start_with_lock(self, cnxt, stack, engine_id, func, *args, **kwargs):
@@ -175,19 +225,31 @@ class ThreadGroupManager(object):
         :param kwargs: Keyword-args to be passed to func
 
         """
+        def _force_exit(*args):
+            LOG.info('Graceful exit timeout exceeded, forcing exit.')
+            os._exit(-1)
+
         def release(gt):
-            """Callback function that will be passed to GreenThread.link().
+            """Callback function that will be passed to Thread.link().
 
             Persist the stack state to COMPLETE and FAILED close to
             releasing the lock to avoid race conditions.
             """
-            if (stack is not None and stack.status != stack.IN_PROGRESS
-                and stack.action not in (stack.DELETE,
-                                         stack.ROLLBACK,
-                                         stack.UPDATE)):
+            if stack is not None and stack.defer_state_persist():
                 stack.persist_state_and_release_lock(lock.engine_id)
+
+                notify = kwargs.get('notify')
+                if notify is not None and not notify.signalled():
+                    notify.signal()
             else:
-                lock.release()
+                try:
+                    lock.release()
+                except Exception:
+                    # allow up to 5 seconds for sys.exit to gracefully shutdown
+                    signal.signal(signal.SIGALRM, _force_exit)
+                    signal.alarm(5)
+                    LOG.exception("FATAL. Failed stack_lock release. Exiting")
+                    sys.exit(-1)
 
         # Link to self to allow the stack to run tasks
         stack.thread_group_mgr = self
@@ -198,20 +260,25 @@ class ThreadGroupManager(object):
     def add_timer(self, stack_id, func, *args, **kwargs):
         """Define a periodic task in the stack threadgroups.
 
-        The task is run in a separate greenthread.
+        The task is run in a separate thread.
 
         Periodicity is cfg.CONF.periodic_interval
         """
-        if stack_id not in self.groups:
-            self.groups[stack_id] = threadgroup.ThreadGroup()
+
+        with self._lock:
+            if stack_id not in self.groups:
+                self.groups[stack_id] = ThreadGroup()
         self.groups[stack_id].add_timer(cfg.CONF.periodic_interval,
-                                        func, *args, **kwargs)
+                                        func, None, *args, **kwargs)
 
     def add_msg_queue(self, stack_id, msg_queue):
-        self.msg_queues[stack_id].append(msg_queue)
+        with self._lock:
+            self.msg_queues[stack_id].append(msg_queue)
 
     def remove_msg_queue(self, gt, stack_id, msg_queue):
-        for q in self.msg_queues.pop(stack_id, []):
+        with self._lock:
+            queues = self.msg_queues.pop(stack_id, [])
+        for q in queues:
             if q is not msg_queue:
                 self.add_msg_queue(stack_id, q)
 
@@ -221,32 +288,69 @@ class ThreadGroupManager(object):
 
     def stop(self, stack_id, graceful=False):
         """Stop any active threads on a stack."""
-        if stack_id in self.groups:
-            self.msg_queues.pop(stack_id, None)
-            threadgroup = self.groups.pop(stack_id)
-            threads = threadgroup.threads[:]
-
-            threadgroup.stop(graceful)
-            threadgroup.wait()
-
-            # Wait for link()ed functions (i.e. lock release)
-            links_done = dict((th, False) for th in threads)
-
-            def mark_done(gt, th):
-                links_done[th] = True
-
-            for th in threads:
-                th.link(mark_done, th)
-            while not all(six.itervalues(links_done)):
-                eventlet.sleep()
+        with self._lock:
+            if stack_id in self.groups:
+                self.msg_queues.pop(stack_id, None)
+                threadgroup = self.groups.pop(stack_id)
+            else:
+                return
+        threadgroup.stop(graceful)
+        threadgroup.wait()
 
     def send(self, stack_id, message):
-        for msg_queue in self.msg_queues.get(stack_id, []):
+        with self._lock:
+            queues = self.msg_queues.get(stack_id, [])[:]
+
+        for msg_queue in queues:
             msg_queue.put_nowait(message)
+
+    def stopall(self):
+        groups = self.groups.copy()
+        for stack_id in groups:
+            self.stop(stack_id)
+
+
+class NotifyEvent(object):
+    def __init__(self):
+        self._queue = queue.Queue(maxsize=1)  # Size 1 to match behavior
+        self._signalled = False
+        self._lock = threading.Lock()  # To protect _signalled
+
+    def signalled(self):
+        with self._lock:
+            return self._signalled
+
+    def signal(self):
+        """Signal the event."""
+        with self._lock:
+            if self._signalled:
+                return
+            self._signalled = True
+
+        # Put None in the queue to signal
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # Already signalled, which is fine
+            pass
+
+        # In standard threading, we can just yield to the scheduler
+        time.sleep(0)
+
+    def wait(self, timeout=None):
+        """Wait for the event with optional timeout."""
+        if timeout is None:
+            timeout = cfg.CONF.rpc_response_timeout
+        try:
+            self._queue.get(timeout=timeout)
+            return True
+        except queue.Empty:
+            LOG.warning('Timed out waiting for operation to start')
+            return False
 
 
 @profiler.trace_cls("rpc")
-class EngineListener(service.Service):
+class EngineListener(object):
     """Listen on an AMQP queue named for the engine.
 
     Allows individual engines to communicate with each other for multi-engine
@@ -256,18 +360,27 @@ class EngineListener(service.Service):
     ACTIONS = (STOP_STACK, SEND) = ('stop_stack', 'send')
 
     def __init__(self, host, engine_id, thread_group_mgr):
-        super(EngineListener, self).__init__()
         self.thread_group_mgr = thread_group_mgr
         self.engine_id = engine_id
         self.host = host
+        self._server = None
 
     def start(self):
-        super(EngineListener, self).start()
         self.target = messaging.Target(
             server=self.engine_id,
             topic=rpc_api.LISTENER_TOPIC)
-        server = rpc_messaging.get_rpc_server(self.target, self)
-        server.start()
+        self._server = rpc_messaging.get_rpc_server(self.target, self)
+        self._server.start()
+
+    def stop(self):
+        if self._server is not None:
+            LOG.debug("Attempting to stop engine listener...")
+            try:
+                self._server.stop()
+                self._server.wait()
+                LOG.info("Engine listener is stopped successfully")
+            except Exception as e:
+                LOG.error("Failed to stop engine listener, %s", e)
 
     def listening(self, ctxt):
         """Respond to a watchdog request.
@@ -288,7 +401,7 @@ class EngineListener(service.Service):
 
 
 @profiler.trace_cls("rpc")
-class EngineService(service.Service):
+class EngineService(service.ServiceBase):
     """Manages the running instances from creation to destruction.
 
     All the methods in here are called from the RPC backend.  This is
@@ -299,10 +412,9 @@ class EngineService(service.Service):
     by the RPC caller.
     """
 
-    RPC_API_VERSION = '1.34'
+    RPC_API_VERSION = '1.36'
 
     def __init__(self, host, topic):
-        super(EngineService, self).__init__()
         resources.initialise()
         self.host = host
         self.topic = topic
@@ -311,7 +423,6 @@ class EngineService(service.Service):
 
         # The following are initialized here, but assigned in start() which
         # happens after the fork when spawning multiple worker processes
-        self.stack_watch = None
         self.listener = None
         self.worker_service = None
         self.engine_id = None
@@ -324,40 +435,11 @@ class EngineService(service.Service):
         self.resource_enforcer = policy.ResourceEnforcer()
 
         if cfg.CONF.trusts_delegated_roles:
-            LOG.warning(_LW('The default value of "trusts_delegated_roles" '
-                            'option in heat.conf is changed to [] in Kilo '
-                            'and heat will delegate all roles of trustor. '
-                            'Please keep the same if you do not want to '
-                            'delegate subset roles when upgrading.'))
-
-    def create_periodic_tasks(self):
-        LOG.debug("Starting periodic watch tasks pid=%s" % os.getpid())
-        # Note with multiple workers, the parent process hasn't called start()
-        # so we need to create a ThreadGroupManager here for the periodic tasks
-        if self.thread_group_mgr is None:
-            self.thread_group_mgr = ThreadGroupManager()
-        self.stack_watch = service_stack_watch.StackWatch(
-            self.thread_group_mgr)
-
-        def create_watch_tasks():
-            while True:
-                try:
-                    # Create a periodic_watcher_task per-stack
-                    admin_context = context.get_admin_context()
-                    stacks = stack_object.Stack.get_all(
-                        admin_context,
-                        show_hidden=True)
-                    for s in stacks:
-                        self.stack_watch.start_watch_task(s.id, admin_context)
-                    LOG.info(_LI("Watch tasks created"))
-                    return
-                except Exception as e:
-                    LOG.error(_LE("Watch task creation attempt failed, %s"), e)
-                    eventlet.sleep(5)
-
-        if self.manage_thread_grp is None:
-            self.manage_thread_grp = threadgroup.ThreadGroup()
-        self.manage_thread_grp.add_thread(create_watch_tasks)
+            LOG.warning('The default value of "trusts_delegated_roles" '
+                        'option in heat.conf is changed to [] in Kilo '
+                        'and heat will delegate all roles of trustor. '
+                        'Please keep the same if you do not want to '
+                        'delegate subset roles when upgrading.')
 
     def start(self):
         self.engine_id = service_utils.generate_engine_id()
@@ -365,17 +447,16 @@ class EngineService(service.Service):
             self.thread_group_mgr = ThreadGroupManager()
         self.listener = EngineListener(self.host, self.engine_id,
                                        self.thread_group_mgr)
-        LOG.debug("Starting listener for engine %s" % self.engine_id)
+        LOG.debug("Starting listener for engine %s", self.engine_id)
         self.listener.start()
 
-        if cfg.CONF.convergence_engine:
-            self.worker_service = worker.WorkerService(
-                host=self.host,
-                topic=rpc_worker_api.TOPIC,
-                engine_id=self.engine_id,
-                thread_group_mgr=self.thread_group_mgr
-            )
-            self.worker_service.start()
+        self.worker_service = worker.WorkerService(
+            host=self.host,
+            topic=rpc_worker_api.TOPIC,
+            engine_id=self.engine_id,
+            thread_group_mgr=self.thread_group_mgr
+        )
+        self.worker_service.start()
 
         target = messaging.Target(
             version=self.RPC_API_VERSION, server=self.host,
@@ -390,12 +471,10 @@ class EngineService(service.Service):
         self._configure_db_conn_pool_size()
         self.service_manage_cleanup()
         if self.manage_thread_grp is None:
-            self.manage_thread_grp = threadgroup.ThreadGroup()
+            self.manage_thread_grp = ThreadGroup()
         self.manage_thread_grp.add_timer(cfg.CONF.periodic_interval,
                                          self.service_manage_report)
         self.manage_thread_grp.add_thread(self.reset_stack_status)
-
-        super(EngineService, self).start()
 
     def _configure_db_conn_pool_size(self):
         # bug #1491185
@@ -407,7 +486,7 @@ class EngineService(service.Service):
         if ((cfg.CONF.database.max_overflow is None) or
                 (cfg.CONF.database.max_overflow < worker_pool_size)):
             cfg.CONF.set_override('max_overflow', worker_pool_size,
-                                  group='database', enforce_type=True)
+                                  group='database')
 
     def _stop_rpc_server(self):
         # Stop rpc connection at first for preventing new requests
@@ -417,15 +496,16 @@ class EngineService(service.Service):
         try:
             self._rpc_server.stop()
             self._rpc_server.wait()
-            LOG.info(_LI("Engine service is stopped successfully"))
+            LOG.info("Engine service is stopped successfully")
         except Exception as e:
-            LOG.error(_LE("Failed to stop engine service, %s"), e)
+            LOG.error("Failed to stop engine service, %s", e)
 
     def stop(self):
         self._stop_rpc_server()
+        if self.listener:
+            self.listener.stop()
 
-        if cfg.CONF.convergence_engine and self.worker_service:
-            # Stop the WorkerService
+        if self.worker_service:
             self.worker_service.stop()
 
         # Wait for all active threads to be finished
@@ -434,23 +514,24 @@ class EngineService(service.Service):
                 # Ignore dummy service task
                 if stack_id == cfg.CONF.periodic_interval:
                     continue
-                LOG.info(_LI("Waiting stack %s processing to be finished"),
+                LOG.info("Waiting stack %s processing to be finished",
                          stack_id)
                 # Stop threads gracefully
                 self.thread_group_mgr.stop(stack_id, True)
-                LOG.info(_LI("Stack %s processing was finished"), stack_id)
+                LOG.info("Stack %s processing was finished", stack_id)
         if self.manage_thread_grp:
             self.manage_thread_grp.stop()
             ctxt = context.get_admin_context()
             service_objects.Service.delete(ctxt, self.service_id)
-            LOG.info(_LI('Service %s is deleted'), self.service_id)
+            LOG.info('Service %s is deleted', self.service_id)
 
         # Terminate the engine process
-        LOG.info(_LI("All threads were gone, terminating engine"))
-        super(EngineService, self).stop()
+        LOG.info("All threads were gone, terminating engine")
+
+    def wait(self):
+        pass
 
     def reset(self):
-        super(EngineService, self).reset()
         logging.setup(cfg.CONF, 'heat')
 
     @context.request_context
@@ -465,7 +546,8 @@ class EngineService(service.Service):
             s = stack_object.Stack.get_by_id(
                 cnxt,
                 stack_name,
-                show_deleted=True)
+                show_deleted=True,
+                eager_load=False)
             # may be the name is in uuid format, so if get by id returns None,
             # we should get the info by name again
         if not s:
@@ -486,11 +568,11 @@ class EngineService(service.Service):
             raise exception.EntityNotFound(entity='Stack',
                                            name=identity.stack_name)
 
-        if not cnxt.is_admin and cnxt.tenant_id not in (
+        if not cnxt.is_admin and cnxt.project_id not in (
                 identity.tenant, s.stack_user_project_id):
             # The DB API should not allow this, but sanity-check anyway..
             raise exception.InvalidTenant(target=identity.tenant,
-                                          actual=cnxt.tenant_id)
+                                          actual=cnxt.project_id)
 
         if identity.path or s.name != identity.stack_name:
             raise exception.EntityNotFound(entity='Stack',
@@ -514,8 +596,28 @@ class EngineService(service.Service):
         else:
             stacks = parser.Stack.load_all(cnxt)
 
-        return [api.format_stack(
-            stack, resolve_outputs=resolve_outputs) for stack in stacks]
+        def show(stack):
+            if resolve_outputs:
+                for res in stack._explicit_dependencies():
+                    ensure_cache = stack.convergence and res.id is not None
+                    node_data = res.node_data(for_resources=ensure_cache,
+                                              for_outputs=True)
+                    stk_defn.update_resource_data(stack.defn, res.name,
+                                                  node_data)
+
+                    # Cases where stored attributes may not exist for a
+                    # resource:
+                    #  * The resource is an AutoScalingGroup that received a
+                    #    signal
+                    #  * Near simultaneous updates (say by an update and a
+                    #    signal)
+                    #  * The first time resolving a pre-Pike stack
+                    if ensure_cache:
+                        res.store_attributes()
+
+            return api.format_stack(stack, resolve_outputs=resolve_outputs)
+
+        return [show(stack) for stack in stacks]
 
     def get_revision(self, cnxt):
         return cfg.CONF.revision['heat_revision']
@@ -543,14 +645,16 @@ class EngineService(service.Service):
         :param show_deleted: if true, show soft-deleted stacks
         :param show_nested: if true, show nested stacks
         :param show_hidden: if true, show hidden stacks
-        :param tags: show stacks containing these tags, combine multiple
-            tags using the boolean AND expression
-        :param tags_any: show stacks containing these tags, combine multiple
-            tags using the boolean OR expression
-        :param not_tags: show stacks not containing these tags, combine
-            multiple tags using the boolean AND expression
-        :param not_tags_any: show stacks not containing these tags, combine
-            multiple tags using the boolean OR expression
+        :param tags: show stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean AND expression
+        :param tags_any: show stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean OR expression
+        :param not_tags: show stacks not containing these tags. If multiple
+            tags are passed, they will be combined using the boolean AND
+            expression
+        :param not_tags_any: show stacks not containing these tags. If
+            multiple tags are passed, they will be combined using the boolean
+            OR expression
         :returns: a list of formatted stacks
         """
         if filters is not None:
@@ -589,14 +693,16 @@ class EngineService(service.Service):
         :param show_deleted: if true, count will include the deleted stacks
         :param show_nested: if true, count will include nested stacks
         :param show_hidden: if true, count will include hidden stacks
-        :param tags: count stacks containing these tags, combine multiple tags
-            using the boolean AND expression
-        :param tags_any: count stacks containing these tags, combine multiple
-            tags using the boolean OR expression
-        :param not_tags: count stacks not containing these tags, combine
-            multiple tags using the boolean AND expression
-        :param not_tags_any: count stacks not containing these tags, combine
-            multiple tags using the boolean OR expression
+        :param tags: count stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean AND expression
+        :param tags_any: count stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean OR expression
+        :param not_tags: count stacks not containing these tags. If multiple
+            tags are passed, they will be combined using the boolean AND
+            expression
+        :param not_tags_any: count stacks not containing these tags. If
+            multiple tags are passed, they will be combined using the boolean
+            OR expression
         :returns: an integer representing the number of matched stacks
         """
         if not tenant_safe:
@@ -626,14 +732,20 @@ class EngineService(service.Service):
             raise exception.MissingCredentialError(required='X-Auth-Key')
 
     def _validate_new_stack(self, cnxt, stack_name, parsed_template):
+        # We'll check that the stack name is unique in the tenant while
+        # storing it in the database to avoid races, but also check it here
+        # before validating so we can fail early.
         if stack_object.Stack.get_by_name(cnxt, stack_name):
             raise exception.StackExists(stack_name=stack_name)
 
-        tenant_limit = cfg.CONF.max_stacks_per_tenant
-        if stack_object.Stack.count_all(cnxt) >= tenant_limit:
-            message = _("You have reached the maximum stacks per tenant, "
-                        "%d. Please delete some stacks.") % tenant_limit
-            raise exception.RequestLimitExceeded(message=message)
+        # Do not stack limit check for admin since admin can see all stacks.
+        if not cnxt.is_admin:
+            tenant_limit = cfg.CONF.max_stacks_per_tenant
+            if (tenant_limit >= 0 and
+                    stack_object.Stack.count_all(cnxt) >= tenant_limit):
+                message = _("You have reached the maximum stacks per tenant, "
+                            "%d. Please delete some stacks.") % tenant_limit
+                raise exception.RequestLimitExceeded(message=message)
         self._validate_template(cnxt, parsed_template)
 
     def _validate_template(self, cnxt, parsed_template):
@@ -642,7 +754,7 @@ class EngineService(service.Service):
         except AssertionError:
             raise
         except Exception as ex:
-            raise exception.StackValidationFailed(message=six.text_type(ex))
+            raise exception.StackValidationFailed(message=str(ex))
 
         max_resources = cfg.CONF.max_resources_per_stack
         if max_resources == -1:
@@ -654,8 +766,9 @@ class EngineService(service.Service):
 
     def _parse_template_and_validate_stack(self, cnxt, stack_name, template,
                                            params, files, environment_files,
-                                           args, owner_id=None,
-                                           nested_depth=0, user_creds_id=None,
+                                           files_container, args,
+                                           owner_id=None, nested_depth=0,
+                                           user_creds_id=None,
                                            stack_user_project_id=None,
                                            convergence=False,
                                            parent_resource_name=None,
@@ -678,9 +791,12 @@ class EngineService(service.Service):
         if template_id is not None:
             tmpl = templatem.Template.load(cnxt, template_id)
         else:
+            if files_container:
+                files = template_files.get_files_from_container(
+                    cnxt, files_container, files)
             tmpl = templatem.Template(template, files=files)
-            env_util.merge_environments(environment_files, files, params,
-                                        tmpl.param_schemata())
+            env_util.merge_environments(environment_files, files,
+                                        params, tmpl.all_param_schemata(files))
             tmpl.env = environment.Environment(params)
         self._validate_new_stack(cnxt, stack_name, tmpl)
 
@@ -693,16 +809,18 @@ class EngineService(service.Service):
                              parent_resource=parent_resource_name,
                              **common_params)
 
+        self.resource_enforcer.enforce_stack(stack, is_registered_policy=True)
         self._validate_deferred_auth_context(cnxt, stack)
+        is_root = stack.nested_depth == 0
         stack.validate()
-        # For the root stack print a summary of the TemplateResources loaded
-        if nested_depth == 0:
+        # For the root stack, log a summary of the TemplateResources loaded
+        if is_root:
             tmpl.env.registry.log_resource_info(prefix=stack_name)
         return stack
 
     @context.request_context
     def preview_stack(self, cnxt, stack_name, template, params, files,
-                      args, environment_files=None):
+                      args, environment_files=None, files_container=None):
         """Simulate a new stack using the provided template.
 
         Note that at this stage the template has already been fetched from the
@@ -717,9 +835,10 @@ class EngineService(service.Service):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: optional swift container name
         """
 
-        LOG.info(_LI('previewing stack %s'), stack_name)
+        LOG.info('previewing stack %s', stack_name)
 
         conv_eng = cfg.CONF.convergence_engine
         stack = self._parse_template_and_validate_stack(cnxt,
@@ -728,16 +847,17 @@ class EngineService(service.Service):
                                                         params,
                                                         files,
                                                         environment_files,
+                                                        files_container,
                                                         args,
                                                         convergence=conv_eng)
 
-        self.resource_enforcer.enforce_stack(stack)
         return api.format_stack_preview(stack)
 
     @context.request_context
     def create_stack(self, cnxt, stack_name, template, params, files,
                      args, environment_files=None,
-                     owner_id=None, nested_depth=0, user_creds_id=None,
+                     files_container=None, owner_id=None,
+                     nested_depth=0, user_creds_id=None,
                      stack_user_project_id=None, parent_resource_name=None,
                      template_id=None):
         """Create a new stack using the template provided.
@@ -754,6 +874,7 @@ class EngineService(service.Service):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: optional swift container name
         :param owner_id: parent stack ID for nested stacks, only expected when
                          called from another heat-engine (not a user option)
         :param nested_depth: the nested depth for nested stacks, only expected
@@ -764,7 +885,7 @@ class EngineService(service.Service):
         :param parent_resource_name: the parent resource name
         :param template_id: the ID of a pre-stored template in the DB
         """
-        LOG.info(_LI('Creating stack %s'), stack_name)
+        LOG.info('Creating stack %s', stack_name)
 
         def _create_stack_user(stack):
             if not stack.stack_user_project_id:
@@ -772,7 +893,11 @@ class EngineService(service.Service):
                     stack.create_stack_user_project_id()
                 except exception.AuthorizationFailure as ex:
                     stack.state_set(stack.action, stack.FAILED,
-                                    six.text_type(ex))
+                                    str(ex))
+                except Exception:
+                    LOG.exception('Failed to create stack user project')
+                    stack.state_set(stack.action, stack.FAILED,
+                                    'Failed to create stack user project')
 
         def _stack_create(stack, msg_queue=None):
             # Create/Adopt a stack, and create the periodic task if successful
@@ -781,23 +906,14 @@ class EngineService(service.Service):
             elif stack.status != stack.FAILED:
                 stack.create(msg_queue=msg_queue)
 
-            if (stack.action in (stack.CREATE, stack.ADOPT)
-                    and stack.status == stack.COMPLETE):
-                if self.stack_watch:
-                    # Schedule a periodic watcher task for this stack
-                    self.stack_watch.start_watch_task(stack.id, cnxt)
-            else:
-                LOG.info(_LI("Stack create failed, status %s"), stack.status)
-
         convergence = cfg.CONF.convergence_engine
 
         stack = self._parse_template_and_validate_stack(
             cnxt, stack_name, template, params, files, environment_files,
-            args, owner_id, nested_depth, user_creds_id,
-            stack_user_project_id, convergence, parent_resource_name,
-            template_id)
+            files_container, args, owner_id, nested_depth,
+            user_creds_id, stack_user_project_id, convergence,
+            parent_resource_name, template_id)
 
-        self.resource_enforcer.enforce_stack(stack)
         stack_id = stack.store()
         if cfg.CONF.reauthentication_auth_method == 'trusts':
             stack = parser.Stack.load(
@@ -810,7 +926,7 @@ class EngineService(service.Service):
             stack.thread_group_mgr = self.thread_group_mgr
             stack.converge_stack(template=stack.t, action=action)
         else:
-            msg_queue = eventlet.queue.LightQueue()
+            msg_queue = queue.Queue()
             th = self.thread_group_mgr.start_with_lock(cnxt, stack,
                                                        self.engine_id,
                                                        _stack_create, stack,
@@ -823,7 +939,8 @@ class EngineService(service.Service):
 
     def _prepare_stack_updates(self, cnxt, current_stack,
                                template, params, environment_files,
-                               files, args, template_id=None):
+                               files, files_container,
+                               args, template_id=None):
         """Return the current and updated stack for a given transition.
 
         Changes *will not* be persisted, this is a helper method for
@@ -839,10 +956,10 @@ class EngineService(service.Service):
         """
 
         # Now parse the template and any parameters for the updated
-        # stack definition.  If PARAM_EXISTING is specified, we merge
+        # stack definition. If PARAM_EXISTING is specified, we merge
         # any environment provided into the existing one and attempt
         # to use the existing stack template, if one is not provided.
-        if args.get(rpc_api.PARAM_EXISTING):
+        if args.get(rpc_api.PARAM_EXISTING, False):
             assert template_id is None, \
                 "Cannot specify template_id with PARAM_EXISTING"
 
@@ -865,17 +982,20 @@ class EngineService(service.Service):
                 else:
                     # Nothing we can do, the failed update happened before
                     # we started storing prev_raw_template_id
-                    LOG.error(_LE('PATCH update to FAILED stack only '
-                                  'possible if convergence enabled or '
-                                  'previous template stored'))
+                    LOG.error('PATCH update to FAILED stack only '
+                              'possible if convergence enabled or '
+                              'previous template stored')
                     msg = _('PATCH update to non-COMPLETE stack')
                     raise exception.NotSupported(feature=msg)
 
             new_files = current_stack.t.files
+            if files_container:
+                files = template_files.get_files_from_container(
+                    cnxt, files_container, files)
             new_files.update(files or {})
             tmpl = templatem.Template(new_template, files=new_files)
-            env_util.merge_environments(environment_files, files, params,
-                                        tmpl.param_schemata())
+            env_util.merge_environments(environment_files, new_files,
+                                        params, tmpl.all_param_schemata(files))
             existing_env = current_stack.env.env_as_dict()
             existing_params = existing_env[env_fmt.PARAMETERS]
             clear_params = set(args.get(rpc_api.PARAM_CLEAR_PARAMETERS, []))
@@ -894,9 +1014,13 @@ class EngineService(service.Service):
             if template_id is not None:
                 tmpl = templatem.Template.load(cnxt, template_id)
             else:
+                if files_container:
+                    files = template_files.get_files_from_container(
+                        cnxt, files_container, files)
                 tmpl = templatem.Template(template, files=files)
-                env_util.merge_environments(environment_files, files, params,
-                                            tmpl.param_schemata())
+                env_util.merge_environments(environment_files,
+                                            files, params,
+                                            tmpl.all_param_schemata(files))
                 tmpl.env = environment.Environment(params)
 
         max_resources = cfg.CONF.max_resources_per_stack
@@ -912,7 +1036,12 @@ class EngineService(service.Service):
                                  current_stack.timeout_mins)
         common_params.setdefault(rpc_api.PARAM_DISABLE_ROLLBACK,
                                  current_stack.disable_rollback)
+        common_params.setdefault(rpc_api.PARAM_CONVERGE,
+                                 current_stack.converge)
 
+        if args.get(rpc_api.PARAM_EXISTING, False):
+            if rpc_api.STACK_TAGS not in common_params:
+                common_params[rpc_api.STACK_TAGS] = current_stack.tags
         current_kwargs.update(common_params)
         updated_stack = parser.Stack(cnxt, stack_name, tmpl,
                                      **current_kwargs)
@@ -922,7 +1051,8 @@ class EngineService(service.Service):
         if invalid_params:
             raise exception.ImmutableParameterModified(*invalid_params)
 
-        self.resource_enforcer.enforce_stack(updated_stack)
+        self.resource_enforcer.enforce_stack(updated_stack,
+                                             is_registered_policy=True)
         updated_stack.parameters.set_stack_id(current_stack.identifier())
 
         self._validate_deferred_auth_context(cnxt, updated_stack)
@@ -932,7 +1062,8 @@ class EngineService(service.Service):
 
     @context.request_context
     def update_stack(self, cnxt, stack_identity, template, params,
-                     files, args, environment_files=None, template_id=None):
+                     files, args, environment_files=None,
+                     files_container=None, template_id=None):
         """Update an existing stack based on the provided template and params.
 
         Note that at this stage the template has already been fetched from the
@@ -947,17 +1078,21 @@ class EngineService(service.Service):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: optional swift container name
         :param template_id: the ID of a pre-stored template in the DB
         """
         # Get the database representation of the existing stack
         db_stack = self._get_stack(cnxt, stack_identity)
-        LOG.info(_LI('Updating stack %s'), db_stack.name)
+        LOG.info('Updating stack %s', db_stack.name)
         if cfg.CONF.reauthentication_auth_method == 'trusts':
             current_stack = parser.Stack.load(
-                cnxt, stack=db_stack, use_stored_context=True)
+                cnxt, stack=db_stack, use_stored_context=True,
+                check_refresh_cred=True)
         else:
-            current_stack = parser.Stack.load(cnxt, stack=db_stack)
-        self.resource_enforcer.enforce_stack(current_stack)
+            current_stack = parser.Stack.load(cnxt, stack=db_stack,
+                                              check_refresh_cred=True)
+        self.resource_enforcer.enforce_stack(current_stack,
+                                             is_registered_policy=True)
 
         if current_stack.action == current_stack.SUSPEND:
             msg = _('Updating a stack when it is suspended')
@@ -969,27 +1104,32 @@ class EngineService(service.Service):
 
         tmpl, current_stack, updated_stack = self._prepare_stack_updates(
             cnxt, current_stack, template, params,
-            environment_files, files, args, template_id)
+            environment_files, files, files_container,
+            args, template_id)
 
         if current_stack.convergence:
             current_stack.thread_group_mgr = self.thread_group_mgr
             current_stack.converge_stack(template=tmpl,
                                          new_stack=updated_stack)
         else:
-            msg_queue = eventlet.queue.LightQueue()
+            msg_queue = queue.Queue()
+            stored_event = NotifyEvent()
             th = self.thread_group_mgr.start_with_lock(cnxt, current_stack,
                                                        self.engine_id,
                                                        current_stack.update,
                                                        updated_stack,
-                                                       msg_queue=msg_queue)
+                                                       msg_queue=msg_queue,
+                                                       notify=stored_event)
             th.link(self.thread_group_mgr.remove_msg_queue,
                     current_stack.id, msg_queue)
             self.thread_group_mgr.add_msg_queue(current_stack.id, msg_queue)
+            stored_event.wait()
         return dict(current_stack.identifier())
 
     @context.request_context
     def preview_update_stack(self, cnxt, stack_identity, template, params,
-                             files, args, environment_files=None):
+                             files, args, environment_files=None,
+                             files_container=None):
         """Shows the resources that would be updated.
 
         The preview_update_stack method shows the resources that would be
@@ -1006,13 +1146,13 @@ class EngineService(service.Service):
         """
         # Get the database representation of the existing stack
         db_stack = self._get_stack(cnxt, stack_identity)
-        LOG.info(_LI('Previewing update of stack %s'), db_stack.name)
+        LOG.info('Previewing update of stack %s', db_stack.name)
 
         current_stack = parser.Stack.load(cnxt, stack=db_stack)
 
         tmpl, current_stack, updated_stack = self._prepare_stack_updates(
             cnxt, current_stack, template, params,
-            environment_files, files, args)
+            environment_files, files, files_container, args)
 
         update_task = update.StackUpdate(current_stack, updated_stack, None)
 
@@ -1026,11 +1166,13 @@ class EngineService(service.Service):
                 return api.format_stack_resource(current.resources.get(k))
 
             return {
-                'unchanged': map(fmt_updated_res, act.get('unchanged', [])),
-                'updated': map(fmt_current_res, act.get('updated', [])),
-                'replaced': map(fmt_updated_res, act.get('replaced', [])),
-                'added': map(fmt_updated_res, act.get('added', [])),
-                'deleted': map(fmt_current_res, act.get('deleted', [])),
+                'unchanged': list(
+                    map(fmt_updated_res, act.get('unchanged', []))),
+                'updated': list(map(fmt_current_res, act.get('updated', []))),
+                'replaced': list(
+                    map(fmt_updated_res, act.get('replaced', []))),
+                'added': list(map(fmt_updated_res, act.get('added', []))),
+                'deleted': list(map(fmt_current_res, act.get('deleted', []))),
             }
 
         updated_stack.id = current_stack.id
@@ -1107,18 +1249,21 @@ class EngineService(service.Service):
         db_stack = self._get_stack(cnxt, stack_identity)
 
         current_stack = parser.Stack.load(cnxt, stack=db_stack)
-        if cancel_with_rollback:  # Commanded by user
+
+        if cancel_with_rollback:
             allowed_actions = (current_stack.UPDATE,)
-        else:  # Cancelled by parent stack
+        else:
             allowed_actions = (current_stack.UPDATE, current_stack.CREATE)
+
         if not (current_stack.status == current_stack.IN_PROGRESS and
                 current_stack.action in allowed_actions):
             state = '_'.join(current_stack.state)
             msg = _("Cancelling update when stack is %s") % str(state)
             raise exception.NotSupported(feature=msg)
-        LOG.info(_LI('Starting cancel of updating stack %s'), db_stack.name)
+        LOG.info('Starting cancel of updating stack %s', db_stack.name)
 
         if current_stack.convergence:
+            current_stack.thread_group_mgr = self.thread_group_mgr
             if cancel_with_rollback:
                 func = current_stack.rollback
             else:
@@ -1127,12 +1272,13 @@ class EngineService(service.Service):
             self.thread_group_mgr.start(current_stack.id, func)
             return
 
-        # stop the running update and take the lock
-        # as we cancel only running update, the acquire_result is
-        # always some engine_id, not None
         lock = stack_lock.StackLock(cnxt, current_stack.id,
                                     self.engine_id)
-        engine_id = lock.try_acquire()
+        engine_id = lock.get_engine_id()
+
+        if engine_id is None:
+            LOG.debug('No lock found on stack %s', db_stack.name)
+            return
 
         if cancel_with_rollback:
             cancel_message = rpc_api.THREAD_CANCEL_WITH_ROLLBACK
@@ -1146,20 +1292,28 @@ class EngineService(service.Service):
         # Another active engine has the lock
         elif service_utils.engine_alive(cnxt, engine_id):
             cancel_result = self._remote_call(
-                cnxt, engine_id, self.listener.SEND,
+                cnxt, engine_id, cfg.CONF.engine_life_check_timeout,
+                self.listener.SEND,
                 stack_identity=stack_identity, message=cancel_message)
             if cancel_result is None:
                 LOG.debug("Successfully sent %(msg)s message "
-                          "to remote task on engine %(eng)s" % {
-                              'eng': engine_id, 'msg': cancel_message})
+                          "to remote task on engine %(eng)s",
+                          {'eng': engine_id, 'msg': cancel_message})
             else:
                 raise exception.EventSendFailed(stack_name=current_stack.name,
                                                 engine_id=engine_id)
 
+        else:
+            LOG.warning(
+                'Cannot cancel stack %(stack_name)s: lock held by '
+                'unknown engine %(engine_id)s',
+                {'stack_name': db_stack.name,
+                 'engine_id': engine_id})
+
     @context.request_context
     def validate_template(self, cnxt, template, params=None, files=None,
-                          environment_files=None, show_nested=False,
-                          ignorable_errors=None):
+                          environment_files=None, files_container=None,
+                          show_nested=False, ignorable_errors=None):
         """Check the validity of a template.
 
         Checks, so far as we can, that a template is valid, and returns
@@ -1171,18 +1325,18 @@ class EngineService(service.Service):
         :param params: Stack Input Params
         :param files: Files referenced from the template
         :param environment_files: optional ordered list of environment file
-               names included in the files dict
+                                  names included in the files dict
         :type  environment_files: list or None
+        :param files_container: optional swift container name
         :param show_nested: if True, any nested templates will be checked
         :param ignorable_errors: List of error_code to be ignored as part of
-        validation
+                                 validation
         """
-        LOG.info(_LI('validate_template'))
+        LOG.info('validate_template')
         if template is None:
             msg = _("No Template provided.")
             return webob.exc.HTTPBadRequest(explanation=msg)
 
-        service_check_defer = False
         if ignorable_errors:
             invalid_codes = (set(ignorable_errors) -
                              set(exception.ERROR_CODE_MAP.keys()))
@@ -1190,28 +1344,26 @@ class EngineService(service.Service):
                 msg = (_("Invalid codes in ignore_errors : %s") %
                        list(invalid_codes))
                 return webob.exc.HTTPBadRequest(explanation=msg)
-
-            service_check_defer = True
-
+        if files_container:
+            files = template_files.get_files_from_container(
+                cnxt, files_container, files)
         tmpl = templatem.Template(template, files=files)
-        env_util.merge_environments(environment_files, files, params,
-                                    tmpl.param_schemata())
+        env_util.merge_environments(environment_files, files,
+                                    params, tmpl.all_param_schemata(files))
         tmpl.env = environment.Environment(params)
         try:
             self._validate_template(cnxt, tmpl)
         except Exception as ex:
-            return {'Error': six.text_type(ex)}
+            return {'Error': str(ex)}
 
         stack_name = 'dummy'
         stack = parser.Stack(cnxt, stack_name, tmpl,
-                             strict_validate=False,
-                             resource_validate=False,
-                             service_check_defer=service_check_defer)
+                             strict_validate=False)
         try:
             stack.validate(ignorable_errors=ignorable_errors,
-                           validate_by_deps=False)
+                           validate_res_tmpl_only=True)
         except exception.StackValidationFailed as ex:
-            return {'Error': six.text_type(ex)}
+            return {'Error': str(ex)}
 
         def filter_parameter(p):
             return p.name not in stack.parameters.PSEUDO_PARAMETERS
@@ -1229,29 +1381,9 @@ class EngineService(service.Service):
             result['ParameterGroups'] = param_groups.parameter_groups
 
         if show_nested:
-            # Note preview_resources is needed here to build the tree
-            # of nested resources/stacks in memory, otherwise the
-            # nested/has_nested() tests below won't work
-            stack.preview_resources()
+            result.update(stack.get_nested_parameters(filter_parameter))
 
-            def nested_params(stk):
-                n_result = {}
-                for r in stk:
-                    if stk[r].has_nested():
-                        n_params = stk[r].nested().parameters.map(
-                            api.format_validate_parameter,
-                            filter_func=filter_parameter)
-                        n_result[r] = {
-                            'Type': stk[r].type(),
-                            'Description': stk[r].nested().t.get(
-                                'Description', ''),
-                            'Parameters': n_params
-                        }
-                        n_result[r].update(nested_params(stk[r].nested()))
-                return {'NestedParameters': n_result} if n_result else {}
-
-            result.update(nested_params(stack))
-
+        result['Environment'] = tmpl.env.user_env_as_dict()
         return result
 
     @context.request_context
@@ -1282,7 +1414,16 @@ class EngineService(service.Service):
         :rtype: dict
         """
         s = self._get_stack(cnxt, stack_identity, show_deleted=True)
-        return s.raw_template.environment
+        tmpl = templatem.Template.load(cnxt, s.raw_template_id, s.raw_template)
+        param_schemata = tmpl.all_param_schemata(tmpl.files)
+        env = copy.deepcopy(s.raw_template.environment)
+        for section in [env_fmt.PARAMETERS, env_fmt.PARAMETER_DEFAULTS]:
+            for param_name in env.get(section, {}).keys():
+                if (param_name not in param_schemata
+                        or not param_schemata[param_name].hidden):
+                    continue
+                env[section][param_name] = str('******')
+        return env
 
     @context.request_context
     def get_files(self, cnxt, stack_identity):
@@ -1308,7 +1449,7 @@ class EngineService(service.Service):
         s = self._get_stack(cntx, stack_identity)
         stack = parser.Stack.load(cntx, stack=s)
 
-        return api.format_stack_outputs(stack.outputs)
+        return api.format_stack_outputs(stack.outputs, resolve_value=False)
 
     @context.request_context
     def show_output(self, cntx, stack_identity, output_key):
@@ -1328,10 +1469,11 @@ class EngineService(service.Service):
             raise exception.NotFound(_('Specified output key %s not '
                                        'found.') % output_key)
 
+        stack._update_all_resource_data(for_resources=False,
+                                        for_outputs={output_key})
         return api.format_stack_output(outputs[output_key])
 
-    def _remote_call(self, cnxt, lock_engine_id, call, **kwargs):
-        timeout = cfg.CONF.engine_life_check_timeout
+    def _remote_call(self, cnxt, lock_engine_id, timeout, call, **kwargs):
         self.cctxt = self._client.prepare(
             version='1.0',
             timeout=timeout,
@@ -1351,19 +1493,29 @@ class EngineService(service.Service):
         """
 
         st = self._get_stack(cnxt, stack_identity)
-        LOG.info(_LI('Deleting stack %s'), st.name)
-        stack = parser.Stack.load(cnxt, stack=st)
-        self.resource_enforcer.enforce_stack(stack)
+        LOG.info('Deleting stack %s', st.name)
+        stack = parser.Stack.load(cnxt, stack=st, check_refresh_cred=True)
+        self.resource_enforcer.enforce_stack(stack, is_registered_policy=True)
+        if (stack.status == stack.COMPLETE and stack.action == stack.DELETE):
+            # In convergence try to soft delete the stack again
+            if stack.convergence:
+                self.thread_group_mgr.start(stack.id, stack.purge_db)
+            raise exception.EntityNotFound(entity='Stack', name=stack.name)
 
-        if stack.convergence and cfg.CONF.convergence_engine:
-            def convergence_delete():
-                stack.thread_group_mgr = self.thread_group_mgr
+        if stack.convergence:
+            stack.thread_group_mgr = self.thread_group_mgr
+            template = templatem.Template.create_empty_template(
+                from_template=stack.t)
+
+            # stop existing traversal; mark stack as FAILED
+            if stack.status == stack.IN_PROGRESS:
+                self.worker_service.stop_traversal(stack)
+
+            def stop_workers():
                 self.worker_service.stop_all_workers(stack)
-                template = templatem.Template.create_empty_template(
-                    from_template=stack.t)
-                stack.converge_stack(template=template, action=stack.DELETE)
 
-            self.thread_group_mgr.start(stack.id, convergence_delete)
+            stack.converge_stack(template=template, action=stack.DELETE,
+                                 pre_converge=stop_workers)
             return
 
         lock = stack_lock.StackLock(cnxt, stack.id, self.engine_id)
@@ -1372,39 +1524,82 @@ class EngineService(service.Service):
             # Successfully acquired lock
             if acquire_result is None:
                 self.thread_group_mgr.stop_timers(stack.id)
+                stored = NotifyEvent()
                 self.thread_group_mgr.start_with_acquired_lock(stack, lock,
-                                                               stack.delete)
+                                                               stack.delete,
+                                                               notify=stored)
+                stored.wait()
                 return
 
         # Current engine has the lock
         if acquire_result == self.engine_id:
             # give threads which are almost complete an opportunity to
             # finish naturally before force stopping them
-            eventlet.sleep(0.2)
-            self.thread_group_mgr.stop(stack.id)
+            self.thread_group_mgr.send(stack.id, rpc_api.THREAD_CANCEL)
 
         # Another active engine has the lock
         elif service_utils.engine_alive(cnxt, acquire_result):
-            stop_result = self._remote_call(
-                cnxt, acquire_result, self.listener.STOP_STACK,
-                stack_identity=stack_identity)
-            if stop_result is None:
-                LOG.debug("Successfully stopped remote task on engine %s"
-                          % acquire_result)
+            cancel_result = self._remote_call(
+                cnxt, acquire_result, cfg.CONF.engine_life_check_timeout,
+                self.listener.SEND,
+                stack_identity=stack_identity, message=rpc_api.THREAD_CANCEL)
+            if cancel_result is None:
+                LOG.debug("Successfully sent %(msg)s message "
+                          "to remote task on engine %(eng)s",
+                          {'eng': acquire_result,
+                           'msg': rpc_api.THREAD_CANCEL})
             else:
-                raise exception.StopActionFailed(stack_name=stack.name,
-                                                 engine_id=acquire_result)
+                raise exception.EventSendFailed(stack_name=stack.name,
+                                                engine_id=acquire_result)
 
-        # There may be additional resources that we don't know about
-        # if an update was in-progress when the stack was stopped, so
-        # reload the stack from the database.
-        st = self._get_stack(cnxt, stack_identity)
-        stack = parser.Stack.load(cnxt, stack=st)
-        self.resource_enforcer.enforce_stack(stack)
+        def reload():
+            st = self._get_stack(cnxt, stack_identity)
+            stack = parser.Stack.load(cnxt, stack=st)
+            self.resource_enforcer.enforce_stack(stack,
+                                                 is_registered_policy=True)
+            return stack
 
-        self.thread_group_mgr.start_with_lock(cnxt, stack, self.engine_id,
-                                              stack.delete)
-        return
+        def wait_then_delete(stack):
+            watch = timeutils.StopWatch(cfg.CONF.error_wait_time + 10)
+            watch.start()
+
+            while not watch.expired():
+                LOG.debug('Waiting for stack cancel to complete: %s',
+                          stack.name)
+                with lock.try_thread_lock() as acquire_result:
+
+                    if acquire_result is None:
+                        stack = reload()
+                        # do the actual delete with the aquired lock
+                        self.thread_group_mgr.start_with_acquired_lock(
+                            stack, lock, stack.delete)
+                        return
+                time.sleep(1.0)
+
+            if acquire_result == self.engine_id:
+                # cancel didn't finish in time, attempt a stop instead
+                self.thread_group_mgr.stop(stack.id)
+            elif service_utils.engine_alive(cnxt, acquire_result):
+                # Another active engine has the lock
+                stop_result = self._remote_call(
+                    cnxt, acquire_result, STOP_STACK_TIMEOUT,
+                    self.listener.STOP_STACK,
+                    stack_identity=stack_identity)
+                if stop_result is None:
+                    LOG.debug("Successfully stopped remote task "
+                              "on engine %s", acquire_result)
+                else:
+                    raise exception.StopActionFailed(
+                        stack_name=stack.name, engine_id=acquire_result)
+
+            stack = reload()
+            # do the actual delete in a locked task
+            self.thread_group_mgr.start_with_lock(cnxt, stack, self.engine_id,
+                                                  stack.delete)
+
+        # Cancelling the stack could take some time, so do it in a task
+        self.thread_group_mgr.start(stack.id, wait_then_delete,
+                                    stack)
 
     @context.request_context
     def export_stack(self, cnxt, stack_identity):
@@ -1429,20 +1624,25 @@ class EngineService(service.Service):
         if not cfg.CONF.enable_stack_abandon:
             raise exception.NotSupported(feature='Stack Abandon')
 
+        def _stack_abandon(stk, abandon):
+            if abandon:
+                LOG.info('abandoning stack %s', stk.name)
+                stk.delete(abandon=abandon)
+            else:
+                LOG.info('exporting stack %s', stk.name)
+
         st = self._get_stack(cnxt, stack_identity)
         stack = parser.Stack.load(cnxt, stack=st)
         lock = stack_lock.StackLock(cnxt, stack.id, self.engine_id)
         with lock.thread_lock():
             # Get stack details before deleting it.
             stack_info = stack.prepare_abandon()
-            if abandon:
-                LOG.info(_LI('abandoning stack %s'), st.name)
-                self.thread_group_mgr.start_with_acquired_lock(stack,
-                                                               lock,
-                                                               stack.delete,
-                                                               abandon=True)
-            else:
-                LOG.info(_LI('exporting stack %s'), st.name)
+            self.thread_group_mgr.start_with_acquired_lock(stack,
+                                                           lock,
+                                                           _stack_abandon,
+                                                           stack,
+                                                           abandon)
+
             return stack_info
 
     def list_resource_types(self,
@@ -1465,10 +1665,6 @@ class EngineService(service.Service):
             type_name=type_name,
             version=heat_version,
             with_description=with_description)
-        if with_description:
-            for resource_type in result:
-                resource_type['description'] = api.build_resource_description(
-                    resource_type['description'])
         return result
 
     def list_template_versions(self, cnxt):
@@ -1482,7 +1678,7 @@ class EngineService(service.Service):
                              for name in mgr.names()]
         versions = []
         for t in sorted(_template_classes):  # Sort to ensure dates come first
-            if issubclass(t[1], cfntemplate.CfnTemplate):
+            if issubclass(t[1], cfntemplate.CfnTemplateBase):
                 type = 'cfn'
             else:
                 type = 'hot'
@@ -1507,7 +1703,8 @@ class EngineService(service.Service):
 
         return versions
 
-    def list_template_functions(self, cnxt, template_version):
+    def list_template_functions(self, cnxt, template_version,
+                                with_condition=False):
         mgr = templatem._get_template_extension_manager()
         try:
             tmpl_class = mgr[template_version]
@@ -1515,13 +1712,14 @@ class EngineService(service.Service):
             raise exception.NotFound(_("Template with version %s not found") %
                                      template_version)
 
+        supported_funcs = tmpl_class.plugin.functions
+        if with_condition:
+            supported_funcs.update(tmpl_class.plugin.condition_functions)
+
         functions = []
-        for func_name, func in six.iteritems(tmpl_class.plugin.functions):
+        for func_name, func in supported_funcs.items():
             if func is not hot_functions.Removed:
-                if func.__doc__.split('\n')[0]:
-                    desc = func.__doc__.split('\n')[0].strip()
-                else:
-                    desc = func.__doc__.split('\n')[1].strip()
+                desc = pydoc.splitdoc(pydoc.getdoc(func))[0]
                 functions.append(
                     {'functions': func_name,
                      'description': desc}
@@ -1535,14 +1733,17 @@ class EngineService(service.Service):
         :param type_name: Name of the resource type to obtain the schema of.
         :param with_description: Return result with description or not.
         """
-        self.resource_enforcer.enforce(cnxt, type_name)
+        self.resource_enforcer.enforce(cnxt, type_name,
+                                       is_registered_policy=True)
         try:
             resource_class = resources.global_env().get_class(type_name)
         except exception.NotFound:
-            LOG.exception(_LE('Error loading resource type %s '
-                              'from global environment.'),
+            LOG.exception('Error loading resource type %s '
+                          'from global environment.',
                           type_name)
             raise exception.InvalidGlobalResource(type_name=type_name)
+
+        assert resource_class is not None
 
         if resource_class.support_status.status == support.HIDDEN:
             raise exception.NotSupported(feature=type_name)
@@ -1553,7 +1754,7 @@ class EngineService(service.Service):
             raise exception.ResourceTypeUnavailable(
                 service_name=resource_class.default_client_name,
                 resource_type=type_name,
-                reason=six.text_type(exc))
+                reason=str(exc))
         else:
             if not svc_available:
                 raise exception.ResourceTypeUnavailable(
@@ -1584,9 +1785,7 @@ class EngineService(service.Service):
                 resource_class.support_status.to_dict()
         }
         if with_description:
-            docstring = resource_class.__doc__
-            description = api.build_resource_description(docstring)
-            result[rpc_api.RES_SCHEMA_DESCRIPTION] = description
+            result[rpc_api.RES_SCHEMA_DESCRIPTION] = resource_class.getdoc()
         return result
 
     def generate_template(self, cnxt, type_name, template_type='cfn'):
@@ -1596,12 +1795,13 @@ class EngineService(service.Service):
         :param type_name: Name of the resource type to generate a template for.
         :param template_type: the template type to generate, cfn or hot.
         """
-        self.resource_enforcer.enforce(cnxt, type_name)
+        self.resource_enforcer.enforce(cnxt, type_name,
+                                       is_registered_policy=True)
         try:
             resource_class = resources.global_env().get_class(type_name)
         except exception.NotFound:
-            LOG.exception(_LE('Error loading resource type %s '
-                              'from global environment.'),
+            LOG.exception('Error loading resource type %s '
+                          'from global environment.',
                           type_name)
             raise exception.InvalidGlobalResource(type_name=type_name)
         else:
@@ -1637,12 +1837,12 @@ class EngineService(service.Service):
 
             if nested_depth:
                 root_stack_identifier = st.identifier()
-                # find all resources associated with a root stack
-                all_r = resource_objects.Resource.get_all_by_root_stack(
-                    cnxt, st.id, None)
+                # find all stacks with resources associated with a root stack
+                ResObj = resource_objects.Resource
+                stack_ids = ResObj.get_all_stack_ids_by_root_stack(cnxt,
+                                                                   st.id)
 
                 # find stacks to the requested nested_depth
-                stack_ids = {r.stack_id for r in six.itervalues(all_r)}
                 stack_filters = {
                     'id': stack_ids,
                     'nested_depth': list(range(nested_depth + 1))
@@ -1687,8 +1887,12 @@ class EngineService(service.Service):
                                                 show_nested=True)
             stack_identifiers = {s.id: s.identifier() for s in stacks}
 
+        # a 'uuid' in filters indicates we are showing a full event, i.e.
+        # the only time we need to load the event's rsrc prop data.
+        include_rsrc_prop_data = (filters and 'uuid' in filters)
         return [api.format_event(e, stack_identifiers.get(e.stack_id),
-                root_stack_identifier) for e in events]
+                                 root_stack_identifier, include_rsrc_prop_data)
+                for e in events]
 
     def _authorize_stack_user(self, cnxt, stack, resource_name):
         """Filter access to describe_stack_resource for in-instance users.
@@ -1712,15 +1916,6 @@ class EngineService(service.Service):
         access_key = ec2_creds.get('access')
         return stack.access_allowed(access_key, resource_name)
 
-    def _verify_stack_resource(self, stack, resource_name):
-        if resource_name not in stack:
-            raise exception.ResourceNotFound(resource_name=resource_name,
-                                             stack_name=stack.name)
-
-        resource = stack[resource_name]
-        if resource.id is None:
-            raise exception.ResourceNotAvailable(resource_name=resource_name)
-
     @context.request_context
     def describe_stack_resource(self, cnxt, stack_identity, resource_name,
                                 with_attr=None):
@@ -1729,7 +1924,7 @@ class EngineService(service.Service):
 
         if cfg.CONF.heat_stack_user_role in cnxt.roles:
             if not self._authorize_stack_user(cnxt, stack, resource_name):
-                LOG.warning(_LW("Access denied to resource %s"), resource_name)
+                LOG.warning("Access denied to resource %s", resource_name)
                 raise exception.Forbidden()
 
         resource = stack.resource_get(resource_name)
@@ -1750,7 +1945,7 @@ class EngineService(service.Service):
         """
 
         def _resource_signal(stack, rsrc, details, need_check):
-            LOG.debug("signaling resource %s:%s" % (stack.name, rsrc.name))
+            LOG.debug("signaling resource %s:%s", stack.name, rsrc.name)
             needs_metadata_updates = rsrc.signal(details, need_check)
 
             if not needs_metadata_updates:
@@ -1760,10 +1955,12 @@ class EngineService(service.Service):
             # update metadata which is used by other resources, e.g
             # when signalling a WaitConditionHandle resource, and other
             # resources may refer to WaitCondition Fn::GetAtt Data
-            for r in stack.dependencies:
-                if (r.name != rsrc.name and r.id is not None and
-                        r.action != r.INIT):
-                    r.metadata_update()
+            for r in stack._explicit_dependencies():
+                if r.action != r.INIT:
+                    if r.name != rsrc.name:
+                        r.metadata_update()
+                    stk_defn.update_resource_data(stack.defn, r.name,
+                                                  r.node_data())
 
         s = self._get_stack(cnxt, stack_identity)
 
@@ -1772,19 +1969,24 @@ class EngineService(service.Service):
         # signal doesn't have permission to read the secret key of
         # the user associated with the cfn-credentials file
         stack = parser.Stack.load(cnxt, stack=s, use_stored_context=True)
-        self._verify_stack_resource(stack, resource_name)
 
-        rsrc = stack[resource_name]
+        rsrc = stack.resource_get(resource_name)
+        if rsrc is None:
+            raise exception.ResourceNotFound(resource_name=resource_name,
+                                             stack_name=stack.name)
+        if rsrc.id is None:
+            raise exception.ResourceNotAvailable(resource_name=resource_name)
 
         if callable(rsrc.signal):
             rsrc._signal_check_action()
             rsrc._signal_check_hook(details)
-            if sync_call:
+            if sync_call or not callable(getattr(rsrc, 'handle_signal', None)):
                 _resource_signal(stack, rsrc, details, False)
-                return rsrc.metadata_get()
             else:
                 self.thread_group_mgr.start(stack.id, _resource_signal,
                                             stack, rsrc, details, False)
+            if sync_call:
+                return rsrc.metadata_get()
 
     @context.request_context
     def resource_mark_unhealthy(self, cnxt, stack_identity, resource_name,
@@ -1796,6 +1998,8 @@ class EngineService(service.Service):
            is false and the resource is in CHECK_FAILED state.
            Otherwise, make no change.
 
+        :param resource_name: either the logical name of the resource or the
+                              physical resource ID.
         :param mark_unhealthy: indicates whether the resource is unhealthy.
         :param resource_status_reason: reason for health change.
         """
@@ -1807,28 +2011,56 @@ class EngineService(service.Service):
                                             rsrc.stack.id,
                                             self.engine_id)
 
-        s = self._get_stack(cnxt, stack_identity)
-        stack = parser.Stack.load(cnxt, stack=s)
-        if resource_name not in stack:
-            raise exception.ResourceNotFound(resource_name=resource_name,
-                                             stack_name=stack.name)
-
         if not isinstance(mark_unhealthy, bool):
             raise exception.Invalid(reason="mark_unhealthy is not a boolean")
 
-        rsrc = stack[resource_name]
+        s = self._get_stack(cnxt, stack_identity)
+        stack = parser.Stack.load(cnxt, stack=s)
+
+        rsrc = self._find_resource_in_stack(cnxt, resource_name, stack)
+
         reason = (resource_status_reason or
                   "state changed by resource_mark_unhealthy api")
         try:
             with lock(rsrc):
                 if mark_unhealthy:
-                    rsrc.state_set(rsrc.CHECK, rsrc.FAILED, reason=reason)
+                    if rsrc.action != rsrc.DELETE:
+                        rsrc.state_set(rsrc.CHECK, rsrc.FAILED, reason=reason)
                 elif rsrc.state == (rsrc.CHECK, rsrc.FAILED):
+                    rsrc.handle_metadata_reset()
                     rsrc.state_set(rsrc.CHECK, rsrc.COMPLETE, reason=reason)
 
         except exception.UpdateInProgress:
             raise exception.ActionInProgress(stack_name=stack.name,
                                              action=stack.action)
+
+    @staticmethod
+    def _find_resource_in_stack(cnxt, resource_name, stack):
+        """Find a resource in a stack by either name or physical ID."""
+        if resource_name in stack:
+            return stack[resource_name]
+
+        rsrcs = resource_objects.Resource.get_all_by_physical_resource_id(
+            cnxt,
+            resource_name)
+
+        def in_stack(rs):
+            return rs.stack_id == stack.id and stack[rs.name].id == rs.id
+
+        matches = [stack[rs.name] for rs in rsrcs if in_stack(rs)]
+
+        if matches:
+            if len(matches) == 1:
+                return matches[0]
+            raise exception.PhysicalResourceIDAmbiguity(phys_id=resource_name)
+
+        # Try it the slow way
+        match = stack.resource_by_refid(resource_name)
+        if match is not None:
+            return match
+
+        raise exception.ResourceNotFound(resource_name=resource_name,
+                                         stack_name=stack.name)
 
     @context.request_context
     def find_physical_resource(self, cnxt, physical_resource_id):
@@ -1837,13 +2069,21 @@ class EngineService(service.Service):
         :param cnxt: RPC context.
         :param physical_resource_id: The physical resource ID to look up.
         """
-        rs = resource_objects.Resource.get_by_physical_resource_id(
+        rsrcs = resource_objects.Resource.get_all_by_physical_resource_id(
             cnxt,
             physical_resource_id)
-        if not rs:
+
+        if not rsrcs:
             raise exception.EntityNotFound(entity='Resource',
                                            name=physical_resource_id)
+        # This call is used only in the cfn API, which only cares about
+        # finding the stack anyway. So allow duplicate resource IDs within the
+        # same stack.
+        if len({rs.stack_id for rs in rsrcs}) > 1:
+            raise exception.PhysicalResourceIDAmbiguity(
+                phys_id=physical_resource_id)
 
+        rs = rsrcs[0]
         stack = parser.Stack.load(cnxt, stack_id=rs.stack_id)
         resource = stack[rs.name]
 
@@ -1856,7 +2096,7 @@ class EngineService(service.Service):
         stack = parser.Stack.load(cnxt, stack=s)
 
         return [api.format_stack_resource(resource)
-                for name, resource in six.iteritems(stack)
+                for name, resource in stack.items()
                 if resource_name is None or name == resource_name]
 
     @context.request_context
@@ -1893,30 +2133,28 @@ class EngineService(service.Service):
     @context.request_context
     def stack_suspend(self, cnxt, stack_identity):
         """Handle request to perform suspend action on a stack."""
-        def _stack_suspend(stack):
-            LOG.debug("suspending stack %s" % stack.name)
-            stack.suspend()
-
         s = self._get_stack(cnxt, stack_identity)
 
         stack = parser.Stack.load(cnxt, stack=s)
-        self.resource_enforcer.enforce_stack(stack)
+        self.resource_enforcer.enforce_stack(stack, is_registered_policy=True)
+        stored_event = NotifyEvent()
         self.thread_group_mgr.start_with_lock(cnxt, stack, self.engine_id,
-                                              _stack_suspend, stack)
+                                              stack.suspend,
+                                              notify=stored_event)
+        stored_event.wait()
 
     @context.request_context
     def stack_resume(self, cnxt, stack_identity):
         """Handle request to perform a resume action on a stack."""
-        def _stack_resume(stack):
-            LOG.debug("resuming stack %s" % stack.name)
-            stack.resume()
-
         s = self._get_stack(cnxt, stack_identity)
 
         stack = parser.Stack.load(cnxt, stack=s)
-        self.resource_enforcer.enforce_stack(stack)
+        self.resource_enforcer.enforce_stack(stack, is_registered_policy=True)
+        stored_event = NotifyEvent()
         self.thread_group_mgr.start_with_lock(cnxt, stack, self.engine_id,
-                                              _stack_resume, stack)
+                                              stack.resume,
+                                              notify=stored_event)
+        stored_event.wait()
 
     @context.request_context
     def stack_snapshot(self, cnxt, stack_identity, name):
@@ -1931,25 +2169,36 @@ class EngineService(service.Service):
                     {'data': data, 'status': status,
                      'status_reason': reason})
 
-            LOG.debug("Snapshotting stack %s" % stack.name)
+            LOG.debug("Snapshotting stack %s", stack.name)
             stack.snapshot(save_snapshot_func=save_snapshot)
 
         s = self._get_stack(cnxt, stack_identity)
 
         stack = parser.Stack.load(cnxt, stack=s)
         if stack.status == stack.IN_PROGRESS:
-            LOG.info(_LI('%(stack)s is in state %(action)s_IN_PROGRESS, '
-                         'snapshot is not permitted.'), {
-                             'stack': six.text_type(stack),
-                             'action': stack.action})
+            LOG.info('%(stack)s is in state %(action)s_IN_PROGRESS, '
+                     'snapshot is not permitted.', {
+                         'stack': str(stack),
+                         'action': stack.action})
             raise exception.ActionInProgress(stack_name=stack.name,
                                              action=stack.action)
+
+        # Do not enforce the limit, following the stack limit
+        if not cnxt.is_admin:
+            stack_limit = cfg.CONF.max_snapshots_per_stack
+            count_all = snapshot_object.Snapshot.count_all_by_stack(cnxt,
+                                                                    stack.id)
+            if (stack_limit >= 0 and count_all >= stack_limit):
+                message = _("You have reached the maximum snapshots "
+                            "per stack, %d. Please delete some "
+                            "snapshots.") % stack_limit
+                raise exception.RequestLimitExceeded(message=message)
 
         lock = stack_lock.StackLock(cnxt, stack.id, self.engine_id)
 
         with lock.thread_lock():
             snapshot = snapshot_object.Snapshot.create(cnxt, {
-                'tenant': cnxt.tenant_id,
+                'tenant': cnxt.project_id,
                 'name': name,
                 'stack_id': stack.id,
                 'status': 'IN_PROGRESS'})
@@ -1986,133 +2235,41 @@ class EngineService(service.Service):
         """Handle request to perform a check action on a stack."""
         s = self._get_stack(cnxt, stack_identity)
         stack = parser.Stack.load(cnxt, stack=s)
-        LOG.info(_LI("Checking stack %s"), stack.name)
+        LOG.info("Checking stack %s", stack.name)
 
+        stored_event = NotifyEvent()
         self.thread_group_mgr.start_with_lock(cnxt, stack, self.engine_id,
-                                              stack.check)
+                                              stack.check, notify=stored_event)
+        stored_event.wait()
 
     @context.request_context
     def stack_restore(self, cnxt, stack_identity, snapshot_id):
-        def _stack_restore(stack, snapshot):
-            LOG.debug("restoring stack %s" % stack.name)
-            stack.restore(snapshot)
-
         s = self._get_stack(cnxt, stack_identity)
         stack = parser.Stack.load(cnxt, stack=s)
-        self.resource_enforcer.enforce_stack(stack)
+        self.resource_enforcer.enforce_stack(stack, is_registered_policy=True)
         snapshot = snapshot_object.Snapshot.get_snapshot_by_stack(
             cnxt, snapshot_id, s)
         # FIXME(pas-ha) has to be amended to deny restoring stacks
         # that have disallowed for current user
 
-        self.thread_group_mgr.start_with_lock(cnxt, stack, self.engine_id,
-                                              _stack_restore, stack, snapshot)
+        if stack.convergence:
+            new_stack, tmpl = stack.restore_data(snapshot)
+            stack.thread_group_mgr = self.thread_group_mgr
+            stack.converge_stack(template=tmpl,
+                                 action=stack.RESTORE,
+                                 new_stack=new_stack)
+        else:
+            stored_event = NotifyEvent()
+            self.thread_group_mgr.start_with_lock(
+                cnxt, stack, self.engine_id, stack.restore, snapshot,
+                notify=stored_event)
+            stored_event.wait()
 
     @context.request_context
     def stack_list_snapshots(self, cnxt, stack_identity):
         s = self._get_stack(cnxt, stack_identity)
-        data = snapshot_object.Snapshot.get_all(cnxt, s.id)
+        data = snapshot_object.Snapshot.get_all_by_stack(cnxt, s.id)
         return [api.format_snapshot(snapshot) for snapshot in data]
-
-    @context.request_context
-    def create_watch_data(self, cnxt, watch_name, stats_data):
-        """Creates data for CloudWatch and WaitConditions.
-
-        This could be used by CloudWatch and WaitConditions
-        and treat HA service events like any other CloudWatch.
-        """
-        def get_matching_watches():
-            if watch_name:
-                yield watchrule.WatchRule.load(cnxt, watch_name)
-            else:
-                for wr in watch_rule.WatchRule.get_all(cnxt):
-                    if watchrule.rule_can_use_sample(wr, stats_data):
-                        yield watchrule.WatchRule.load(cnxt, watch=wr)
-
-        rule_run = False
-        for rule in get_matching_watches():
-            rule.create_watch_data(stats_data)
-            rule_run = True
-
-        if not rule_run:
-            if watch_name is None:
-                watch_name = 'Unknown'
-            raise exception.EntityNotFound(entity='Watch Rule',
-                                           name=watch_name)
-
-        return stats_data
-
-    @context.request_context
-    def show_watch(self, cnxt, watch_name):
-        """Return the attributes of one watch/alarm.
-
-        :param cnxt: RPC context.
-        :param watch_name: Name of the watch you want to see, or None to see
-            all.
-        """
-        if watch_name:
-            wrn = [watch_name]
-        else:
-            try:
-                wrn = [w.name for w in watch_rule.WatchRule.get_all(cnxt)]
-            except Exception as ex:
-                LOG.warning(_LW('show_watch (all) db error %s'), ex)
-                return
-
-        wrs = [watchrule.WatchRule.load(cnxt, w) for w in wrn]
-        result = [api.format_watch(w) for w in wrs]
-        return result
-
-    @context.request_context
-    def show_watch_metric(self, cnxt, metric_namespace=None, metric_name=None):
-        """Return the datapoints for a metric.
-
-        :param cnxt: RPC context.
-        :param metric_namespace: Name of the namespace you want to see, or None
-            to see all.
-        :param metric_name: Name of the metric you want to see, or None to see
-            all.
-        """
-
-        # DB API and schema does not yet allow us to easily query by
-        # namespace/metric, but we will want this at some point
-        # for now, the API can query all metric data and filter locally
-        if metric_namespace is not None or metric_name is not None:
-            LOG.error(_LE("Filtering by namespace/metric not yet supported"))
-            return
-
-        try:
-            wds = watch_data.WatchData.get_all(cnxt)
-            rule_names = {
-                r.id: r.name for r in watch_rule.WatchRule.get_all(cnxt)
-            }
-        except Exception as ex:
-            LOG.warning(_LW('show_metric (all) db error %s'), ex)
-            return
-
-        result = [api.format_watch_data(w, rule_names) for w in wds]
-        return result
-
-    @context.request_context
-    def set_watch_state(self, cnxt, watch_name, state):
-        """Temporarily set the state of a given watch.
-
-        :param cnxt: RPC context.
-        :param watch_name: Name of the watch.
-        :param state: State (must be one defined in WatchRule class.
-        """
-        wr = watchrule.WatchRule.load(cnxt, watch_name)
-        if wr.state == rpc_api.WATCH_STATE_CEILOMETER_CONTROLLED:
-            return
-        actions = wr.set_watch_state(state)
-        for action in actions:
-            self.thread_group_mgr.start(wr.stack_id, action)
-
-        # Return the watch with the state overridden to indicate success
-        # We do not update the timestamps as we are not modifying the DB
-        result = api.format_watch(wr)
-        result[rpc_api.WATCH_STATE_VALUE] = state
-        return result
 
     @context.request_context
     def show_software_config(self, cnxt, config_id):
@@ -2132,6 +2289,15 @@ class EngineService(service.Service):
     @context.request_context
     def create_software_config(self, cnxt, group, name, config,
                                inputs, outputs, options):
+        # Do not enforce the limit, following the stack limit
+        if not cnxt.is_admin:
+            tenant_limit = cfg.CONF.max_software_configs_per_tenant
+            count_all = self.software_config.count_software_config(cnxt)
+            if (tenant_limit >= 0 and count_all >= tenant_limit):
+                message = _("You have reached the maximum software configs "
+                            "per tenant, %d. "
+                            "Please delete some configs.") % tenant_limit
+                raise exception.RequestLimitExceeded(message=message)
         return self.software_config.create_software_config(
             cnxt,
             group=group,
@@ -2170,6 +2336,16 @@ class EngineService(service.Service):
                                    input_values, action, status,
                                    status_reason, stack_user_project_id,
                                    deployment_id=None):
+        # Do not enforce the limit, following the stack limit
+        if not cnxt.is_admin:
+            tenant_limit = cfg.CONF.max_software_deployments_per_tenant
+            count_all = self.software_config.count_software_deployment(cnxt)
+            if (tenant_limit >= 0 and
+                    count_all >= tenant_limit):
+                message = _("You have reached the maximum software "
+                            "deployments per tenant, %d. "
+                            "Please delete some deployments.") % tenant_limit
+                raise exception.RequestLimitExceeded(message=message)
         return self.software_config.create_software_deployment(
             cnxt, server_id=server_id,
             config_id=config_id,
@@ -2220,32 +2396,41 @@ class EngineService(service.Service):
         parent_stack = parser.Stack.load(ctxt,
                                          stack_id=stack_id,
                                          show_deleted=False)
+
+        if parent_stack.owner_id is not None:
+            msg = _("Migration of nested stack %s") % stack_id
+            raise exception.NotSupported(feature=msg)
+
         if parent_stack.convergence:
-            LOG.info(_LI("Convergence was already enabled for stack %s"),
+            LOG.info("Convergence was already enabled for stack %s",
                      stack_id)
             return
+
+        if parent_stack.status != parent_stack.COMPLETE:
+            raise exception.ActionNotComplete(stack_name=parent_stack.name,
+                                              action=parent_stack.action)
+
         db_stacks = stack_object.Stack.get_all_by_root_owner_id(
             ctxt, parent_stack.id)
         stacks = [parser.Stack.load(ctxt, stack_id=st.id,
                                     stack=st) for st in db_stacks]
+
+        # check if any of the nested stacks is in IN_PROGRESS/FAILED state
+        for stack in stacks:
+            if stack.status != stack.COMPLETE:
+                raise exception.ActionNotComplete(stack_name=stack.name,
+                                                  action=stack.action)
         stacks.append(parent_stack)
         locks = []
         try:
             for st in stacks:
                 lock = stack_lock.StackLock(ctxt, st.id, self.engine_id)
-                lock.acquire()
                 locks.append(lock)
-            sess = ctxt.session
-            sess.begin(subtransactions=True)
-            try:
+                lock.acquire()
+            with ctxt.session.begin():
                 for st in stacks:
                     if not st.convergence:
-                        st.service_check_defer = True
                         st.migrate_to_convergence()
-                sess.commit()
-            except Exception:
-                sess.rollback()
-                raise
         finally:
             for lock in locks:
                 lock.release()
@@ -2264,17 +2449,17 @@ class EngineService(service.Service):
                      report_interval=cfg.CONF.periodic_interval)
             )
             self.service_id = service_ref['id']
-            LOG.debug('Service %s is started' % self.service_id)
+            LOG.debug('Service %s is started', self.service_id)
 
         try:
             service_objects.Service.update_by_id(
                 cnxt,
                 self.service_id,
                 dict(deleted_at=None))
-            LOG.debug('Service %s is updated' % self.service_id)
+            LOG.debug('Service %s is updated', self.service_id)
         except Exception as ex:
-            LOG.error(_LE('Service %(service_id)s update '
-                          'failed: %(error)s'),
+            LOG.error('Service %(service_id)s update '
+                      'failed: %(error)s',
                       {'service_id': self.service_id, 'error': ex})
 
     def service_manage_cleanup(self):
@@ -2292,30 +2477,21 @@ class EngineService(service.Service):
                 continue
             if service_ref['updated_at'] < time_line:
                 # hasn't been updated, assuming it's died.
-                LOG.debug('Service %s was aborted' % service_ref['id'])
+                LOG.debug('Service %s was aborted', service_ref['id'])
                 service_objects.Service.delete(cnxt, service_ref['id'])
 
-    def set_stack_and_resource_to_failed(self, stack):
-        for name, rsrc in six.iteritems(stack.resources):
-            if rsrc.status == rsrc.IN_PROGRESS:
-                status_reason = ('Engine went down '
-                                 'during resource %s' % rsrc.action)
-                rsrc.state_set(rsrc.action,
-                               rsrc.FAILED,
-                               six.text_type(status_reason))
-        reason = ('Engine went down during stack %s' % stack.action)
-        stack.state_set(stack.action, stack.FAILED, six.text_type(reason))
-
     def reset_stack_status(self):
-        cnxt = context.get_admin_context()
         filters = {
             'status': parser.Stack.IN_PROGRESS,
             'convergence': False
         }
-        stacks = stack_object.Stack.get_all(cnxt,
+        stacks = stack_object.Stack.get_all(context.get_admin_context(),
                                             filters=filters,
                                             show_nested=True)
         for s in stacks:
+            # Build one context per stack, so that it can safely be passed to
+            # to thread.
+            cnxt = context.get_admin_context()
             stack_id = s.id
             lock = stack_lock.StackLock(cnxt, stack_id, self.engine_id)
             engine_id = lock.get_engine_id()
@@ -2330,24 +2506,23 @@ class EngineService(service.Service):
                         lock.release()
                         continue
 
-                    stk = parser.Stack.load(cnxt, stack=s,
-                                            service_check_defer=True,
-                                            resource_validate=False)
-                    LOG.info(_LI('Engine %(engine)s went down when stack '
-                                 '%(stack_id)s was in action %(action)s'),
+                    stk = parser.Stack.load(cnxt, stack=s)
+                    LOG.info('Engine %(engine)s went down when stack '
+                             '%(stack_id)s was in action %(action)s',
                              {'engine': engine_id, 'action': stk.action,
                               'stack_id': stk.id})
+
+                    reason = _('Engine went down during stack %s') % stk.action
 
                     # Set stack and resources status to FAILED in sub thread
                     self.thread_group_mgr.start_with_acquired_lock(
                         stk,
                         lock,
-                        self.set_stack_and_resource_to_failed,
-                        stk
+                        stk.reset_stack_and_resources_in_progress,
+                        reason
                     )
             except exception.ActionInProgress:
                 continue
             except Exception:
-                LOG.exception(_LE('Error while resetting stack: %s')
-                              % stack_id)
+                LOG.exception('Error while resetting stack: %s', stack_id)
                 continue

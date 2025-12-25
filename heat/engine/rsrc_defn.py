@@ -12,14 +12,11 @@
 
 import collections
 import copy
+import functools
 import itertools
 import operator
-import warnings
-
-import six
 
 from heat.common import exception
-from heat.common.i18n import repr_wrapper
 from heat.engine import function
 from heat.engine import properties
 
@@ -27,16 +24,26 @@ from heat.engine import properties
 __all__ = ['ResourceDefinition']
 
 
-@repr_wrapper
-class ResourceDefinitionCore(object):
+# Field names that can be passed to Template.get_section_name() in order to
+# determine the appropriate name for a particular template format.
+FIELDS = (
+    TYPE, PROPERTIES, METADATA, DELETION_POLICY, UPDATE_POLICY,
+    DEPENDS_ON, DESCRIPTION, EXTERNAL_ID,
+) = (
+    'Type', 'Properties', 'Metadata', 'DeletionPolicy', 'UpdatePolicy',
+    'DependsOn', 'Description', 'external_id',
+)
+
+
+class ResourceDefinition(object):
     """A definition of a resource, independent of any template format."""
 
     class Diff(object):
         """A diff between two versions of the same resource definition."""
 
         def __init__(self, old_defn, new_defn):
-            if not (isinstance(old_defn, ResourceDefinitionCore) and
-                    isinstance(new_defn, ResourceDefinitionCore)):
+            if not (isinstance(old_defn, ResourceDefinition) and
+                    isinstance(new_defn, ResourceDefinition)):
                 raise TypeError
 
             self.old_defn = old_defn
@@ -100,23 +107,25 @@ class ResourceDefinitionCore(object):
 
         self._hash = hash(self.resource_type)
         self._rendering = None
+        self._dep_names = None
+        self._all_dep_attrs = None
 
-        assert isinstance(self.description, six.string_types)
+        assert isinstance(self.description, str)
 
         if properties is not None:
-            assert isinstance(properties, (collections.Mapping,
+            assert isinstance(properties, (collections.abc.Mapping,
                                            function.Function))
             self._hash ^= _hash_data(properties)
 
         if metadata is not None:
-            assert isinstance(metadata, (collections.Mapping,
+            assert isinstance(metadata, (collections.abc.Mapping,
                                          function.Function))
             self._hash ^= _hash_data(metadata)
 
         if depends is not None:
-            assert isinstance(depends, (collections.Sequence,
+            assert isinstance(depends, (collections.abc.Sequence,
                                         function.Function))
-            assert not isinstance(depends, six.string_types)
+            assert not isinstance(depends, str)
             self._hash ^= _hash_data(depends)
 
         if deletion_policy is not None:
@@ -124,20 +133,22 @@ class ResourceDefinitionCore(object):
             self._hash ^= _hash_data(deletion_policy)
 
         if update_policy is not None:
-            assert isinstance(update_policy, (collections.Mapping,
+            assert isinstance(update_policy, (collections.abc.Mapping,
                                               function.Function))
             self._hash ^= _hash_data(update_policy)
 
         if external_id is not None:
-            assert isinstance(external_id, (six.string_types,
+            assert isinstance(external_id, (str,
                                             function.Function))
             self._hash ^= _hash_data(external_id)
             self._deletion_policy = self.RETAIN
 
         if condition is not None:
-            assert isinstance(condition, (six.string_types, bool,
+            assert isinstance(condition, (str, bool,
                                           function.Function))
             self._hash ^= _hash_data(condition)
+
+        self.set_translation_rules()
 
     def freeze(self, **overrides):
         """Return a frozen resource definition, with all functions resolved.
@@ -173,6 +184,10 @@ class ResourceDefinitionCore(object):
 
         This returns a new resource definition, with all of the functions
         parsed in the context of the specified stack and template.
+
+        Any conditions are *not* included - it is assumed that the resource is
+        being interpreted in any context that it should be enabled in that
+        context.
         """
         assert not getattr(self, '_frozen', False
                            ), "Cannot re-parse a frozen definition"
@@ -188,51 +203,95 @@ class ResourceDefinitionCore(object):
             deletion_policy=reparse_snippet(self._deletion_policy),
             update_policy=reparse_snippet(self._update_policy),
             external_id=reparse_snippet(self._external_id),
-            condition=self._condition)
+            condition=None)
 
-    def dep_attrs(self, resource_name):
+    def validate(self):
+        """Validate intrinsic functions that appear in the definition."""
+        function.validate(self._properties, PROPERTIES)
+        function.validate(self._metadata, METADATA)
+        function.validate(self._depends, DEPENDS_ON)
+        function.validate(self._deletion_policy, DELETION_POLICY)
+        function.validate(self._update_policy, UPDATE_POLICY)
+        function.validate(self._external_id, EXTERNAL_ID)
+
+    def dep_attrs(self, resource_name, load_all=False):
         """Iterate over attributes of a given resource that this references.
 
         Return an iterator over dependent attributes for specified
         resource_name in resources' properties and metadata fields.
         """
+        if self._all_dep_attrs is None and load_all:
+            attr_map = collections.defaultdict(set)
+            atts = itertools.chain(function.all_dep_attrs(self._properties),
+                                   function.all_dep_attrs(self._metadata))
+            for res_name, att_name in atts:
+                attr_map[res_name].add(att_name)
+            self._all_dep_attrs = attr_map
+
+        if self._all_dep_attrs is not None:
+            return self._all_dep_attrs[resource_name]
+
         return itertools.chain(function.dep_attrs(self._properties,
                                                   resource_name),
                                function.dep_attrs(self._metadata,
                                                   resource_name))
 
+    def required_resource_names(self):
+        """Return a set of names of all resources on which this depends.
+
+        Note that this is done entirely in isolation from the rest of the
+        template, so the resource names returned may refer to resources that
+        don't actually exist, or would have strict_dependency=False. Use the
+        dependencies() method to get validated dependencies.
+        """
+        if self._dep_names is None:
+            explicit_depends = [] if self._depends is None else self._depends
+
+            def path(section):
+                return '.'.join([self.name, section])
+
+            prop_deps = function.dependencies(self._properties,
+                                              path(PROPERTIES))
+            metadata_deps = function.dependencies(self._metadata,
+                                                  path(METADATA))
+            implicit_depends = map(lambda rp: rp.name,
+                                   itertools.chain(prop_deps,
+                                                   metadata_deps))
+
+            # (ricolin) External resource should not depend on any other
+            # resources. This operation is not allowed for now.
+            if self.external_id():
+                if explicit_depends:
+                    raise exception.InvalidExternalResourceDependency(
+                        external_id=self.external_id(),
+                        resource_type=self.resource_type
+                    )
+                self._dep_names = set()
+            else:
+                self._dep_names = set(itertools.chain(explicit_depends,
+                                                      implicit_depends))
+        return self._dep_names
+
     def dependencies(self, stack):
         """Return the Resource objects in given stack on which this depends."""
-        def path(section):
-            return '.'.join([self.name, section])
-
         def get_resource(res_name):
             if res_name not in stack:
+                if res_name in stack.defn.all_rsrc_names():
+                    # The resource is conditionally defined, allow dependencies
+                    # on it
+                    return
                 raise exception.InvalidTemplateReference(resource=res_name,
                                                          key=self.name)
-            return stack[res_name]
+            res = stack[res_name]
+            if getattr(res, 'strict_dependency', True):
+                return res
 
-        def strict_func_deps(data, datapath):
-            return six.moves.filter(
-                lambda r: getattr(r, 'strict_dependency', True),
-                function.dependencies(data, datapath))
+        return filter(None, map(get_resource, self.required_resource_names()))
 
-        explicit_depends = [] if self._depends is None else self._depends
-        prop_deps = strict_func_deps(self._properties, path(PROPERTIES))
-        metadata_deps = strict_func_deps(self._metadata, path(METADATA))
-
-        # (ricolin) External resource should not depend on any other resources.
-        # This operation is not allowed for now.
-        if self.external_id():
-            if explicit_depends:
-                raise exception.InvalidExternalResourceDependency(
-                    external_id=self.external_id(),
-                    resource_type=self.resource_type
-                )
-            return itertools.chain()
-
-        return itertools.chain((get_resource(dep) for dep in explicit_depends),
-                               prop_deps, metadata_deps)
+    def set_translation_rules(self, rules=None, client_resolve=True):
+        """Helper method to update properties with translation rules."""
+        self._rules = rules or []
+        self._client_resolve = client_resolve
 
     def properties(self, schema, context=None):
         """Return a Properties object representing the resource properties.
@@ -240,9 +299,12 @@ class ResourceDefinitionCore(object):
         The Properties object is constructed from the given schema, and may
         require a context to validate constraints.
         """
-        return properties.Properties(schema, self._properties or {},
-                                     function.resolve, self.name, context,
-                                     section=PROPERTIES)
+        props = properties.Properties(schema, self._properties or {},
+                                      function.resolve, context=context,
+                                      section=PROPERTIES,
+                                      rsrc_description=self.description)
+        props.update_translation(self._rules, self._client_resolve)
+        return props
 
     def deletion_policy(self):
         """Return the deletion policy for the resource.
@@ -257,9 +319,11 @@ class ResourceDefinitionCore(object):
         The Properties object is constructed from the given schema, and may
         require a context to validate constraints.
         """
-        return properties.Properties(schema, self._update_policy or {},
-                                     function.resolve, self.name, context,
-                                     section=UPDATE_POLICY)
+        props = properties.Properties(schema, self._update_policy or {},
+                                      function.resolve, context=context,
+                                      section=UPDATE_POLICY)
+        props.update_translation(self._rules, self._client_resolve)
+        return props
 
     def metadata(self):
         """Return the resource metadata."""
@@ -307,7 +371,7 @@ class ResourceDefinitionCore(object):
         Return a Diff object that can be used to establish differences between
         this definition and a previous definition of the same resource.
         """
-        if not isinstance(previous, ResourceDefinitionCore):
+        if not isinstance(previous, ResourceDefinition):
             return NotImplemented
 
         return self.Diff(previous, self)
@@ -320,7 +384,7 @@ class ResourceDefinitionCore(object):
         ignored, as are the actual values that any included functions resolve
         to.
         """
-        if not isinstance(other, ResourceDefinitionCore):
+        if not isinstance(other, ResourceDefinition):
             return NotImplemented
 
         return self.render_hot() == other.render_hot()
@@ -362,176 +426,17 @@ class ResourceDefinitionCore(object):
         return '%(classname)s(%(name)s, %(type)s, %(args)s)' % data
 
 
-_KEYS = (
-    TYPE, PROPERTIES, METADATA, DELETION_POLICY, UPDATE_POLICY,
-    DEPENDS_ON, DESCRIPTION,
-) = (
-    'Type', 'Properties', 'Metadata', 'DeletionPolicy', 'UpdatePolicy',
-    'DependsOn', 'Description',
-)
-
-
-class ResourceDefinition(ResourceDefinitionCore, collections.Mapping):
-    """A resource definition that also acts like a cfn template snippet.
-
-    This class exists only for backwards compatibility with existing resource
-    plugins and unit tests; it is deprecated and will be replaced with
-    ResourceDefinitionCore, possibly as soon as the Ocata release.
-    """
-
-    _deprecation_msg = (
-        'Reading the ResourceDefinition as if it were a snippet of a '
-        'CloudFormation template is deprecated, and the ability to treat it '
-        'as such will be removed in the future. Resource plugins should use '
-        'the ResourceDefinition API to work with the definition of the '
-        'resource instance.')
-
-    class Diff(ResourceDefinitionCore.Diff, collections.Mapping):
-        """A resource definition diff that acts like a cfn template snippet.
-
-        This class exists only for backwards compatibility with existing
-        resource plugins and unit tests; it is deprecated and could be removed
-        as soon as the Ocata release. Prefer using the API directly rather than
-        treating the diff as a dict containing the differences between two cfn
-        template snippets.
-        """
-
-        _deprecation_msg = (
-            'Reading the ResourceDefinition Diff as if it were a diff of two '
-            'snippets from CloudFormation templates is deprecated, and the '
-            'ability to treat it as such will be removed in the future. '
-            'Resource plugins should use the ResourceDefinition.Diff API and '
-            'the ResourceDefinition API to detect changes in the definition '
-            'and work with the new definition of the resource.')
-
-        def __contains__(self, key):
-            warnings.warn(self._deprecation_msg, DeprecationWarning)
-
-            if key == PROPERTIES:
-                return self.properties_changed()
-            elif key == METADATA:
-                return self.metadata_changed()
-            elif key == UPDATE_POLICY:
-                return self.update_policy_changed()
-            else:
-                return False
-
-        def __iter__(self):
-            return (k for k in _KEYS if k in self)
-
-        def __getitem__(self, key):
-            if key not in self:
-                raise KeyError
-            return self.new_defn.get(key)
-
-        def __len__(self):
-            return len(list(iter(self)))
-
-        def __repr__(self):
-            """Return a string representation of the diff."""
-            return 'ResourceDefinition.Diff %s' % repr(dict(self))
-
-    def __eq__(self, other):
-        """Compare this resource definition for equality with another.
-
-        Two resource definitions are considered to be equal if they can be
-        generated from the same template snippet. The name of the resource is
-        ignored, as are the actual values that any included functions resolve
-        to.
-
-        This method can also compare the resource definition to a template
-        snippet. In this case, two snippets are considered equal if they
-        compare equal in a dictionary comparison. (Specifically, this means
-        that intrinsic functions are compared by their results.) This exists
-        solely to not break existing unit tests.
-        """
-        if not isinstance(other, ResourceDefinitionCore):
-            if isinstance(other, collections.Mapping):
-                return dict(self) == other
-
-        return super(ResourceDefinition, self).__eq__(other)
-
-    __hash__ = ResourceDefinitionCore.__hash__
-
-    def __iter__(self):
-        """Iterate over the available CFN template keys.
-
-        This is for backwards compatibility with existing code that expects a
-        parsed-JSON template snippet.
-        """
-        warnings.warn(self._deprecation_msg, DeprecationWarning)
-
-        yield TYPE
-        if self._properties is not None:
-            yield PROPERTIES
-        if self._metadata is not None:
-            yield METADATA
-        if self._deletion_policy is not None:
-            yield DELETION_POLICY
-        if self._update_policy is not None:
-            yield UPDATE_POLICY
-        if self._depends:
-            yield DEPENDS_ON
-        if self.description:
-            yield DESCRIPTION
-
-    def __getitem__(self, key):
-        """Get the specified item from a CFN template snippet.
-
-        This is for backwards compatibility with existing code that expects a
-        parsed-JSON template snippet.
-        """
-        warnings.warn(self._deprecation_msg, DeprecationWarning)
-
-        if key == TYPE:
-            return self.resource_type
-        elif key == PROPERTIES:
-            if self._properties is not None:
-                return self._properties
-        elif key == METADATA:
-            if self._metadata is not None:
-                return self._metadata
-        elif key == DELETION_POLICY:
-            if self._deletion_policy is not None:
-                return self._deletion_policy
-        elif key == UPDATE_POLICY:
-            if self._update_policy is not None:
-                return self._update_policy
-        elif key == DEPENDS_ON:
-            if self._depends:
-                if len(self._depends) == 1:
-                    return self._depends[0]
-                return self._depends
-        elif key == DESCRIPTION:
-            if self.description:
-                return self.description
-
-        raise KeyError(key)
-
-    def __len__(self):
-        """Return the number of available CFN template keys.
-
-        This is for backwards compatibility with existing code that expects a
-        parsed-JSON template snippet.
-        """
-        return len(list(iter(self)))
-
-    def __repr__(self):
-        """Return a string representation of the resource definition."""
-        return 'ResourceDefinition %s' % repr(dict(self))
-
-
 def _hash_data(data):
     """Return a stable hash value for an arbitrary parsed-JSON data snippet."""
     if isinstance(data, function.Function):
         data = copy.deepcopy(data)
 
-    if not isinstance(data, six.string_types):
-        if isinstance(data, collections.Sequence):
+    if not isinstance(data, str):
+        if isinstance(data, collections.abc.Sequence):
             return hash(tuple(_hash_data(d) for d in data))
 
-        if isinstance(data, collections.Mapping):
+        if isinstance(data, collections.abc.Mapping):
             item_hashes = (hash(k) ^ _hash_data(v) for k, v in data.items())
-            return six.moves.reduce(operator.xor, item_hashes, 0)
+            return functools.reduce(operator.xor, item_hashes, 0)
 
     return hash(data)

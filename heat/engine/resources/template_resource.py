@@ -11,9 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from requests import exceptions
-import six
 
 from heat.common import exception
 from heat.common import grouputils
@@ -25,10 +25,15 @@ from heat.engine import environment
 from heat.engine import properties
 from heat.engine.resources import stack_resource
 from heat.engine import template
+from heat.rpc import api as rpc_api
+
+LOG = logging.getLogger(__name__)
 
 
 REMOTE_SCHEMES = ('http', 'https')
 LOCAL_SCHEMES = ('file',)
+
+STACK_ID_OUTPUT = 'OS::stack_id'
 
 
 def generate_class_from_template(name, data, param_defaults):
@@ -77,7 +82,7 @@ class TemplateResource(stack_resource.StackResource):
                 'Only Templates with an extension of .yaml or '
                 '.template are supported'))
         else:
-            self.template_name = tri.template_name
+            self._template_name = tri.template_name
             self.resource_type = tri.name
             self.resource_path = tri.path
             if tri.user_resource:
@@ -92,7 +97,7 @@ class TemplateResource(stack_resource.StackResource):
         try:
             return urlfetch.get(template_name, allowed_schemes=allowed_schemes)
         except (IOError, exceptions.RequestException) as r_exc:
-            args = {'name': template_name, 'exc': six.text_type(r_exc)}
+            args = {'name': template_name, 'exc': str(r_exc)}
             msg = _('Could not fetch remote template '
                     '"%(name)s": %(exc)s') % args
             raise exception.NotFound(msg_fmt=msg)
@@ -118,9 +123,7 @@ class TemplateResource(stack_resource.StackResource):
             tmpl, self.stack.env.param_defaults)
 
         self.attributes_schema.update(self.base_attributes_schema)
-        self.attributes = attributes.Attributes(self.name,
-                                                self.attributes_schema,
-                                                self._resolve_all_attributes)
+        self.attributes.set_schema(self.attributes_schema)
 
     def child_params(self):
         """Override method of child_params for the resource.
@@ -171,12 +174,17 @@ class TemplateResource(stack_resource.StackResource):
 
     def child_template(self):
         if not self._parsed_nested:
-            self._parsed_nested = template_format.parse(self.template_data())
+            self._parsed_nested = template_format.parse(self.template_data(),
+                                                        self.template_url)
         return self._parsed_nested
 
     def regenerate_info_schema(self, definition):
         self._get_resource_info(definition)
         self._generate_schema()
+
+    @property
+    def template_url(self):
+        return self._template_name
 
     def template_data(self):
         # we want to have the latest possible template.
@@ -184,11 +192,15 @@ class TemplateResource(stack_resource.StackResource):
         # 2. try download
         # 3. look in the db
         reported_excp = None
-        t_data = self.stack.t.files.get(self.template_name)
+        t_data = self.stack.t.files.get(self.template_url)
         stored_t_data = t_data
-        if not t_data and self.template_name.endswith((".yaml", ".template")):
+
+        if t_data is None:
+            LOG.debug('TemplateResource data file "%s" not found in files.',
+                      self.template_url)
+        if not t_data and self.template_url.endswith((".yaml", ".template")):
             try:
-                t_data = self.get_template_file(self.template_name,
+                t_data = self.get_template_file(self.template_url,
                                                 self.allowed_schemes)
             except exception.NotFound as err:
                 if self.action == self.UPDATE:
@@ -196,19 +208,22 @@ class TemplateResource(stack_resource.StackResource):
                 reported_excp = err
 
         if t_data is None:
-            if self.nested() is not None:
-                t_data = jsonutils.dumps(self.nested().t.t)
+            nested_identifier = self.nested_identifier()
+            if nested_identifier is not None:
+                nested_t = self.rpc_client().get_template(self.context,
+                                                          nested_identifier)
+                t_data = jsonutils.dumps(nested_t)
 
         if t_data is not None:
             if t_data != stored_t_data:
-                self.stack.t.files[self.template_name] = t_data
+                self.stack.t.files[self.template_url] = t_data
             self.stack.t.env.register_class(self.resource_type,
-                                            self.template_name,
+                                            self.template_url,
                                             path=self.resource_path)
             return t_data
         if reported_excp is None:
             reported_excp = ValueError(_('Unknown error retrieving %s') %
-                                       self.template_name)
+                                       self.template_url)
         raise reported_excp
 
     def _validate_against_facade(self, facade_cls):
@@ -248,9 +263,8 @@ class TemplateResource(stack_resource.StackResource):
                 raise exception.StackValidationFailed(message=msg)
 
     def validate(self):
-        if self.validation_exception is not None:
-            msg = six.text_type(self.validation_exception)
-            raise exception.StackValidationFailed(message=msg)
+        # Calls validate_template()
+        result = super(TemplateResource, self).validate()
 
         try:
             self.template_data()
@@ -271,7 +285,14 @@ class TemplateResource(stack_resource.StackResource):
             facade_cls = fri.get_class(files=self.stack.t.files)
             self._validate_against_facade(facade_cls)
 
-        return super(TemplateResource, self).validate()
+        return result
+
+    def validate_template(self):
+        if self.validation_exception is not None:
+            msg = str(self.validation_exception)
+            raise exception.StackValidationFailed(message=msg)
+
+        return super(TemplateResource, self).validate_template()
 
     def handle_adopt(self, resource_data=None):
         return self.create_with_template(self.child_template(),
@@ -294,17 +315,38 @@ class TemplateResource(stack_resource.StackResource):
                                          self.child_params())
 
     def get_reference_id(self):
-        if self.nested() is None:
-            return six.text_type(self.name)
+        if self.resource_id is None:
+            return str(self.name)
 
-        if 'OS::stack_id' in self.nested().outputs:
-            return self.nested().outputs['OS::stack_id'].get_value()
+        if STACK_ID_OUTPUT in self.attributes.cached_attrs:
+            return self.attributes.cached_attrs[STACK_ID_OUTPUT]
 
-        return self.nested().identifier().arn()
+        stack_identity = self.nested_identifier()
+        reference_id = stack_identity.arn()
+
+        try:
+            if self._outputs is not None:
+                reference_id = self.get_output(STACK_ID_OUTPUT)
+            elif STACK_ID_OUTPUT in self.attributes:
+                output = self.rpc_client().show_output(self.context,
+                                                       dict(stack_identity),
+                                                       STACK_ID_OUTPUT)
+                if rpc_api.OUTPUT_ERROR in output:
+                    raise exception.TemplateOutputError(
+                        resource=self.name,
+                        attribute=STACK_ID_OUTPUT,
+                        message=output[rpc_api.OUTPUT_ERROR])
+                reference_id = output[rpc_api.OUTPUT_VALUE]
+        except exception.TemplateOutputError as err:
+            LOG.info('%s', err)
+        except exception.NotFound:
+            pass
+
+        self.attributes.set_cached_attr(STACK_ID_OUTPUT, reference_id)
+        return reference_id
 
     def get_attribute(self, key, *path):
-        stack = self.nested()
-        if stack is None:
+        if self.resource_id is None:
             return None
 
         # first look for explicit resource.x.y
@@ -312,9 +354,9 @@ class TemplateResource(stack_resource.StackResource):
             return grouputils.get_nested_attrs(self, key, False, *path)
 
         # then look for normal outputs
-        if key in stack.outputs:
-            return attributes.select_from_attribute(self.get_output(key), path)
-
-        # otherwise the key must be wrong.
-        raise exception.InvalidTemplateAttribute(resource=self.name,
-                                                 key=key)
+        try:
+            return attributes.select_from_attribute(self.get_output(key),
+                                                    path)
+        except exception.NotFound:
+            raise exception.InvalidTemplateAttribute(resource=self.name,
+                                                     key=key)

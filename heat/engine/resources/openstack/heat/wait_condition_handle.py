@@ -11,11 +11,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import uuid
-
 from oslo_serialization import jsonutils
 
 from heat.common.i18n import _
+from heat.common import password_gen
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -135,7 +134,7 @@ class HeatWaitConditionHandle(wc_base.BaseWaitConditionHandle):
             self.SIGNAL_TRANSPORT) == self.TOKEN_SIGNAL
 
     def handle_create(self):
-        self.password = uuid.uuid4().hex
+        self.password = password_gen.generate_openstack_password()
         super(HeatWaitConditionHandle, self).handle_create()
         if self._signal_transport_token():
             # FIXME(shardy): The assumption here is that token expiry > timeout
@@ -154,9 +153,9 @@ class HeatWaitConditionHandle(wc_base.BaseWaitConditionHandle):
         # the one needed for signalling from the stack_user_project
         heat_client_plugin = self.stack.clients.client_plugin('heat')
         endpoint = heat_client_plugin.get_heat_url()
-        rsrc_ep = endpoint.replace(self.context.tenant_id,
+        rsrc_ep = endpoint.replace(self.context.project_id,
                                    self.identifier().url_path())
-        return rsrc_ep.replace(self.context.tenant_id,
+        return rsrc_ep.replace(self.context.project_id,
                                self.stack.stack_user_project_id)
 
     def _resolve_attribute(self, key):
@@ -196,12 +195,14 @@ class HeatWaitConditionHandle(wc_base.BaseWaitConditionHandle):
         """Validate and update the resource metadata.
 
         Metadata is not mandatory, but if passed it must use the following
-        format:
-        {
-            "status" : "Status (must be SUCCESS or FAILURE)",
-            "data" : "Arbitrary data",
-            "reason" : "Reason string"
-        }
+        format::
+
+            {
+                "status" : "Status (must be SUCCESS or FAILURE)",
+                "data" : "Arbitrary data",
+                "reason" : "Reason string"
+            }
+
         Optionally "id" may also be specified, but if missing the index
         of the signal received will be used.
         """
@@ -222,8 +223,8 @@ class HeatWaitConditionHandle(wc_base.BaseWaitConditionHandle):
 class UpdateWaitConditionHandle(aws_wch.WaitConditionHandle):
     """WaitConditionHandle that clears signals and changes handle on update.
 
-    This works identically to a regular WaitConditionHandle, except that
-    on update it clears all signals received and changes the handle. Using
+    This works similarly to an AWS::CloudFormation::WaitConditionHandle, except
+    that on update it clears all signals received and changes the handle. Using
     this handle means that you must setup the signal senders to send their
     signals again any time the update handle changes. This allows us to roll
     out new configurations and be confident that they are rolled out once
@@ -232,7 +233,8 @@ class UpdateWaitConditionHandle(aws_wch.WaitConditionHandle):
 
     support_status = support.SupportStatus(version='2014.1')
 
-    def update(self, after, before=None, prev_resource=None):
+    def _needs_update(self, after, before, after_props, before_props,
+                      prev_resource, check_init_complete=True):
         raise resource.UpdateReplace(self.name)
 
 

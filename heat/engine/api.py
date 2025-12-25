@@ -15,10 +15,8 @@ import collections
 
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import six
 
 from heat.common.i18n import _
-from heat.common.i18n import _LE
 from heat.common import param_utils
 from heat.common import template_format
 from heat.common import timeutils as heat_timeutils
@@ -41,21 +39,16 @@ def extract_args(params):
         try:
             timeout = int(timeout_mins)
         except (ValueError, TypeError):
-            LOG.exception(_LE('Timeout conversion failed'))
+            LOG.exception('Timeout conversion failed')
         else:
             if timeout > 0:
                 kwargs[rpc_api.PARAM_TIMEOUT] = timeout
             else:
                 raise ValueError(_('Invalid timeout value %s') % timeout)
-
-    name = rpc_api.PARAM_DISABLE_ROLLBACK
-    if name in params:
-        disable_rollback = param_utils.extract_bool(name, params[name])
-        kwargs[name] = disable_rollback
-
-    name = rpc_api.PARAM_SHOW_DELETED
-    if name in params:
-        params[name] = param_utils.extract_bool(name, params[name])
+    for name in [rpc_api.PARAM_CONVERGE, rpc_api.PARAM_DISABLE_ROLLBACK]:
+        if name in params:
+            bool_value = param_utils.extract_bool(name, params[name])
+            kwargs[name] = bool_value
 
     adopt_data = params.get(rpc_api.PARAM_ADOPT_STACK_DATA)
     if adopt_data:
@@ -66,12 +59,12 @@ def extract_args(params):
         kwargs[rpc_api.PARAM_ADOPT_STACK_DATA] = adopt_data
 
     tags = params.get(rpc_api.PARAM_TAGS)
-    if tags:
+    if tags is not None:
         if not isinstance(tags, list):
             raise ValueError(_('Invalid tags, not a list: %s') % tags)
 
         for tag in tags:
-            if not isinstance(tag, six.string_types):
+            if not isinstance(tag, str):
                 raise ValueError(_('Invalid tag, "%s" is not a string') % tag)
 
             if len(tag) > 80:
@@ -194,7 +187,7 @@ def format_stack_output(output_defn, resolve_value=True):
         except Exception as ex:
             # We don't need error raising, just adding output_error to
             # resulting dict.
-            result.update({rpc_api.OUTPUT_ERROR: six.text_type(ex)})
+            result.update({rpc_api.OUTPUT_ERROR: str(ex)})
         finally:
             result.update({rpc_api.OUTPUT_VALUE: value})
 
@@ -218,7 +211,7 @@ def format_stack(stack, preview=False, resolve_outputs=True):
         rpc_api.STACK_UPDATED_TIME: updated_time,
         rpc_api.STACK_DELETION_TIME: deleted_time,
         rpc_api.STACK_NOTIFICATION_TOPICS: [],  # TODO(therve) Not implemented
-        rpc_api.STACK_PARAMETERS: stack.parameters.map(six.text_type),
+        rpc_api.STACK_PARAMETERS: stack.parameters.map(str),
         rpc_api.STACK_DESCRIPTION: stack.t[stack.t.DESCRIPTION],
         rpc_api.STACK_TMPL_DESCRIPTION: stack.t[stack.t.DESCRIPTION],
         rpc_api.STACK_CAPABILITIES: [],   # TODO(?) Not implemented yet
@@ -239,7 +232,8 @@ def format_stack(stack, preview=False, resolve_outputs=True):
         info.update(update_info)
 
     # allow users to view the outputs of stacks
-    if stack.action != stack.DELETE and resolve_outputs:
+    if (not (stack.action == stack.DELETE and stack.status == stack.COMPLETE)
+            and resolve_outputs):
         info[rpc_api.STACK_OUTPUTS] = format_stack_outputs(stack.outputs,
                                                            resolve_value=True)
 
@@ -249,7 +243,7 @@ def format_stack(stack, preview=False, resolve_outputs=True):
 def format_stack_db_object(stack):
     """Return a summary representation of the given stack.
 
-    Given a stack versioned db object, return a representation of the given
+    Given a stack versioned DB object, return a representation of the given
     stack for a stack listing.
     """
     updated_time = heat_timeutils.isotime(stack.updated_at)
@@ -283,19 +277,22 @@ def format_resource_attributes(resource, with_attr=None):
     if not with_attr:
         with_attr = []
 
+    # Always return live values for consistency
+    resolver.reset_resolved_values()
+
     def resolve(attr, resolver):
         try:
             return resolver._resolver(attr)
         except Exception:
             return None
-    # if 'show' in attribute_schema, will resolve all attributes of resource
+    # if 'show' in attributes_schema, will resolve all attributes of resource
     # including the ones are not represented in response of show API, such as
     # 'console_urls' for nova server, user can view it by taking with_attr
     # parameter
     if 'show' in resolver:
         show_attr = resolve('show', resolver)
         # check if 'show' resolved to dictionary. so it's not None
-        if isinstance(show_attr, collections.Mapping):
+        if isinstance(show_attr, collections.abc.Mapping):
             for a in with_attr:
                 if a not in show_attr:
                     show_attr[a] = resolve(a, resolver)
@@ -314,6 +311,8 @@ def format_resource_properties(resource):
         try:
             return resource.properties[prop]
         except (KeyError, ValueError):
+            LOG.exception("Error in fetching property %s of resource %s",
+                          prop, resource.name)
             return None
 
     return dict((prop, get_property(prop))
@@ -368,7 +367,7 @@ def format_stack_resource(resource, detail=True, with_props=False,
 def format_stack_preview(stack):
     def format_resource(res):
         if isinstance(res, list):
-            return map(format_resource, res)
+            return list(map(format_resource, res))
         return format_stack_resource(res, with_props=True)
 
     fmt_stack = format_stack(stack, preview=True)
@@ -378,7 +377,8 @@ def format_stack_preview(stack):
     return fmt_stack
 
 
-def format_event(event, stack_identifier, root_stack_identifier=None):
+def format_event(event, stack_identifier, root_stack_identifier=None,
+                 include_rsrc_prop_data=True):
     result = {
         rpc_api.EVENT_ID: dict(event.identifier(stack_identifier)),
         rpc_api.EVENT_STACK_ID: dict(stack_identifier),
@@ -390,10 +390,11 @@ def format_event(event, stack_identifier, root_stack_identifier=None):
         rpc_api.EVENT_RES_STATUS: event.resource_status,
         rpc_api.EVENT_RES_STATUS_DATA: event.resource_status_reason,
         rpc_api.EVENT_RES_TYPE: event.resource_type,
-        rpc_api.EVENT_RES_PROPERTIES: event.resource_properties,
     }
     if root_stack_identifier:
         result[rpc_api.EVENT_ROOT_STACK_ID] = dict(root_stack_identifier)
+    if include_rsrc_prop_data:
+        result[rpc_api.EVENT_RES_PROPERTIES] = event.resource_properties
 
     return result
 
@@ -410,7 +411,7 @@ def format_notification_body(stack):
 
     updated_at = heat_timeutils.isotime(stack.updated_time)
     result = {
-        rpc_api.NOTIFY_TENANT_ID: stack.context.tenant_id,
+        rpc_api.NOTIFY_TENANT_ID: stack.context.project_id,
         rpc_api.NOTIFY_USER_ID: stack.context.username,
         # deprecated: please use rpc_api.NOTIFY_USERID for user id or
         # rpc_api.NOTIFY_USERNAME for user name.
@@ -421,10 +422,12 @@ def format_notification_body(stack):
         rpc_api.NOTIFY_STATE: state,
         rpc_api.NOTIFY_STATE_REASON: stack.status_reason,
         rpc_api.NOTIFY_CREATE_AT: heat_timeutils.isotime(stack.created_time),
-        rpc_api.NOTIFY_DESCRIPTION: stack.t[stack.t.DESCRIPTION],
         rpc_api.NOTIFY_TAGS: stack.tags,
         rpc_api.NOTIFY_UPDATE_AT: updated_at
     }
+    if stack.t is not None:
+        result[rpc_api.NOTIFY_DESCRIPTION] = stack.t[stack.t.DESCRIPTION]
+
     return result
 
 
@@ -477,7 +480,7 @@ def format_watch_data(wd, rule_names):
     if len(metric) == 1:
         metric_name, metric_data = metric[0]
     else:
-        LOG.error(_LE("Unexpected number of keys in watch_data.data!"))
+        LOG.error("Unexpected number of keys in watch_data.data!")
         return
 
     result = {
@@ -523,6 +526,15 @@ def format_validate_parameter(param):
     if param.user_value:
         res[rpc_api.PARAM_VALUE] = param.user_value
 
+    if param.tags():
+        res[rpc_api.PARAM_TAG] = param.tags()
+
+    _build_parameter_constraints(res, param)
+
+    return res
+
+
+def _build_parameter_constraints(res, param):
     constraint_description = []
 
     # build constraints
@@ -541,6 +553,13 @@ def format_validate_parameter(param):
             if c.max is not None:
                 res[rpc_api.PARAM_MAX_VALUE] = c.max
 
+        elif isinstance(c, constr.Modulo):
+            if c.step is not None:
+                res[rpc_api.PARAM_STEP] = c.step
+
+            if c.offset is not None:
+                res[rpc_api.PARAM_OFFSET] = c.offset
+
         elif isinstance(c, constr.AllowedValues):
             res[rpc_api.PARAM_ALLOWED_VALUES] = list(c.allowed)
 
@@ -557,10 +576,8 @@ def format_validate_parameter(param):
         res[rpc_api.PARAM_CONSTRAINT_DESCRIPTION] = " ".join(
             constraint_description)
 
-    return res
 
-
-def format_software_config(sc, detail=True):
+def format_software_config(sc, detail=True, include_project=False):
     if sc is None:
         return
     result = {
@@ -575,6 +592,9 @@ def format_software_config(sc, detail=True):
         result[rpc_api.SOFTWARE_CONFIG_INPUTS] = sc.config['inputs']
         result[rpc_api.SOFTWARE_CONFIG_OUTPUTS] = sc.config['outputs']
         result[rpc_api.SOFTWARE_CONFIG_OPTIONS] = sc.config['options']
+
+    if include_project:
+        result[rpc_api.SOFTWARE_CONFIG_PROJECT] = sc.tenant
     return result
 
 
@@ -612,10 +632,3 @@ def format_snapshot(snapshot):
             heat_timeutils.isotime(snapshot.created_at),
     }
     return result
-
-
-def build_resource_description(docstring):
-    if docstring is not None:
-        return '\n'.join(map(lambda x: x.strip(), docstring.split('\n')))
-    else:
-        return _('No description given')

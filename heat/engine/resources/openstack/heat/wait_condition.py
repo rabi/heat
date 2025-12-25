@@ -14,10 +14,8 @@
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import timeutils
-import six
 
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -89,21 +87,22 @@ class HeatWaitCondition(resource.Resource):
         ),
     }
 
-    def __init__(self, name, definition, stack):
-        super(HeatWaitCondition, self).__init__(name, definition, stack)
-
     def _get_handle_resource(self):
         return self.stack.resource_by_refid(self.properties[self.HANDLE])
 
     def _validate_handle_resource(self, handle):
-        if not isinstance(handle, wc_base.BaseWaitConditionHandle):
-            raise ValueError(_('%(name)s is not a valid wait condition '
-                               'handle.') % {'name': handle.name})
+        if handle is not None and isinstance(
+                handle, wc_base.BaseWaitConditionHandle):
+            return
+        LOG.debug("Got %r instead of wait condition handle", handle)
+        hn = handle.name if handle else self.properties[self.HANDLE]
+        msg = _('%s is not a valid wait condition handle.') % hn
+        raise ValueError(msg)
 
     def _wait(self, handle, started_at, timeout_in):
         if timeutils.is_older_than(started_at, timeout_in):
             exc = wc_base.WaitConditionTimeout(self, handle)
-            LOG.info(_LI('%(name)s Timed out (%(timeout)s)'),
+            LOG.info('%(name)s Timed out (%(timeout)s)',
                      {'name': str(self), 'timeout': str(exc)})
             raise exc
 
@@ -111,12 +110,12 @@ class HeatWaitCondition(resource.Resource):
 
         if any(s != handle.STATUS_SUCCESS for s in handle_status):
             failure = wc_base.WaitConditionFailure(self, handle)
-            LOG.info(_LI('%(name)s Failed (%(failure)s)'),
+            LOG.info('%(name)s Failed (%(failure)s)',
                      {'name': str(self), 'failure': str(failure)})
             raise failure
 
         if len(handle_status) >= self.properties[self.COUNT]:
-            LOG.info(_LI("%s Succeeded"), str(self))
+            LOG.info("%s Succeeded", str(self))
             return True
         return False
 
@@ -148,15 +147,15 @@ class HeatWaitCondition(resource.Resource):
 
     def _resolve_attribute(self, key):
         handle = self._get_handle_resource()
+        if handle is None:
+            return ''
         if key == self.DATA:
             meta = handle.metadata_get(refresh=True)
             res = {k: meta[k][handle.DATA] for k in meta}
-            LOG.debug('%(name)s.GetAtt(%(key)s) == %(res)s'
-                      % {'name': self.name,
-                         'key': key,
-                         'res': res})
+            LOG.debug('%(name)s.GetAtt(%(key)s) == %(res)s',
+                      {'name': self.name, 'key': key, 'res': res})
 
-            return six.text_type(jsonutils.dumps(res))
+            return str(jsonutils.dumps(res))
 
 
 def resource_mapping():

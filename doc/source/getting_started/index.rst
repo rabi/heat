@@ -11,6 +11,8 @@
       License for the specific language governing permissions and limitations
       under the License.
 
+:orphan:
+
 Getting Started Guides
 ======================
 
@@ -21,5 +23,4 @@ Getting Started Guides
    on_fedora
    on_ubuntu
    on_other
-   jeos_building
    standalone

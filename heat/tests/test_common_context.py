@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,8 +13,9 @@
 #    under the License.
 
 import os
+from unittest import mock
 
-import mock
+from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
 from oslo_config import fixture as config_fixture
 from oslo_middleware import request_id
@@ -39,11 +41,12 @@ class TestRequestContext(common.HeatTestCase):
                     'user': 'mick',
                     'password': 'foo',
                     'trust_id': None,
+                    'global_request_id': None,
                     'show_deleted': False,
                     'roles': ['arole', 'notadmin'],
                     'tenant_id': '456tenant',
                     'user_id': 'fooUser',
-                    'tenant': u'\u5218\u80dc',
+                    'tenant': '\u5218\u80dc',
                     'auth_url': 'http://xyz',
                     'aws_creds': 'blah',
                     'region_name': 'RegionOne',
@@ -60,8 +63,8 @@ class TestRequestContext(common.HeatTestCase):
             password=self.ctx.get('password'),
             aws_creds=self.ctx.get('aws_creds'),
             project_name=self.ctx.get('tenant'),
-            tenant=self.ctx.get('tenant_id'),
-            user=self.ctx.get('user_id'),
+            project_id=self.ctx.get('tenant_id'),
+            user_id=self.ctx.get('user_id'),
             auth_url=self.ctx.get('auth_url'),
             roles=self.ctx.get('roles'),
             show_deleted=self.ctx.get('show_deleted'),
@@ -70,16 +73,67 @@ class TestRequestContext(common.HeatTestCase):
             trustor_user_id=self.ctx.get('trustor_user_id'),
             trust_id=self.ctx.get('trust_id'),
             region_name=self.ctx.get('region_name'),
-            user_domain_id=self.ctx.get('user_domain'),
-            project_domain_id=self.ctx.get('project_domain'))
+            user_domain_id=self.ctx.get('user_domain_id'),
+            project_domain_id=self.ctx.get('project_domain_id'))
         ctx_dict = ctx.to_dict()
-        del(ctx_dict['request_id'])
+        del ctx_dict['request_id']
+        del ctx_dict['project_id']
+        del ctx_dict['project_name']
         self.assertEqual(self.ctx, ctx_dict)
+
+    def test_request_context_to_dict_unicode(self):
+
+        ctx_origin = {'username': 'mick',
+                      'trustor_user_id': None,
+                      'auth_token': '123',
+                      'auth_token_info': {'123info': 'woop'},
+                      'is_admin': False,
+                      'user': 'mick',
+                      'password': 'foo',
+                      'trust_id': None,
+                      'global_request_id': None,
+                      'show_deleted': False,
+                      'roles': ['arole', 'notadmin'],
+                      'tenant_id': '456tenant',
+                      'project_id': '456tenant',
+                      'user_id': 'Gāo',
+                      'tenant': '\u5218\u80dc',
+                      'project_name': '\u5218\u80dc',
+                      'auth_url': 'http://xyz',
+                      'aws_creds': 'blah',
+                      'region_name': 'RegionOne',
+                      'user_identity': 'Gāo 456tenant',
+                      'user_domain_id': None,
+                      'project_domain_id': None}
+
+        ctx = context.RequestContext(
+            auth_token=ctx_origin.get('auth_token'),
+            username=ctx_origin.get('username'),
+            password=ctx_origin.get('password'),
+            aws_creds=ctx_origin.get('aws_creds'),
+            project_name=ctx_origin.get('tenant'),
+            project_id=ctx_origin.get('tenant_id'),
+            user_id=ctx_origin.get('user_id'),
+            auth_url=ctx_origin.get('auth_url'),
+            roles=ctx_origin.get('roles'),
+            show_deleted=ctx_origin.get('show_deleted'),
+            is_admin=ctx_origin.get('is_admin'),
+            auth_token_info=ctx_origin.get('auth_token_info'),
+            trustor_user_id=ctx_origin.get('trustor_user_id'),
+            trust_id=ctx_origin.get('trust_id'),
+            region_name=ctx_origin.get('region_name'),
+            user_domain_id=ctx_origin.get('user_domain_id'),
+            project_domain_id=ctx_origin.get('project_domain_id'))
+        ctx_dict = ctx.to_dict()
+        del ctx_dict['request_id']
+        self.assertEqual(ctx_origin, ctx_dict)
 
     def test_request_context_from_dict(self):
         ctx = context.RequestContext.from_dict(self.ctx)
         ctx_dict = ctx.to_dict()
-        del(ctx_dict['request_id'])
+        del ctx_dict['request_id']
+        del ctx_dict['project_id']
+        del ctx_dict['project_name']
         self.assertEqual(self.ctx, ctx_dict)
 
     def test_request_context_update(self):
@@ -92,7 +146,7 @@ class TestRequestContext(common.HeatTestCase):
                 continue
 
             # these values are different between attribute and context
-            if k == 'tenant' or k == 'user':
+            if k in ('tenant', 'user', 'tenant_id'):
                 continue
 
             self.assertEqual(self.ctx.get(k), ctx.to_dict().get(k))
@@ -127,7 +181,7 @@ class TestRequestContext(common.HeatTestCase):
     def test_keystone_v3_endpoint_in_context(self):
         """Ensure that the context is the preferred source for the auth_uri."""
         cfg.CONF.set_override('auth_uri', 'http://xyz',
-                              group='clients_keystone', enforce_type=True)
+                              group='clients_keystone')
         policy_check = 'heat.common.policy.Enforcer.check_is_admin'
         with mock.patch(policy_check) as pc:
             pc.return_value = False
@@ -143,10 +197,7 @@ class TestRequestContext(common.HeatTestCase):
         the preferred source when the context does not have the auth_uri.
         """
         cfg.CONF.set_override('auth_uri', 'http://xyz',
-                              group='clients_keystone', enforce_type=True)
-        importutils.import_module('keystonemiddleware.auth_token')
-        cfg.CONF.set_override('auth_uri', 'http://abc/v2.0',
-                              group='keystone_authtoken', enforce_type=True)
+                              group='clients_keystone')
         policy_check = 'heat.common.policy.Enforcer.check_is_admin'
         with mock.patch(policy_check) as pc:
             pc.return_value = False
@@ -167,8 +218,12 @@ class TestRequestContext(common.HeatTestCase):
         [clients_keystone] section.
         """
         importutils.import_module('keystonemiddleware.auth_token')
-        cfg.CONF.set_override('auth_uri', 'http://abc/v2.0',
-                              group='keystone_authtoken', enforce_type=True)
+        try:
+            cfg.CONF.set_override('www_authenticate_uri', 'http://abc/v2.0',
+                                  group='keystone_authtoken')
+        except cfg.NoSuchOptError:
+            cfg.CONF.set_override('auth_uri', 'http://abc/v2.0',
+                                  group='keystone_authtoken')
         policy_check = 'heat.common.policy.Enforcer.check_is_admin'
         with mock.patch(policy_check) as pc:
             pc.return_value = False
@@ -188,27 +243,13 @@ class TestRequestContext(common.HeatTestCase):
             self.assertRaises(exception.AuthorizationFailure, getattr, ctx,
                               'keystone_v3_endpoint')
 
-    def test_create_trusts_auth_plugin_with_correct_user_domain_id(self):
-        importutils.import_module('keystonemiddleware.auth_token')
-        cfg.CONF.set_override('auth_uri', 'http://abc/v2.0',
-                              group='keystone_authtoken', enforce_type=True)
-        cfg.CONF.set_override('admin_user', 'heat',
-                              group='keystone_authtoken', enforce_type=True)
-        cfg.CONF.set_override('admin_password', 'password',
-                              group='keystone_authtoken', enforce_type=True)
-        policy_check = 'heat.common.policy.Enforcer.check_is_admin'
-        with mock.patch(policy_check) as pc:
-            pc.return_value = False
-            ctx = context.RequestContext(auth_url=None,
-                                         user_domain_id='non-default',
-                                         username='test')
-            with mock.patch('keystoneauth1.identity.generic.Password') as ps:
-                ctx.trusts_auth_plugin
-                ps.assert_called_once_with(username='heat',
-                                           password='password',
-                                           user_domain_id='default',
-                                           auth_url='http://abc/v3',
-                                           trust_id=None)
+    def test_get_trust_context_auth_plugin_unauthorized(self):
+        self.ctx['trust_id'] = 'trust_id'
+        ctx = context.RequestContext.from_dict(self.ctx)
+        self.patchobject(ks_loading, 'load_auth_from_conf_options',
+                         return_value=None)
+        self.assertRaises(exception.AuthorizationFailure, getattr,
+                          ctx, 'auth_plugin')
 
     def test_cache(self):
         ctx = context.RequestContext.from_dict(self.ctx)
@@ -350,7 +391,7 @@ class RequestContextMiddlewareTest(common.HeatTestCase):
     )]
 
     def setUp(self):
-        super(RequestContextMiddlewareTest, self).setUp()
+        super(RequestContextMiddlewareTest, self).setUp(mock_find_file=False)
         self.fixture = self.useFixture(config_fixture.Config())
         self.fixture.conf(args=['--config-dir', policy_path])
         policy_opts.set_defaults(cfg.CONF, 'check_admin.json')

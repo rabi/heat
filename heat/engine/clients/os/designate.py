@@ -11,10 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from designateclient import client
 from designateclient import exceptions
-from designateclient import v1 as client
-from designateclient.v1 import domains
-from designateclient.v1 import records
 
 from heat.common import exception as heat_exception
 from heat.engine.clients import client_plugin
@@ -31,64 +29,29 @@ class DesignateClientPlugin(client_plugin.ClientPlugin):
 
     def _create(self):
         endpoint_type = self._get_client_option(CLIENT_NAME, 'endpoint_type')
-        return client.Client(session=self.context.keystone_session,
+        return client.Client(version='2',
+                             session=self.context.keystone_session,
                              endpoint_type=endpoint_type,
-                             service_type=self.DNS)
+                             service_type=self.DNS,
+                             region_name=self._get_region_name())
 
     def is_not_found(self, ex):
         return isinstance(ex, exceptions.NotFound)
 
-    def get_domain_id(self, domain_id_or_name):
+    def get_zone_id(self, zone_id_or_name):
+        client = self.client()
         try:
-            domain_obj = self.client().domains.get(domain_id_or_name)
-            return domain_obj.id
+            zone_obj = client.zones.get(zone_id_or_name)
+            return zone_obj['id']
         except exceptions.NotFound:
-            for domain in self.client().domains.list():
-                if domain.name == domain_id_or_name:
-                    return domain.id
+            zones = client.zones.list(criterion=dict(name=zone_id_or_name))
+            if len(zones) == 1:
+                return zones[0]['id']
 
-        raise heat_exception.EntityNotFound(entity='Designate Domain',
-                                            name=domain_id_or_name)
-
-    def domain_create(self, **kwargs):
-        domain = domains.Domain(**kwargs)
-        return self.client().domains.create(domain)
-
-    def domain_update(self, **kwargs):
-        # Designate mandates to pass the Domain object with updated properties
-        domain = self.client().domains.get(kwargs['id'])
-        for key in kwargs.keys():
-            setattr(domain, key, kwargs[key])
-
-        return self.client().domains.update(domain)
-
-    def record_create(self, **kwargs):
-        domain_id = self.get_domain_id(kwargs.pop('domain'))
-        record = records.Record(**kwargs)
-        return self.client().records.create(domain_id, record)
-
-    def record_update(self, **kwargs):
-        # Designate mandates to pass the Record object with updated properties
-        domain_id = self.get_domain_id(kwargs.pop('domain'))
-        record = self.client().records.get(domain_id, kwargs['id'])
-
-        for key in kwargs.keys():
-            setattr(record, key, kwargs[key])
-
-        return self.client().records.update(record.domain_id, record)
-
-    def record_delete(self, **kwargs):
-        domain_id = self.get_domain_id(kwargs.pop('domain'))
-        return self.client().records.delete(domain_id,
-                                            kwargs.pop('id'))
-
-    def record_show(self, **kwargs):
-        domain_id = self.get_domain_id(kwargs.pop('domain'))
-        return self.client().records.get(domain_id,
-                                         kwargs.pop('id'))
+        raise heat_exception.EntityNotFound(entity='Designate Zone',
+                                            name=zone_id_or_name)
 
 
-class DesignateDomainConstraint(constraints.BaseCustomConstraint):
-
+class DesignateZoneConstraint(constraints.BaseCustomConstraint):
     resource_client_name = CLIENT_NAME
-    resource_getter_name = 'get_domain_id'
+    resource_getter_name = 'get_zone_id'

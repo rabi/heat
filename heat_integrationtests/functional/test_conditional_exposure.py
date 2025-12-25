@@ -17,33 +17,35 @@ from heat_integrationtests.functional import functional_base
 
 
 class ServiceBasedExposureTest(functional_base.FunctionalTestsBase):
-    # NOTE(pas-ha) if we ever decide to install Sahara on Heat
+    # NOTE(pas-ha) if we ever decide to install Manila on Heat
     # functional gate, this must be changed to other not-installed
     # but in principle supported service
-    unavailable_service = 'Sahara'
+    unavailable_service = 'Manila'
     unavailable_template = """
 heat_template_version: 2015-10-15
+parameters:
+  instance_type:
+    type: string
 resources:
   not_available:
-    type: OS::Sahara::NodeGroupTemplate
+    type: OS::Manila::Share
     properties:
-      plugin_name: fake
-      hadoop_version: 0.1
-      flavor: m1.large
-      node_processes: []
+      name: not_available
+      share_protocol: NFS
+      size: 1
 """
 
     def setUp(self):
         super(ServiceBasedExposureTest, self).setUp()
         # check that Sahara endpoint is available
-        if self._is_sahara_deployed():
-            self.skipTest("Sahara is actually deployed, "
+        if self._is_manila_deployed():
+            self.skipTest("Manila is actually deployed, "
                           "can not run negative tests on "
-                          "Sahara resources availability.")
+                          "Manila resources availability.")
 
-    def _is_sahara_deployed(self):
+    def _is_manila_deployed(self):
         try:
-            self.identity_client.get_endpoint_url('data-processing',
+            self.identity_client.get_endpoint_url('sharev2',
                                                   self.conf.region)
         except keystoneclient.exceptions.EndpointNotFound:
             return False
@@ -56,12 +58,15 @@ resources:
 
     def test_unavailable_resources_not_created(self):
         stack_name = self._stack_rand_name()
+        parameters = {'instance_type': self.conf.minimal_instance_type}
         ex = self.assertRaises(exc.HTTPBadRequest,
                                self.client.stacks.create,
                                stack_name=stack_name,
+                               parameters=parameters,
                                template=self.unavailable_template)
-        self.assertIn('ResourceTypeUnavailable', ex.message)
-        self.assertIn('OS::Sahara::NodeGroupTemplate', ex.message)
+        self.assertIn('ResourceTypeUnavailable', ex.message.decode('utf-8'))
+        self.assertIn('OS::Manila::Share',
+                      ex.message.decode('utf-8'))
 
 
 class RoleBasedExposureTest(functional_base.FunctionalTestsBase):
@@ -143,7 +148,7 @@ resources:
                                    self.client.stacks.create,
                                    stack_name=self.stack_name,
                                    template=self.template)
-            self.assertIn(self.forbidden_r_type, ex.message)
+            self.assertIn(self.forbidden_r_type, ex.message.decode('utf-8'))
 
     def test_forbidden_resource_not_listed(self):
         resources = self.client.resource_types.list()

@@ -12,10 +12,9 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 
-import mock
 from oslo_config import cfg
-from oslo_service import threadgroup
 from oslo_utils import timeutils
 
 from heat.common import context
@@ -40,7 +39,7 @@ class ServiceEngineTest(common.HeatTestCase):
 
     def test_make_sure_rpc_version(self):
         self.assertEqual(
-            '1.34',
+            '1.36',
             service.EngineService.RPC_API_VERSION,
             ('RPC version is changed, please update this test to new version '
              'and make sure additional test cases are added for RPC APIs '
@@ -228,23 +227,26 @@ class ServiceEngineTest(common.HeatTestCase):
                 return_value=mock.Mock())
     @mock.patch('heat.engine.service.EngineListener',
                 return_value=mock.Mock())
-    @mock.patch('oslo_service.threadgroup.ThreadGroup',
+    @mock.patch('heat.engine.worker.WorkerService',
+                return_value=mock.Mock())
+    @mock.patch('heat.engine.service.ThreadGroup',
                 return_value=mock.Mock())
     @mock.patch.object(service.EngineService, '_configure_db_conn_pool_size')
     def test_engine_service_start_in_non_convergence_mode(
             self,
             configure_db_conn_pool_size,
             thread_group_class,
+            worker_service_class,
             engine_listener_class,
             thread_group_manager_class,
             sample_uuid_method,
             rpc_client_class,
             target_class,
             rpc_server_method):
-        cfg.CONF.set_default('convergence_engine', False)
+        cfg.CONF.set_override('convergence_engine', False)
         self._test_engine_service_start(
             thread_group_class,
-            None,
+            worker_service_class,
             engine_listener_class,
             thread_group_manager_class,
             sample_uuid_method,
@@ -267,7 +269,7 @@ class ServiceEngineTest(common.HeatTestCase):
                 return_value=mock.Mock())
     @mock.patch('heat.engine.worker.WorkerService',
                 return_value=mock.Mock())
-    @mock.patch('oslo_service.threadgroup.ThreadGroup',
+    @mock.patch('heat.engine.service.ThreadGroup',
                 return_value=mock.Mock())
     @mock.patch.object(service.EngineService, '_configure_db_conn_pool_size')
     def test_engine_service_start_in_convergence_mode(
@@ -281,7 +283,7 @@ class ServiceEngineTest(common.HeatTestCase):
             rpc_client_class,
             target_class,
             rpc_server_method):
-        cfg.CONF.set_default('convergence_engine', True)
+        cfg.CONF.set_override('convergence_engine', True)
         self._test_engine_service_start(
             thread_group_class,
             worker_service_class,
@@ -300,6 +302,7 @@ class ServiceEngineTest(common.HeatTestCase):
         cfg.CONF.set_default('periodic_interval', 60)
         self.patchobject(self.eng, 'service_manage_cleanup')
         self.patchobject(self.eng, 'reset_stack_status')
+        self.patchobject(self.eng, 'service_manage_report')
 
         self.eng.start()
         # Add dummy thread group to test thread_group_mgr.stop() is executed?
@@ -309,6 +312,10 @@ class ServiceEngineTest(common.HeatTestCase):
         self.eng.thread_group_mgr.groups['sample-uuid2'] = dtg2
         self.eng.service_id = 'sample-service-uuid'
 
+        self.patchobject(self.eng.manage_thread_grp, 'stop',
+                         new=mock.Mock(wraps=self.eng.manage_thread_grp.stop))
+        self.patchobject(self.eng, '_stop_rpc_server',
+                         new=mock.Mock(wraps=self.eng._stop_rpc_server))
         orig_stop = self.eng.thread_group_mgr.stop
 
         with mock.patch.object(self.eng.thread_group_mgr, 'stop') as stop:
@@ -328,8 +335,8 @@ class ServiceEngineTest(common.HeatTestCase):
                      mock.call('sample-uuid2', True)]
             self.eng.thread_group_mgr.stop.assert_has_calls(calls, True)
 
-            # # Manage Thread group
-            self.eng.manage_thread_grp.stop.assert_called_with(False)
+            # Manage Thread group
+            self.eng.manage_thread_grp.stop.assert_called_with()
 
             # Service delete
             admin_context_method.assert_called_once_with()
@@ -339,11 +346,7 @@ class ServiceEngineTest(common.HeatTestCase):
                 self.eng.service_id
             )
 
-    @mock.patch.object(service.EngineService,
-                       '_stop_rpc_server')
     @mock.patch.object(worker.WorkerService,
-                       'stop')
-    @mock.patch.object(threadgroup.ThreadGroup,
                        'stop')
     @mock.patch('heat.common.context.get_admin_context',
                 return_value=mock.Mock())
@@ -353,17 +356,13 @@ class ServiceEngineTest(common.HeatTestCase):
             self,
             service_delete_method,
             admin_context_method,
-            thread_group_stop,
-            worker_service_stop,
-            rpc_server_stop):
+            worker_service_stop):
         cfg.CONF.set_default('convergence_engine', True)
         self._test_engine_service_stop(
             service_delete_method,
             admin_context_method
         )
 
-    @mock.patch.object(service.EngineService, '_stop_rpc_server')
-    @mock.patch.object(threadgroup.ThreadGroup, 'stop')
     @mock.patch('heat.common.context.get_admin_context',
                 return_value=mock.Mock())
     @mock.patch('heat.objects.service.Service.delete',
@@ -371,9 +370,7 @@ class ServiceEngineTest(common.HeatTestCase):
     def test_engine_service_stop_in_non_convergence_mode(
             self,
             service_delete_method,
-            admin_context_method,
-            thread_group_stop,
-            rpc_server_stop):
+            admin_context_method):
         cfg.CONF.set_default('convergence_engine', False)
         self._test_engine_service_stop(
             service_delete_method,
@@ -385,8 +382,6 @@ class ServiceEngineTest(common.HeatTestCase):
         self.eng.reset()
         setup_logging_mock.assert_called_once_with(cfg.CONF, 'heat')
 
-    @mock.patch('oslo_messaging.Target',
-                return_value=mock.Mock())
     @mock.patch('heat.common.messaging.get_rpc_client',
                 return_value=mock.Mock())
     @mock.patch('heat.common.service_utils.generate_engine_id',
@@ -397,7 +392,7 @@ class ServiceEngineTest(common.HeatTestCase):
                 return_value=mock.Mock())
     @mock.patch('heat.engine.worker.WorkerService',
                 return_value=mock.Mock())
-    @mock.patch('oslo_service.threadgroup.ThreadGroup',
+    @mock.patch('heat.engine.service.ThreadGroup',
                 return_value=mock.Mock())
     def test_engine_service_configures_connection_pool(
             self,
@@ -406,8 +401,8 @@ class ServiceEngineTest(common.HeatTestCase):
             engine_listener_class,
             thread_group_manager_class,
             sample_uuid_method,
-            rpc_client_class,
-            target_class):
+            rpc_client_class):
+        self.addCleanup(self.eng._stop_rpc_server)
         self.eng.start()
         self.assertEqual(cfg.CONF.executor_thread_pool_size,
                          cfg.CONF.database.max_overflow)

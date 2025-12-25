@@ -16,6 +16,7 @@ from heat.engine import constraints
 from heat.engine import properties
 from heat.engine import resource
 from heat.engine import support
+from heat.engine import translation
 
 
 class KeystoneEndpoint(resource.Resource):
@@ -83,6 +84,24 @@ class KeystoneEndpoint(resource.Resource):
         )
     }
 
+    def translation_rules(self, props):
+        return [
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                [self.SERVICE],
+                client_plugin=self.client_plugin(),
+                finder='get_service_id'
+            ),
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                [self.REGION],
+                client_plugin=self.client_plugin(),
+                finder='get_region_id'
+            ),
+        ]
+
     def client(self):
         return super(KeystoneEndpoint, self).client().client
 
@@ -125,6 +144,16 @@ class KeystoneEndpoint(resource.Resource):
                 url=url,
                 name=name,
                 enabled=enabled)
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        endpoint_reality = {}
+
+        endpoint_reality.update(
+            {self.SERVICE: resource_data.get('service_id'),
+             self.REGION: resource_data.get('region_id')})
+        for key in (set(self.PROPERTIES) - {self.SERVICE, self.REGION}):
+            endpoint_reality.update({key: resource_data.get(key)})
+        return endpoint_reality
 
 
 def resource_mapping():

@@ -15,6 +15,7 @@
 
 """Client side of the heat engine RPC API."""
 
+from oslo_utils import excutils
 from oslo_utils import reflection
 
 from heat.common import messaging
@@ -57,6 +58,8 @@ class EngineClient(object):
         1.33 - Remove tenant_safe from list_stacks, count_stacks
                and list_software_configs
         1.34 - Add migrate_convergence_1 call
+        1.35 - Add with_condition to list_template_functions
+        1.36 - Add files_container to create/update/preview/validate
     """
 
     BASE_RPC_API_VERSION = '1.0'
@@ -99,14 +102,15 @@ class EngineClient(object):
         error_name = reflection.get_class_name(error, fully_qualified=False)
         return error_name.split('_Remote')[0]
 
-    def ignore_error_named(self, error, name):
-        """Raises the error unless its local name matches the supplied name.
+    def ignore_error_by_name(self, name):
+        """Returns a context manager that filters exceptions with a given name.
 
-        :param error: Remote raised error to derive the local name from.
-        :param name: Name to compare local name to.
+        :param name: Name to compare the local exception name to.
         """
-        if self.local_error_name(error) != name:
-            raise error
+        def error_name_matches(err):
+            return self.local_error_name(err) == name
+
+        return excutils.exception_filter(error_name_matches)
 
     def identify_stack(self, ctxt, stack_name):
         """Returns the full stack identifier for a single, live stack.
@@ -138,14 +142,16 @@ class EngineClient(object):
         :param show_deleted: if true, show soft-deleted stacks
         :param show_nested: if true, show nested stacks
         :param show_hidden: if true, show hidden stacks
-        :param tags: show stacks containing these tags, combine multiple
-            tags using the boolean AND expression
-        :param tags_any: show stacks containing these tags, combine multiple
-            tags using the boolean OR expression
-        :param not_tags: show stacks not containing these tags, combine
-            multiple tags using the boolean AND expression
-        :param not_tags_any: show stacks not containing these tags, combine
-            multiple tags using the boolean OR expression
+        :param tags: show stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean AND expression
+        :param tags_any: show stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean OR expression
+        :param not_tags: show stacks not containing these tags. If multiple
+            tags are passed, they will be combined using the boolean AND
+            expression
+        :param not_tags_any: show stacks not containing these tags. If
+            multiple tags are passed, they will be combined using the boolean
+            OR expression
         :returns: a list of stacks
         """
         return self.call(ctxt,
@@ -171,14 +177,16 @@ class EngineClient(object):
         :param show_deleted: if true, count will include the deleted stacks
         :param show_nested: if true, count will include nested stacks
         :param show_hidden: if true, count will include hidden stacks
-        :param tags: count stacks containing these tags, combine multiple tags
-            using the boolean AND expression
-        :param tags_any: count stacks containing these tags, combine multiple
-            tags using the boolean OR expression
-        :param not_tags: count stacks not containing these tags, combine
-            multiple tags using the boolean AND expression
-        :param not_tags_any: count stacks not containing these tags, combine
-            multiple tags using the boolean OR expression
+        :param tags: count stacks containing these tags. If multiple tags are
+            passed, they will be combined using the boolean AND expression
+        :param tags_any: count stacks containing these tags. If multiple tags
+            are passed, they will be combined using the boolean OR expression
+        :param not_tags: count stacks not containing these tags. If multiple
+            tags are passed, they will be combined using the boolean AND
+            expression
+        :param not_tags_any: count stacks not containing these tags. If
+            multiple tags are passed, they will be combined using the boolean
+            OR expression
         :returns: an integer representing the number of matched stacks
         """
         return self.call(ctxt, self.make_msg('count_stacks',
@@ -197,7 +205,7 @@ class EngineClient(object):
 
         :param ctxt: RPC context.
         :param stack_identity: Name of the stack you want to show, or None to
-        show all
+                               show all
         :param resolve_outputs: If True, stack outputs will be resolved
         """
         return self.call(ctxt, self.make_msg('show_stack',
@@ -206,7 +214,7 @@ class EngineClient(object):
                          version='1.20')
 
     def preview_stack(self, ctxt, stack_name, template, params, files,
-                      args, environment_files=None):
+                      args, environment_files=None, files_container=None):
         """Simulates a new stack using the provided template.
 
         Note that at this stage the template has already been fetched from the
@@ -221,17 +229,19 @@ class EngineClient(object):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: name of swift container
         """
         return self.call(ctxt,
                          self.make_msg('preview_stack', stack_name=stack_name,
                                        template=template,
                                        params=params, files=files,
                                        environment_files=environment_files,
+                                       files_container=files_container,
                                        args=args),
-                         version='1.23')
+                         version='1.36')
 
     def create_stack(self, ctxt, stack_name, template, params, files,
-                     args, environment_files=None):
+                     args, environment_files=None, files_container=None):
         """Creates a new stack using the template provided.
 
         Note that at this stage the template has already been fetched from the
@@ -246,12 +256,14 @@ class EngineClient(object):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: name of swift container
         """
         return self._create_stack(ctxt, stack_name, template, params, files,
-                                  args, environment_files=environment_files)
+                                  args, environment_files=environment_files,
+                                  files_container=files_container)
 
     def _create_stack(self, ctxt, stack_name, template, params, files,
-                      args, environment_files=None,
+                      args, environment_files=None, files_container=None,
                       owner_id=None, nested_depth=0, user_creds_id=None,
                       stack_user_project_id=None, parent_resource_name=None,
                       template_id=None):
@@ -272,16 +284,18 @@ class EngineClient(object):
                                 template=template,
                                 params=params, files=files,
                                 environment_files=environment_files,
+                                files_container=files_container,
                                 args=args, owner_id=owner_id,
                                 nested_depth=nested_depth,
                                 user_creds_id=user_creds_id,
                                 stack_user_project_id=stack_user_project_id,
                                 parent_resource_name=parent_resource_name,
                                 template_id=template_id),
-            version='1.29')
+            version='1.36')
 
     def update_stack(self, ctxt, stack_identity, template, params,
-                     files, args, environment_files=None):
+                     files, args, environment_files=None,
+                     files_container=None):
         """Updates an existing stack based on the provided template and params.
 
         Note that at this stage the template has already been fetched from the
@@ -296,14 +310,16 @@ class EngineClient(object):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: name of swift container
         """
         return self._update_stack(ctxt, stack_identity, template, params,
                                   files, args,
-                                  environment_files=environment_files)
+                                  environment_files=environment_files,
+                                  files_container=files_container)
 
     def _update_stack(self, ctxt, stack_identity, template, params,
                       files, args, environment_files=None,
-                      template_id=None):
+                      files_container=None, template_id=None):
         """Internal interface for engine-to-engine communication via RPC.
 
         Allows an additional option which should not be exposed to users via
@@ -318,12 +334,14 @@ class EngineClient(object):
                                        params=params,
                                        files=files,
                                        environment_files=environment_files,
+                                       files_container=files_container,
                                        args=args,
                                        template_id=template_id),
-                         version='1.29')
+                         version='1.36')
 
     def preview_update_stack(self, ctxt, stack_identity, template, params,
-                             files, args, environment_files=None):
+                             files, args, environment_files=None,
+                             files_container=None):
         """Returns the resources that would be changed in an update.
 
         Based on the provided template and parameters.
@@ -339,6 +357,7 @@ class EngineClient(object):
         :param environment_files: optional ordered list of environment file
                names included in the files dict
         :type  environment_files: list or None
+        :param files_container: name of swift container
         """
         return self.call(ctxt,
                          self.make_msg('preview_update_stack',
@@ -347,13 +366,14 @@ class EngineClient(object):
                                        params=params,
                                        files=files,
                                        environment_files=environment_files,
+                                       files_container=files_container,
                                        args=args,
                                        ),
-                         version='1.23')
+                         version='1.36')
 
     def validate_template(self, ctxt, template, params=None, files=None,
-                          environment_files=None, show_nested=False,
-                          ignorable_errors=None):
+                          environment_files=None, files_container=None,
+                          show_nested=False, ignorable_errors=None):
         """Uses the stack parser to check the validity of a template.
 
         :param ctxt: RPC context.
@@ -361,10 +381,11 @@ class EngineClient(object):
         :param params: Stack Input Params/Environment
         :param files: files referenced from the environment/template.
         :param environment_files: ordered list of environment file names
-               included in the files dict
+                                  included in the files dict
+        :param files_container: name of swift container
         :param show_nested: if True nested templates will be validated
         :param ignorable_errors: List of error_code to be ignored as part of
-        validation
+                                 validation
         """
         return self.call(ctxt, self.make_msg(
             'validate_template',
@@ -373,8 +394,9 @@ class EngineClient(object):
             files=files,
             show_nested=show_nested,
             environment_files=environment_files,
+            files_container=files_container,
             ignorable_errors=ignorable_errors),
-            version='1.24')
+            version='1.36')
 
     def authenticated_to_backend(self, ctxt):
         """Validate the credentials in the RPC context.
@@ -421,12 +443,15 @@ class EngineClient(object):
                                        stack_identity=stack_identity),
                          version='1.32')
 
-    def delete_stack(self, ctxt, stack_identity, cast=True):
+    def delete_stack(self, ctxt, stack_identity, cast=False):
         """Deletes a given stack.
 
         :param ctxt: RPC context.
         :param stack_identity: Name of the stack you want to delete.
-        :param cast: cast the message or use call (default: True)
+        :param cast: cast the message instead of using call (default: False)
+
+        You probably never want to use cast(). If you do, you'll never hear
+        about any exceptions the call might raise.
         """
         rpc_method = self.cast if cast else self.call
         return rpc_method(ctxt,
@@ -473,16 +498,20 @@ class EngineClient(object):
         return self.call(ctxt, self.make_msg('list_template_versions'),
                          version='1.11')
 
-    def list_template_functions(self, ctxt, template_version):
-        """Get a list of available functions in a given template.
+    def list_template_functions(self, ctxt, template_version,
+                                with_condition=False):
+        """Get a list of available functions in a given template type.
 
         :param ctxt: RPC context
-        :param template_name : name of the template which function list you
-                               want to get
+        :param template_version: template format/version tuple for which you
+                                 want to get the list of functions.
+        :param with_condition: return includes condition functions.
         """
-        return self.call(ctxt, self.make_msg(
-            'list_template_functions', template_version=template_version),
-            version='1.13')
+        return self.call(ctxt,
+                         self.make_msg('list_template_functions',
+                                       template_version=template_version,
+                                       with_condition=with_condition),
+                         version='1.35')
 
     def resource_schema(self, ctxt, type_name, with_description=False):
         """Get the schema for a resource type.
@@ -648,60 +677,6 @@ class EngineClient(object):
                           mark_unhealthy=mark_unhealthy,
                           resource_status_reason=resource_status_reason),
             version='1.26')
-
-    def create_watch_data(self, ctxt, watch_name, stats_data):
-        """Creates data for CloudWatch and WaitConditions.
-
-        This could be used by CloudWatch and WaitConditions and treat HA
-        service events like any other CloudWatch.
-
-        :param ctxt: RPC context.
-        :param watch_name: Name of the watch/alarm
-        :param stats_data: The data to post.
-        """
-        return self.call(ctxt, self.make_msg('create_watch_data',
-                                             watch_name=watch_name,
-                                             stats_data=stats_data))
-
-    def show_watch(self, ctxt, watch_name):
-        """Returns the attributes of one watch/alarm.
-
-        The show_watch method returns the attributes of one watch
-        or all watches if no watch_name is passed.
-
-        :param ctxt: RPC context.
-        :param watch_name: Name of the watch/alarm you want to see,
-                           or None to see all
-        """
-        return self.call(ctxt, self.make_msg('show_watch',
-                                             watch_name=watch_name))
-
-    def show_watch_metric(self, ctxt, metric_namespace=None, metric_name=None):
-        """Returns the datapoints for a metric.
-
-        The show_watch_metric method returns the datapoints associated
-        with a specified metric, or all metrics if no metric_name is passed.
-
-        :param ctxt: RPC context.
-        :param metric_namespace: Name of the namespace you want to see,
-                           or None to see all
-        :param metric_name: Name of the metric you want to see,
-                           or None to see all
-        """
-        return self.call(ctxt, self.make_msg('show_watch_metric',
-                                             metric_namespace=metric_namespace,
-                                             metric_name=metric_name))
-
-    def set_watch_state(self, ctxt, watch_name, state):
-        """Temporarily set the state of a given watch.
-
-        :param ctxt: RPC context.
-        :param watch_name: Name of the watch
-        :param state: State (must be one defined in WatchRule class)
-        """
-        return self.call(ctxt, self.make_msg('set_watch_state',
-                                             watch_name=watch_name,
-                                             state=state))
 
     def get_revision(self, ctxt):
         return self.call(ctxt, self.make_msg('get_revision'))

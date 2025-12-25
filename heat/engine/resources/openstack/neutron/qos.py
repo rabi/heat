@@ -32,6 +32,10 @@ class QoSPolicy(neutron.NeutronResource):
 
     required_service_extension = 'qos'
 
+    entity = 'qos_policy'
+
+    res_info_key = 'policy'
+
     support_status = support.SupportStatus(version='6.0.0')
 
     PROPERTIES = (
@@ -98,10 +102,6 @@ class QoSPolicy(neutron.NeutronResource):
                 self.resource_id,
                 {'policy': prop_diff})
 
-    def _show_resource(self):
-        return self.client().show_qos_policy(
-            self.resource_id)['policy']
-
 
 class QoSRule(neutron.NeutronResource):
     """A resource for Neutron QoS base rule."""
@@ -111,7 +111,7 @@ class QoSRule(neutron.NeutronResource):
     support_status = support.SupportStatus(version='6.0.0')
 
     PROPERTIES = (
-        POLICY,  TENANT_ID,
+        POLICY, TENANT_ID,
     ) = (
         'policy', 'tenant_id',
     )
@@ -153,10 +153,12 @@ class QoSBandwidthLimitRule(QoSRule):
     administrators only.
     """
 
+    entity = 'bandwidth_limit_rule'
+
     PROPERTIES = (
-        MAX_BANDWIDTH, MAX_BURST_BANDWIDTH,
+        MAX_BANDWIDTH, MAX_BURST_BANDWIDTH, DIRECTION
     ) = (
-        'max_kbps', 'max_burst_kbps',
+        'max_kbps', 'max_burst_kbps', 'direction'
     )
 
     properties_schema = {
@@ -177,6 +179,16 @@ class QoSBandwidthLimitRule(QoSRule):
                 constraints.Range(min=0)
             ],
             default=0
+        ),
+        DIRECTION: properties.Schema(
+            properties.Schema.STRING,
+            _('Traffic direction from the point of view of the port.'),
+            update_allowed=True,
+            constraints=[
+                constraints.AllowedValues(['egress', 'ingress']),
+            ],
+            default='egress',
+            support_status=support.SupportStatus(version='13.0.0')
         )
     }
 
@@ -208,9 +220,8 @@ class QoSBandwidthLimitRule(QoSRule):
                 self.policy_id,
                 {'bandwidth_limit_rule': prop_diff})
 
-    def _show_resource(self):
-        return self.client().show_bandwidth_limit_rule(
-            self.resource_id, self.policy_id)['bandwidth_limit_rule']
+    def _res_get_args(self):
+        return [self.resource_id, self.policy_id]
 
 
 class QoSDscpMarkingRule(QoSRule):
@@ -225,6 +236,8 @@ class QoSDscpMarkingRule(QoSRule):
     """
 
     support_status = support.SupportStatus(version='7.0.0')
+
+    entity = 'dscp_marking_rule'
 
     PROPERTIES = (
         DSCP_MARK,
@@ -275,14 +288,187 @@ class QoSDscpMarkingRule(QoSRule):
                 self.policy_id,
                 {'dscp_marking_rule': prop_diff})
 
-    def _show_resource(self):
-        return self.client().show_dscp_marking_rule(
-            self.resource_id, self.policy_id)['dscp_marking_rule']
+    def _res_get_args(self):
+        return [self.resource_id, self.policy_id]
+
+
+class QoSMinimumBandwidthRule(QoSRule):
+    """A resource for guaranteeing bandwidth.
+
+    This rule can be associated with a QoS policy, and then the policy
+    can be used by a neutron port to provide guaranteed bandwidth QoS
+    capabilities.
+
+    Depending on drivers the guarantee may be enforced on two levels.
+    First when a server is placed (scheduled) on physical infrastructure
+    and/or second in the data plane of the physical hypervisor. For details
+    please see Neutron documentation:
+
+    https://docs.openstack.org/neutron/latest/admin/config-qos-min-bw.html
+
+    The default policy usage of this resource is limited to
+    administrators only.
+    """
+
+    entity = 'minimum_bandwidth_rule'
+
+    required_service_extension = 'qos-bw-minimum-ingress'
+
+    support_status = support.SupportStatus(
+        status=support.SUPPORTED,
+        version='14.0.0',
+    )
+
+    PROPERTIES = (
+        MIN_BANDWIDTH, DIRECTION
+    ) = (
+        'min_kbps', 'direction'
+    )
+
+    properties_schema = {
+        MIN_BANDWIDTH: properties.Schema(
+            properties.Schema.INTEGER,
+            _('Min bandwidth in kbps.'),
+            required=True,
+            update_allowed=True,
+            constraints=[
+                constraints.Range(min=0),
+            ],
+        ),
+        DIRECTION: properties.Schema(
+            properties.Schema.STRING,
+            _('Traffic direction from the point of view of the port.'),
+            update_allowed=True,
+            constraints=[
+                constraints.AllowedValues(['egress', 'ingress']),
+            ],
+            default='egress',
+        ),
+    }
+
+    properties_schema.update(QoSRule.properties_schema)
+
+    def handle_create(self):
+        props = self.prepare_properties(self.properties,
+                                        self.physical_resource_name())
+        props.pop(self.POLICY)
+
+        rule = self.client().create_minimum_bandwidth_rule(
+            self.policy_id,
+            {'minimum_bandwidth_rule': props})['minimum_bandwidth_rule']
+
+        self.resource_id_set(rule['id'])
+
+    def handle_delete(self):
+        if self.resource_id is None:
+            return
+
+        with self.client_plugin().ignore_not_found:
+            self.client().delete_minimum_bandwidth_rule(
+                self.resource_id, self.policy_id)
+
+    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
+        if prop_diff:
+            self.client().update_minimum_bandwidth_rule(
+                self.resource_id,
+                self.policy_id,
+                {'minimum_bandwidth_rule': prop_diff})
+
+    def _res_get_args(self):
+        return [self.resource_id, self.policy_id]
+
+
+class QoSMinimumPacketRateRule(QoSRule):
+    """A resource for guaranteeing packet rate.
+
+    This rule can be associated with a QoS policy, and then the policy
+    can be used by a neutron port to provide guaranteed packet rate QoS
+    capabilities.
+
+    Depending on drivers the guarantee may be enforced on two levels.
+    First when a server is placed (scheduled) on physical infrastructure
+    and/or second in the data plane of the physical hypervisor. For details
+    please see Neutron documentation:
+
+    https://docs.openstack.org/neutron/latest/admin/config-qos-min-pps.html
+
+    The default policy usage of this resource is limited to
+    administrators only.
+    """
+
+    entity = 'minimum_packet_rate_rule'
+
+    required_service_extension = 'qos-pps-minimum'
+
+    support_status = support.SupportStatus(
+        status=support.SUPPORTED,
+        version='19.0.0',
+    )
+
+    PROPERTIES = (
+        MIN_PACKET_RATE, DIRECTION
+    ) = (
+        'min_kpps', 'direction'
+    )
+
+    properties_schema = {
+        MIN_PACKET_RATE: properties.Schema(
+            properties.Schema.INTEGER,
+            _('Min packet rate in kpps.'),
+            required=True,
+            update_allowed=True,
+            constraints=[
+                constraints.Range(min=0),
+            ],
+        ),
+        DIRECTION: properties.Schema(
+            properties.Schema.STRING,
+            _('Traffic direction from the point of view of the port.'),
+            update_allowed=True,
+            constraints=[
+                constraints.AllowedValues(['any', 'egress', 'ingress']),
+            ],
+            default='egress',
+        ),
+    }
+
+    properties_schema.update(QoSRule.properties_schema)
+
+    def handle_create(self):
+        props = self.prepare_properties(self.properties,
+                                        self.physical_resource_name())
+        props.pop(self.POLICY)
+
+        rule = self.client().create_minimum_packet_rate_rule(
+            self.policy_id,
+            {'minimum_packet_rate_rule': props})['minimum_packet_rate_rule']
+
+        self.resource_id_set(rule['id'])
+
+    def handle_delete(self):
+        if self.resource_id is None:
+            return
+
+        with self.client_plugin().ignore_not_found:
+            self.client().delete_minimum_packet_rate_rule(
+                self.resource_id, self.policy_id)
+
+    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
+        if prop_diff:
+            self.client().update_minimum_packet_rate_rule(
+                self.resource_id,
+                self.policy_id,
+                {'minimum_packet_rate_rule': prop_diff})
+
+    def _res_get_args(self):
+        return [self.resource_id, self.policy_id]
 
 
 def resource_mapping():
     return {
         'OS::Neutron::QoSPolicy': QoSPolicy,
         'OS::Neutron::QoSBandwidthLimitRule': QoSBandwidthLimitRule,
-        'OS::Neutron::QoSDscpMarkingRule': QoSDscpMarkingRule
+        'OS::Neutron::QoSDscpMarkingRule': QoSDscpMarkingRule,
+        'OS::Neutron::QoSMinimumBandwidthRule': QoSMinimumBandwidthRule,
+        'OS::Neutron::QoSMinimumPacketRateRule': QoSMinimumPacketRateRule,
     }

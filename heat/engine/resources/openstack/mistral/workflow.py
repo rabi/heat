@@ -14,7 +14,6 @@
 import copy
 
 from oslo_serialization import jsonutils
-import six
 import yaml
 
 from heat.common import exception
@@ -25,6 +24,7 @@ from heat.engine import properties
 from heat.engine import resource
 from heat.engine.resources import signal_responder
 from heat.engine import support
+from heat.engine import translation
 
 
 class Workflow(signal_responder.SignalResponder,
@@ -45,29 +45,32 @@ class Workflow(signal_responder.SignalResponder,
 
     entity = 'workflows'
 
+    always_replace_on_check_failed = False
+
     PROPERTIES = (
         NAME, TYPE, DESCRIPTION, INPUT, OUTPUT, TASKS, PARAMS,
-        TASK_DEFAULTS, USE_REQUEST_BODY_AS_INPUT
+        TASK_DEFAULTS, USE_REQUEST_BODY_AS_INPUT, TAGS
     ) = (
         'name', 'type', 'description', 'input', 'output', 'tasks', 'params',
-        'task_defaults', 'use_request_body_as_input'
+        'task_defaults', 'use_request_body_as_input', 'tags'
     )
 
     _TASKS_KEYS = (
         TASK_NAME, TASK_DESCRIPTION, ON_ERROR, ON_COMPLETE, ON_SUCCESS,
         POLICIES, ACTION, WORKFLOW, PUBLISH, TASK_INPUT, REQUIRES,
         RETRY, WAIT_BEFORE, WAIT_AFTER, PAUSE_BEFORE, TIMEOUT,
-        WITH_ITEMS, KEEP_RESULT, TARGET, JOIN
+        WITH_ITEMS, KEEP_RESULT, TARGET, JOIN, CONCURRENCY
     ) = (
         'name', 'description', 'on_error', 'on_complete', 'on_success',
         'policies', 'action', 'workflow', 'publish', 'input', 'requires',
         'retry', 'wait_before', 'wait_after', 'pause_before', 'timeout',
-        'with_items', 'keep_result', 'target', 'join'
+        'with_items', 'keep_result', 'target', 'join', 'concurrency'
     )
 
     _TASKS_TASK_DEFAULTS = [
         ON_ERROR, ON_COMPLETE, ON_SUCCESS,
-        REQUIRES, RETRY, WAIT_BEFORE, WAIT_AFTER, PAUSE_BEFORE, TIMEOUT
+        REQUIRES, RETRY, WAIT_BEFORE, WAIT_AFTER, PAUSE_BEFORE, TIMEOUT,
+        CONCURRENCY
     ]
 
     _SIGNAL_DATA_KEYS = (
@@ -106,6 +109,12 @@ class Workflow(signal_responder.SignalResponder,
               '"params".'),
             update_allowed=True,
             support_status=support.SupportStatus(version='6.0.0')
+        ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('List of tags to set on the workflow.'),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='10.0.0')
         ),
         DESCRIPTION: properties.Schema(
             properties.Schema.STRING,
@@ -186,6 +195,13 @@ class Workflow(signal_responder.SignalResponder,
                       'a task will be failed automatically '
                       'by engine if hasn\'t completed.')
                 ),
+                CONCURRENCY: properties.Schema(
+                    properties.Schema.INTEGER,
+                    _('Defines a max number of actions running simultaneously '
+                      'in a task. Applicable only for tasks that have '
+                      'with-items.'),
+                    support_status=support.SupportStatus(version='8.0.0')
+                )
             },
             update_allowed=True
         ),
@@ -253,13 +269,18 @@ class Workflow(signal_responder.SignalResponder,
                           'that influence how Mistral Engine runs tasks. Must '
                           'satisfy Mistral DSL v2.'),
                         support_status=support.SupportStatus(
-                            status=support.DEPRECATED,
-                            version='5.0.0',
+                            status=support.HIDDEN,
+                            version='8.0.0',
                             message=_('Add needed policies directly to '
                                       'the task, Policy keyword is not '
                                       'needed'),
                             previous_status=support.SupportStatus(
-                                version='2015.1'))
+                                status=support.DEPRECATED,
+                                version='5.0.0',
+                                previous_status=support.SupportStatus(
+                                    version='2015.1')
+                            )
+                        )
                     ),
                     REQUIRES: properties.Schema(
                         properties.Schema.LIST,
@@ -313,6 +334,13 @@ class Workflow(signal_responder.SignalResponder,
                           'after task completion.'),
                         support_status=support.SupportStatus(version='5.0.0')
                     ),
+                    CONCURRENCY: properties.Schema(
+                        properties.Schema.INTEGER,
+                        _('Defines a max number of actions running '
+                          'simultaneously in a task. Applicable only for '
+                          'tasks that have with-items.'),
+                        support_status=support.SupportStatus(version='8.0.0')
+                    ),
                     TARGET: properties.Schema(
                         properties.Schema.STRING,
                         _('It defines an executor to which task action '
@@ -347,7 +375,8 @@ class Workflow(signal_responder.SignalResponder,
         ALARM_URL: attributes.Schema(
             _("A signed url to create executions for workflows specified in "
               "Workflow resource."),
-            type=attributes.Schema.STRING
+            type=attributes.Schema.STRING,
+            cache_mode=attributes.Schema.CACHE_NONE
         ),
         EXECUTIONS: attributes.Schema(
             _("List of workflows' executions, each of them is a dictionary "
@@ -357,6 +386,31 @@ class Workflow(signal_responder.SignalResponder,
             type=attributes.Schema.LIST
         )
     }
+
+    def translation_rules(self, properties):
+        policies_keys = [self.PAUSE_BEFORE, self.WAIT_AFTER, self.WAIT_BEFORE,
+                         self.TIMEOUT, self.CONCURRENCY, self.RETRY]
+        rules = []
+        for key in policies_keys:
+            rules.append(
+                translation.TranslationRule(
+                    properties,
+                    translation.TranslationRule.REPLACE,
+                    [self.TASKS, key],
+                    value_name=self.POLICIES,
+                    custom_value_path=[key]
+                )
+            )
+        # after executing rules above properties data contains policies key
+        # with empty dict value, so need to remove policies from properties.
+        rules.append(
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.DELETE,
+                [self.TASKS, self.POLICIES]
+            )
+        )
+        return rules
 
     def get_reference_id(self):
         return self._workflow_name()
@@ -388,11 +442,11 @@ class Workflow(signal_responder.SignalResponder,
                         error=_('Signal data error'),
                         message=message)
         if params is not None and not isinstance(params, dict):
-                message = (_('Params must be a map, find a '
-                             '%s') % type(params))
-                raise exception.StackValidationFailed(
-                    error=_('Signal data error'),
-                    message=message)
+            message = (_('Params must be a map, find a '
+                         '%s') % type(params))
+            raise exception.StackValidationFailed(
+                error=_('Signal data error'),
+                message=message)
 
     def validate(self):
         super(Workflow, self).validate()
@@ -447,6 +501,11 @@ class Workflow(signal_responder.SignalResponder,
                         }
                         raise exception.StackValidationFailed(message=msg)
 
+            if (task.get(self.WITH_ITEMS) is None and
+                    task.get(self.CONCURRENCY) is not None):
+                raise exception.ResourcePropertyDependency(
+                    prop1=self.CONCURRENCY, prop2=self.WITH_ITEMS)
+
     def _workflow_name(self):
         return self.properties.get(self.NAME) or self.physical_resource_name()
 
@@ -455,12 +514,7 @@ class Workflow(signal_responder.SignalResponder,
             current_task = {}
             wf_value = task.get(self.WORKFLOW)
             if wf_value is not None:
-                if wf_value in [res.resource_id
-                                for res in six.itervalues(self.stack)]:
-                    current_task.update({self.WORKFLOW: wf_value})
-                else:
-                    msg = _("No such workflow %s") % wf_value
-                    raise ValueError(msg)
+                current_task.update({self.WORKFLOW: wf_value})
 
             # backward support for kilo.
             if task.get(self.POLICIES) is not None:
@@ -486,6 +540,7 @@ class Workflow(signal_responder.SignalResponder,
                       defn_name: {self.TYPE: props.get(self.TYPE),
                                   self.DESCRIPTION: props.get(
                                       self.DESCRIPTION),
+                                  self.TAGS: props.get(self.TAGS),
                                   self.OUTPUT: props.get(self.OUTPUT)}}
         for key in list(definition[defn_name].keys()):
             if definition[defn_name][key] is None:
@@ -500,7 +555,7 @@ class Workflow(signal_responder.SignalResponder,
         if props.get(self.TASK_DEFAULTS) is not None:
             definition[defn_name][self.TASK_DEFAULTS.replace('_', '-')] = {
                 k.replace('_', '-'): v for k, v in
-                six.iteritems(props.get(self.TASK_DEFAULTS)) if v}
+                props.get(self.TASK_DEFAULTS).items() if v}
 
         return yaml.dump(definition, Dumper=yaml.CSafeDumper
                          if hasattr(yaml, 'CSafeDumper')
@@ -534,7 +589,7 @@ class Workflow(signal_responder.SignalResponder,
         try:
             execution = self.client().executions.create(
                 self._workflow_name(),
-                jsonutils.dumps(inputs_result),
+                workflow_input=jsonutils.dumps(inputs_result),
                 **params_result)
         except Exception as ex:
             raise exception.ResourceFailure(ex, self)
@@ -543,12 +598,21 @@ class Workflow(signal_responder.SignalResponder,
             executions.extend(self.data().get(self.EXECUTIONS).split(','))
         self.data_set(self.EXECUTIONS, ','.join(executions))
 
+    def needs_replace_failed(self):
+        if self.resource_id is None:
+            return True
+
+        if self.properties[self.NAME] is None:
+            return True
+
+        with self.client_plugin().ignore_not_found:
+            self.client().workflows.get(self.resource_id)
+            return False
+        self.resource_id_set(None)
+        return True
+
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        update_allowed = [self.INPUT, self.PARAMS, self.DESCRIPTION]
-        for prop in update_allowed:
-            if prop in prop_diff:
-                del prop_diff[prop]
-        if len(prop_diff) > 0:
+        if prop_diff:
             props = json_snippet.properties(self.properties_schema,
                                             self.context)
             new_props = self.prepare_properties(props)
@@ -583,8 +647,8 @@ class Workflow(signal_responder.SignalResponder,
                     'created_at': execution.created_at,
                     'updated_at': execution.updated_at,
                     'state': execution.state,
-                    'input': jsonutils.loads(six.text_type(execution.input)),
-                    'output': jsonutils.loads(six.text_type(execution.output))
+                    'input': jsonutils.loads(str(execution.input)),
+                    'output': jsonutils.loads(str(execution.output))
                 }
 
             return [parse_execution_response(
@@ -597,7 +661,7 @@ class Workflow(signal_responder.SignalResponder,
                     self.INPUT: self.properties.get(self.INPUT)}
 
         elif name == self.ALARM_URL and self.resource_id is not None:
-            return six.text_type(self._get_ec2_signed_url())
+            return str(self._get_ec2_signed_url(never_expire=True))
 
 
 def resource_mapping():

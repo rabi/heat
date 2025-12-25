@@ -12,7 +12,6 @@
 #    under the License.
 
 from oslo_config import cfg
-import six
 
 from heatclient import client as hc
 from heatclient import exc
@@ -32,14 +31,15 @@ class HeatClientPlugin(client_plugin.ClientPlugin):
     def _create(self):
         endpoint = self.get_heat_url()
         args = {}
-        if self._get_client_option(CLIENT_NAME, 'url'):
+        if self._get_client_option(CLIENT_NAME, 'url', fallback=False):
             # assume that the heat API URL is manually configured because
             # it is not in the keystone catalog, so include the credentials
             # for the standalone auth_password middleware
             args['username'] = self.context.username
             args['password'] = self.context.password
 
-        return hc.Client('1', endpoint,
+        args['connect_retries'] = cfg.CONF.client_retry_limit
+        return hc.Client('1', endpoint_override=endpoint,
                          session=self.context.keystone_session,
                          **args)
 
@@ -53,9 +53,9 @@ class HeatClientPlugin(client_plugin.ClientPlugin):
         return isinstance(ex, exc.HTTPConflict)
 
     def get_heat_url(self):
-        heat_url = self._get_client_option(CLIENT_NAME, 'url')
+        heat_url = self._get_client_option(CLIENT_NAME, 'url', fallback=False)
         if heat_url:
-            tenant_id = self.context.tenant_id
+            tenant_id = self.context.project_id
             heat_url = heat_url % {'tenant_id': tenant_id}
         else:
             endpoint_type = self._get_client_option(CLIENT_NAME,
@@ -88,15 +88,6 @@ class HeatClientPlugin(client_plugin.ClientPlugin):
         if config_url and config_url[-1] != "/":
             config_url += '/'
         return config_url
-
-    def get_watch_server_url(self):
-        cfn_url = self.get_heat_cfn_url()
-        url_parts = cfn_url.split(':')
-        port_and_version = url_parts[-1].split('/')
-        port_and_version[0] = (
-            six.text_type(cfg.CONF.heat_api_cloudwatch.bind_port))
-        url_parts[-1] = '/'.join(port_and_version)
-        return ':'.join(url_parts)
 
     def get_insecure_option(self):
         return self._get_client_option(CLIENT_NAME, 'insecure')

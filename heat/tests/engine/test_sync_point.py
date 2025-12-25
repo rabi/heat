@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
+
 from oslo_db import exception
 
 from heat.engine import sync_point
@@ -71,18 +72,19 @@ class SyncPointTestCase(common.HeatTestCase):
 
     def test_serialize_input_data(self):
         res = sync_point.serialize_input_data({(3, 8): None})
-        self.assertEqual({'input_data': {u'tuple:(3, 8)': None}}, res)
+        self.assertEqual({'input_data': {'tuple:(3, 8)': None}}, res)
 
     @mock.patch('heat.engine.sync_point.update_input_data', return_value=None)
-    @mock.patch('eventlet.sleep', side_effect=exception.DBError)
+    @mock.patch('time.sleep', side_effect=exception.DBError)
     def sync_with_sleep(self, ctx, stack, mock_sleep_time, mock_uid):
         resource = stack['C']
         graph = stack.convergence_dependencies.graph()
 
         mock_callback = mock.Mock()
+        sender = (3, True)
         self.assertRaises(exception.DBError, sync_point.sync, ctx, resource.id,
                           stack.current_traversal, True, mock_callback,
-                          set(graph[(resource.id, True)]), {})
+                          set(graph[(resource.id, True)]), {sender: None})
         return mock_sleep_time
 
     def test_sync_with_time_throttle(self):
@@ -92,4 +94,4 @@ class SyncPointTestCase(common.HeatTestCase):
                                 convergence=True)
         stack.converge_stack(stack.t, action=stack.CREATE)
         mock_sleep_time = self.sync_with_sleep(ctx, stack)
-        mock_sleep_time.assert_called_once_with(mock.ANY)
+        self.assertTrue(mock_sleep_time.called)

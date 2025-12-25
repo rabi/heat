@@ -16,12 +16,10 @@ import weakref
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import importutils
-import six
 from stevedore import enabled
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.common import pluginutils
 
 LOG = logging.getLogger(__name__)
@@ -32,7 +30,8 @@ _default_backend = "heat.engine.clients.OpenStackClients"
 cloud_opts = [
     cfg.StrOpt('cloud_backend',
                default=_default_backend,
-               help="Fully qualified class name to use as a client backend.")
+               help=_("Fully qualified class name to use as "
+                      "a client backend."))
 ]
 cfg.CONF.register_opts(cloud_opts)
 
@@ -50,11 +49,6 @@ class OpenStackClients(object):
         ctxt = self._context()
         assert ctxt is not None, "Need a reference to the context"
         return ctxt
-
-    def invalidate_plugins(self):
-        """Used to force plugins to clear any cached client."""
-        for name in self._client_plugins:
-            self._client_plugins[name].invalidate()
 
     def client_plugin(self, name):
         global _mgr
@@ -82,7 +76,7 @@ class OpenStackClients(object):
             client = getattr(self, method_name)()
             self._clients[name] = client
             return client
-        LOG.warning(_LW('Requested client "%s" not found'), name)
+        LOG.warning('Requested client "%s" not found', name)
 
 
 class ClientBackend(object):
@@ -98,11 +92,11 @@ class ClientBackend(object):
             try:
                 return importutils.import_object(cfg.CONF.cloud_backend,
                                                  context)
-            except (ImportError, RuntimeError, cfg.NoSuchOptError) as err:
-                msg = _('Invalid cloud_backend setting in heat.conf '
-                        'detected - %s') % six.text_type(err)
-                LOG.error(msg)
-                raise exception.Invalid(reason=msg)
+            except (ImportError, RuntimeError, cfg.NoSuchOptError):
+                LOG.exception('Invalid cloud_backend setting in heat.conf '
+                              'detected')
+                raise exception.Invalid(
+                    reason=_('Invalid cloud_backend setting'))
 
 
 Clients = ClientBackend

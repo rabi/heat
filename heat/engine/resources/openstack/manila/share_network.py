@@ -66,7 +66,11 @@ class ManilaShareNetwork(resource.Resource):
             properties.Schema.STRING,
             _('Nova network id.'),
             update_allowed=True,
-            constraints=[constraints.CustomConstraint('nova.network')]
+            support_status=support.SupportStatus(
+                status=support.HIDDEN,
+                message=_('nova-network is no longer supported.'),
+                version='21.0.0'
+            )
         ),
         DESCRIPTION: properties.Schema(
             properties.Schema.STRING,
@@ -113,24 +117,16 @@ class ManilaShareNetwork(resource.Resource):
         return self.client().share_networks.get(self.resource_id)
 
     def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
         network = self._request_network()
         return getattr(network, name, None)
 
     def validate(self):
         super(ManilaShareNetwork, self).validate()
-        if (self.properties[self.NEUTRON_NETWORK] and
-                self.properties[self.NOVA_NETWORK]):
-            raise exception.ResourcePropertyConflict(self.NEUTRON_NETWORK,
-                                                     self.NOVA_NETWORK)
 
-        if (self.properties[self.NOVA_NETWORK] and
-                self.properties[self.NEUTRON_SUBNET]):
-            raise exception.ResourcePropertyConflict(self.NEUTRON_SUBNET,
-                                                     self.NOVA_NETWORK)
-
-        if self.is_using_neutron() and self.properties[self.NOVA_NETWORK]:
-            msg = _('With Neutron enabled you need to pass Neutron network '
-                    'and Neutron subnet instead of Nova network')
+        if self.properties[self.NOVA_NETWORK]:
+            msg = _('Nova network is no longer supported')
             raise exception.StackValidationFailed(message=msg)
 
         if (self.properties[self.NEUTRON_NETWORK] and not
@@ -142,10 +138,10 @@ class ManilaShareNetwork(resource.Resource):
                 self.properties[self.NEUTRON_SUBNET]):
             plg = self.client_plugin('neutron')
             subnet_id = plg.find_resourceid_by_name_or_id(
-                'subnet', self.properties[self.NEUTRON_SUBNET])
+                plg.RES_TYPE_SUBNET, self.properties[self.NEUTRON_SUBNET])
             net_id = plg.network_id_from_subnet_id(subnet_id)
             provided_net_id = plg.find_resourceid_by_name_or_id(
-                'network', self.properties[self.NEUTRON_NETWORK])
+                plg.RES_TYPE_NETWORK, self.properties[self.NEUTRON_NETWORK])
             if net_id != provided_net_id:
                 msg = (_('Provided %(subnet)s does not belong '
                          'to provided %(network)s.')
@@ -154,36 +150,25 @@ class ManilaShareNetwork(resource.Resource):
                 raise exception.StackValidationFailed(message=msg)
 
     def translation_rules(self, props):
-        if self.is_using_neutron():
-            translation_rules = [
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    [self.NEUTRON_NETWORK],
-                    client_plugin=self.client_plugin('neutron'),
-                    finder='find_resourceid_by_name_or_id',
-                    entity='network'
-                ),
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    [self.NEUTRON_SUBNET],
-                    client_plugin=self.client_plugin('neutron'),
-                    finder='find_resourceid_by_name_or_id',
-                    entity='subnet'
-                )
-            ]
-        else:
-            translation_rules = [
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    [self.NOVA_NETWORK],
-                    client_plugin=self.client_plugin('nova'),
-                    finder='get_nova_network_id'
-                )
-            ]
-
+        neutron_client_plugin = self.client_plugin('neutron')
+        translation_rules = [
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                [self.NEUTRON_NETWORK],
+                client_plugin=neutron_client_plugin,
+                finder='find_resourceid_by_name_or_id',
+                entity=neutron_client_plugin.RES_TYPE_NETWORK
+            ),
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                [self.NEUTRON_SUBNET],
+                client_plugin=neutron_client_plugin,
+                finder='find_resourceid_by_name_or_id',
+                entity=neutron_client_plugin.RES_TYPE_SUBNET
+            )
+        ]
         return translation_rules
 
     def handle_create(self):
@@ -196,7 +181,6 @@ class ManilaShareNetwork(resource.Resource):
             name=self.properties[self.NAME],
             neutron_net_id=neutron_net_id,
             neutron_subnet_id=neutron_subnet_id,
-            nova_net_id=self.properties[self.NOVA_NETWORK],
             description=self.properties[self.DESCRIPTION])
         self.resource_id_set(network.id)
 
@@ -232,8 +216,20 @@ class ManilaShareNetwork(resource.Resource):
                 name=prop_diff.get(self.NAME),
                 neutron_net_id=neutron_net_id,
                 neutron_subnet_id=neutron_subnet_id,
-                nova_net_id=prop_diff.get(self.NOVA_NETWORK),
                 description=prop_diff.get(self.DESCRIPTION))
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        result = super(ManilaShareNetwork, self).parse_live_resource_data(
+            resource_properties, resource_data)
+        sec_list = self.client().security_services.list(
+            search_opts={'share_network_id': self.resource_id})
+        result.update({
+            self.NOVA_NETWORK: resource_data.get('nova_net_id'),
+            self.NEUTRON_NETWORK: resource_data.get('neutron_net_id'),
+            self.NEUTRON_SUBNET: resource_data.get('neutron_subnet_id'),
+            self.SECURITY_SERVICES: [service.id for service in sec_list]}
+        )
+        return result
 
 
 def resource_mapping():

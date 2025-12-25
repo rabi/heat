@@ -11,11 +11,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
+from oslo_utils import uuidutils
+
 from glanceclient import client as gc
 from glanceclient import exc
-from glanceclient.openstack.common.apiclient import exceptions
 
-from heat.common.i18n import _
+from heat.engine.clients import client_exception
 from heat.engine.clients import client_plugin
 from heat.engine.clients import os as os_client
 from heat.engine import constraints
@@ -25,13 +27,13 @@ CLIENT_NAME = 'glance'
 
 class GlanceClientPlugin(client_plugin.ClientPlugin):
 
-    exceptions_module = [exceptions, exc]
+    exceptions_module = [client_exception, exc]
 
     service_types = [IMAGE] = ['image']
 
-    supported_versions = [V1, V2] = ['1', '2']
+    supported_versions = [V2] = ['2']
 
-    default_version = V1
+    default_version = V2
 
     def _create(self, version=None):
         con = self.context
@@ -39,24 +41,20 @@ class GlanceClientPlugin(client_plugin.ClientPlugin):
 
         return gc.Client(version, session=con.keystone_session,
                          interface=interface,
-                         service_type=self.IMAGE)
+                         service_type=self.IMAGE,
+                         connect_retries=cfg.CONF.client_retry_limit,
+                         region_name=self._get_region_name())
 
     def _find_with_attr(self, entity, **kwargs):
         """Find a item for entity with attributes matching ``**kwargs``."""
         matches = list(self._findall_with_attr(entity, **kwargs))
         num_matches = len(matches)
         if num_matches == 0:
-            msg = _("No %(name)s matching %(args)s.") % {
-                'name': entity,
-                'args': kwargs
-            }
-            raise exceptions.NotFound(msg)
+            raise client_exception.EntityMatchNotFound(entity=entity,
+                                                       args=kwargs)
         elif num_matches > 1:
-            msg = _("No %(name)s unique match found for %(args)s.") % {
-                'name': entity,
-                'args': kwargs
-            }
-            raise exceptions.NoUniqueMatch(msg)
+            raise client_exception.EntityUniqueMatchNotFound(entity=entity,
+                                                             args=kwargs)
         else:
             return matches[0]
 
@@ -67,13 +65,14 @@ class GlanceClientPlugin(client_plugin.ClientPlugin):
         return func.list(**filters)
 
     def is_not_found(self, ex):
-        return isinstance(ex, (exceptions.NotFound, exc.HTTPNotFound))
+        return isinstance(ex, (client_exception.EntityMatchNotFound,
+                               exc.HTTPNotFound))
 
     def is_over_limit(self, ex):
         return isinstance(ex, exc.HTTPOverLimit)
 
     def is_conflict(self, ex):
-        return isinstance(ex, (exceptions.Conflict, exc.Conflict))
+        return isinstance(ex, exc.HTTPConflict)
 
     def find_image_by_name_or_id(self, image_identifier):
         """Return the ID for the specified image name or identifier.
@@ -81,7 +80,7 @@ class GlanceClientPlugin(client_plugin.ClientPlugin):
         :param image_identifier: image name or a UUID-like identifier
         :returns: the id of the requested :image_identifier:
         """
-        return self._find_image_id(self.context.tenant_id,
+        return self._find_image_id(self.context.project_id,
                                    image_identifier)
 
     @os_client.MEMOIZE_FINDER
@@ -96,14 +95,17 @@ class GlanceClientPlugin(client_plugin.ClientPlugin):
         :param image_identifier: image name
         :returns: an image object with name/id :image_identifier:
         """
-        try:
-            return self.client().images.get(image_identifier)
-        except exc.HTTPNotFound:
-            return self._find_with_attr('images', name=image_identifier)
+        if uuidutils.is_uuid_like(image_identifier):
+            try:
+                return self.client().images.get(image_identifier)
+            except exc.HTTPNotFound:
+                pass
+        return self._find_with_attr('images', name=image_identifier)
 
 
 class ImageConstraint(constraints.BaseCustomConstraint):
-    expected_exceptions = (exceptions.NotFound, exceptions.NoUniqueMatch)
+    expected_exceptions = (client_exception.EntityMatchNotFound,
+                           client_exception.EntityUniqueMatchNotFound)
 
     resource_client_name = CLIENT_NAME
     resource_getter_name = 'find_image_by_name_or_id'

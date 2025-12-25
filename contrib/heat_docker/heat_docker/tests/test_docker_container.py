@@ -14,14 +14,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common.i18n import _
 from heat.common import template_format
 from heat.engine import resource
-from heat.engine import rsrc_defn
 from heat.engine import scheduler
 from heat.tests import common
 from heat.tests import utils
@@ -60,7 +58,6 @@ class DockerContainerTest(common.HeatTestCase):
         super(DockerContainerTest, self).setUp()
         for res_name, res_class in docker_container.resource_mapping().items():
             resource._register_class(res_name, res_class)
-        self.addCleanup(self.m.VerifyAll)
 
     def create_container(self, resource_name):
         t = template_format.parse(template)
@@ -69,11 +66,9 @@ class DockerContainerTest(common.HeatTestCase):
             resource_name,
             self.stack.t.resource_definitions(self.stack)[resource_name],
             self.stack)
-        self.m.StubOutWithMock(resource, 'get_client')
-        resource.get_client().MultipleTimes().AndReturn(
-            docker.Client())
+        self.patchobject(resource, 'get_client',
+                         return_value=docker.Client())
         self.assertIsNone(resource.validate())
-        self.m.ReplayAll()
         scheduler.TaskRunner(resource.create)()
         self.assertEqual((resource.CREATE, resource.COMPLETE),
                          resource.state)
@@ -100,11 +95,9 @@ class DockerContainerTest(common.HeatTestCase):
         props['name'] = 'super-blog'
         resource = docker_container.DockerContainer(
             'Blog', definition.freeze(properties=props), self.stack)
-        self.m.StubOutWithMock(resource, 'get_client')
-        resource.get_client().MultipleTimes().AndReturn(
-            docker.Client())
+        self.patchobject(resource, 'get_client',
+                         return_value=docker.Client())
         self.assertIsNone(resource.validate())
-        self.m.ReplayAll()
         scheduler.TaskRunner(resource.create)()
         self.assertEqual((resource.CREATE, resource.COMPLETE),
                          resource.state)
@@ -114,6 +107,11 @@ class DockerContainerTest(common.HeatTestCase):
 
     @mock.patch.object(docker_container.DockerContainer, 'get_client')
     def test_create_failed(self, test_client):
+        t = template_format.parse(template)
+        self.stack = utils.parse_stack(t)
+        definition = self.stack.t.resource_definitions(self.stack)['Blog']
+        props = t['Resources']['Blog']['Properties'].copy()
+
         mock_client = mock.Mock()
         mock_client.inspect_container.return_value = {
             "State": {
@@ -122,16 +120,12 @@ class DockerContainerTest(common.HeatTestCase):
         }
         mock_client.logs.return_value = "Container startup failed"
         test_client.return_value = mock_client
-        mock_stack = mock.Mock()
-        mock_stack.has_cache_data.return_value = False
-        mock_stack.db_resource_get.return_value = None
-        res_def = mock.Mock(spec=rsrc_defn.ResourceDefinition)
-        docker_res = docker_container.DockerContainer("test", res_def,
-                                                      mock_stack)
+        docker_res = docker_container.DockerContainer(
+            'Blog', definition.freeze(properties=props), self.stack)
         exc = self.assertRaises(exception.ResourceInError,
                                 docker_res.check_create_complete,
                                 'foo')
-        self.assertIn("Container startup failed", six.text_type(exc))
+        self.assertIn("Container startup failed", str(exc))
 
     def test_start_with_bindings_and_links(self):
         t = template_format.parse(template)
@@ -142,11 +136,9 @@ class DockerContainerTest(common.HeatTestCase):
         props['links'] = {'db': 'mysql'}
         resource = docker_container.DockerContainer(
             'Blog', definition.freeze(properties=props), self.stack)
-        self.m.StubOutWithMock(resource, 'get_client')
-        resource.get_client().MultipleTimes().AndReturn(
-            docker.Client())
+        self.patchobject(resource, 'get_client',
+                         return_value=docker.Client())
         self.assertIsNone(resource.validate())
-        self.m.ReplayAll()
         scheduler.TaskRunner(resource.create)()
         self.assertEqual((resource.CREATE, resource.COMPLETE),
                          resource.state)
@@ -188,7 +180,6 @@ class DockerContainerTest(common.HeatTestCase):
                 raise
 
         self.assertIs(False, exists)
-        self.m.VerifyAll()
 
     @testtools.skipIf(docker is None, 'docker-py not available')
     def test_resource_delete_exception(self):
@@ -197,18 +188,18 @@ class DockerContainerTest(common.HeatTestCase):
         response.content = 'some content'
 
         container = self.create_container('Blog')
-        self.m.StubOutWithMock(container.get_client(), 'kill')
-        container.get_client().kill(container.resource_id).AndRaise(
-            docker.errors.APIError('Not found', response))
+        self.patchobject(container.get_client(), 'kill',
+                         side_effect=[docker.errors.APIError(
+                             'Not found', response)])
 
-        self.m.StubOutWithMock(container, '_get_container_status')
-        container._get_container_status(container.resource_id).AndRaise(
-            docker.errors.APIError('Not found', response))
-
-        self.m.ReplayAll()
-
+        self.patchobject(container, '_get_container_status',
+                         side_effect=[docker.errors.APIError(
+                             'Not found', response)])
         scheduler.TaskRunner(container.delete)()
-        self.m.VerifyAll()
+        container.get_client().kill.assert_called_once_with(
+            container.resource_id)
+        container._get_container_status.assert_called_once_with(
+            container.resource_id)
 
     def test_resource_suspend_resume(self):
         container = self.create_container('Blog')
@@ -339,7 +330,7 @@ class DockerContainerTest(common.HeatTestCase):
         args = dict(arg=arg, min_version=min_version)
         expected = _('"%(arg)s" is not supported for API version '
                      '< "%(min_version)s"') % args
-        self.assertEqual(expected, six.text_type(msg))
+        self.assertEqual(expected, str(msg))
 
     def test_start_with_read_only_for_low_api_version(self):
         self.arg_for_low_api_version('read_only', True, '1.16')

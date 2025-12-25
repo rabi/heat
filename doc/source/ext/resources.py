@@ -13,12 +13,12 @@
 # -*- coding: utf-8 -*-
 
 from functools import cmp_to_key
+import json
 import pydoc
 
 from docutils import core
 from docutils import nodes
-import six
-from sphinx.util import compat
+from docutils.parsers import rst
 
 from heat.common.i18n import _
 from heat.engine import attributes
@@ -26,14 +26,30 @@ from heat.engine import plugin_manager
 from heat.engine import properties
 from heat.engine import support
 
-_CODE_NAMES = {'2013.1': 'Grizzly',
-               '2013.2': 'Havana',
-               '2014.1': 'Icehouse',
-               '2014.2': 'Juno',
-               '2015.1': 'Kilo',
-               '5.0.0': 'Liberty',
-               '6.0.0': 'Mitaka',
-               '7.0.0': 'Newton'}
+_CODE_NAMES = {
+    '2013.1': 'Grizzly',
+    '2013.2': 'Havana',
+    '2014.1': 'Icehouse',
+    '2014.2': 'Juno',
+    '2015.1': 'Kilo',
+    '5.0.0': 'Liberty',
+    '6.0.0': 'Mitaka',
+    '7.0.0': 'Newton',
+    '8.0.0': 'Ocata',
+    '9.0.0': 'Pike',
+    '10.0.0': 'Queens',
+    '11.0.0': 'Rocky',
+    '12.0.0': 'Stein',
+    '13.0.0': 'Train',
+    '14.0.0': 'Ussuri',
+    '15.0.0': 'Victoria',
+    '16.0.0': 'Wallaby',
+    '17.0.0': 'Xena',
+    '18.0.0': 'Yoga',
+    '19.0.0': 'Zed',
+    '20.0.0': '2023.1',
+    '21.0.0': '2023.2',
+}
 
 all_resources = {}
 
@@ -50,7 +66,7 @@ class contribresourcepages(nodes.General, nodes.Element):
     pass
 
 
-class ResourcePages(compat.Directive):
+class ResourcePages(rst.Directive):
     has_content = False
     required_arguments = 0
     optional_arguments = 1
@@ -126,8 +142,17 @@ class ResourcePages(compat.Directive):
                     'status_msg': sstatus['message']}
             if not (sstatus['status'] == support.SUPPORTED and
                     sstatus['version'] is None):
-                para = nodes.paragraph('', msg)
-                note = nodes.note('', para)
+                para = nodes.inline('', msg)
+                para['classes'] = ['versionmodified']
+                parent_para = nodes.paragraph()
+                parent_para['classes'] = ['versionsupport']
+                parent_para.append(para)
+                note = nodes.topic()
+                if sstatus['status'] == support.SUPPORTED:
+                    note['classes'] = ['versionadded']
+                else:
+                    note['classes'] = ['deprecated']
+                note.append(parent_para)
                 section.append(note)
             support_status = support_status.previous_status
 
@@ -138,6 +163,23 @@ class ResourcePages(compat.Directive):
         title = nodes.title('', title)
         section.append(title)
         return section
+
+    def _prop_section(self, parent, title, id_pattern):
+        id = id_pattern % self.resource_type
+        section = nodes.section(ids=[id])
+        parent.append(section)
+
+        # Ignore title generated for list items
+        if title != '*':
+            title = nodes.term('', title)
+            ref = nodes.reference('', '\xb6')
+            ref['classes'] = ['headerlink']
+            ref['refid'] = id
+            title.append(ref)
+            section.append(title)
+        field = nodes.definition()
+        section.append(field)
+        return field
 
     def _prop_syntax_example(self, prop):
         if not prop:
@@ -200,76 +242,93 @@ resources:
         return (x_status > y_status) - (x_status < y_status)
 
     def contribute_property(self, parent, prop_key, prop, upd_para=None,
-                            id_pattern_prefix=None):
+                            id_pattern_prefix=None, sub_prop=False):
         if not id_pattern_prefix:
             id_pattern_prefix = '%s-prop'
         id_pattern = id_pattern_prefix + '-' + prop_key
 
-        definition = self._section(parent, prop_key, id_pattern)
+        definition = self._prop_section(parent, prop_key, id_pattern)
 
         self._status_str(prop.support_status, definition)
 
         if not prop.implemented:
-            para = nodes.paragraph('', _('Not implemented.'))
+            para = nodes.line('', _('Not implemented.'))
             note = nodes.note('', para)
-            definition.append(note)
+            if sub_prop:
+                definition.append(para)
+            else:
+                definition.append(note)
             return
 
+        if sub_prop and prop.type not in (properties.Schema.LIST,
+                                          properties.Schema.MAP):
+            if prop.required:
+                para = nodes.line('', _('Required.'))
+                definition.append(para)
+            else:
+                para = nodes.line('', _('Optional.'))
+                definition.append(para)
+
         if prop.description:
-            para = nodes.paragraph('', prop.description)
+            para = nodes.line('', prop.description)
             definition.append(para)
 
-        type = nodes.paragraph('', _('%s value expected.') % prop.type)
+        type = nodes.line('', _('%s value expected.') % prop.type)
         definition.append(type)
 
         if upd_para is not None:
             definition.append(upd_para)
         else:
             if prop.update_allowed:
-                upd_para = nodes.paragraph(
+                upd_para = nodes.line(
                     '', _('Can be updated without replacement.'))
                 definition.append(upd_para)
             elif prop.immutable:
-                upd_para = nodes.paragraph('', _('Updates are not supported. '
-                                                 'Resource update will fail on'
-                                                 ' any attempt to update this '
-                                                 'property.'))
+                upd_para = nodes.line('', _('Updates are not supported. '
+                                            'Resource update will fail on '
+                                            'any attempt to update this '
+                                            'property.'))
                 definition.append(upd_para)
             else:
-                upd_para = nodes.paragraph('', _('Updates cause replacement.'))
+                upd_para = nodes.line('', _('Updates cause replacement.'))
                 definition.append(upd_para)
 
         if prop.default is not None:
-            para = nodes.paragraph('', _('Defaults to "%s".') % prop.default)
+            para = nodes.line('', _('Defaults to '))
+            default = nodes.literal('', json.dumps(prop.default))
+            para.append(default)
             definition.append(para)
+        elif prop_key == 'description' and prop.update_allowed:
+            para = nodes.line('', _('Defaults to the resource description'))
 
         for constraint in prop.constraints:
-            para = nodes.paragraph('', str(constraint))
+            para = nodes.line('', str(constraint))
             definition.append(para)
 
         sub_schema = None
         if prop.schema and prop.type == properties.Schema.MAP:
-            para = nodes.paragraph()
+            para = nodes.line()
             emph = nodes.emphasis('', _('Map properties:'))
             para.append(emph)
             definition.append(para)
             sub_schema = prop.schema
 
         elif prop.schema and prop.type == properties.Schema.LIST:
-            para = nodes.paragraph()
+            para = nodes.line()
             emph = nodes.emphasis('', _('List contents:'))
             para.append(emph)
             definition.append(para)
             sub_schema = prop.schema
 
         if sub_schema:
+            indent = nodes.definition_list()
+            definition.append(indent)
             for _key, _prop in sorted(sub_schema.items(),
                                       key=cmp_to_key(self.cmp_prop)):
                 if _prop.support_status.status != support.HIDDEN:
-                    indent = nodes.block_quote()
-                    definition.append(indent)
                     self.contribute_property(
-                        indent, _key, _prop, upd_para, id_pattern)
+                        indent, _key, _prop, upd_para, id_pattern,
+                        sub_prop=True)
 
     def contribute_properties(self, parent):
         if not self.props_schemata:
@@ -283,30 +342,37 @@ resources:
         if required_props:
             section = self._section(
                 parent, _('Required Properties'), '%s-props-req')
+            definition_list = nodes.definition_list()
+            section.append(definition_list)
 
             for prop_key, prop in sorted(required_props.items(),
                                          key=cmp_to_key(self.cmp_prop)):
-                self.contribute_property(section, prop_key, prop)
+                self.contribute_property(definition_list, prop_key, prop)
 
         optional_props = dict((k, v) for k, v in props.items()
                               if not v.required)
         if optional_props:
             section = self._section(
                 parent, _('Optional Properties'), '%s-props-opt')
+            definition_list = nodes.definition_list()
+            section.append(definition_list)
 
             for prop_key, prop in sorted(optional_props.items(),
                                          key=cmp_to_key(self.cmp_prop)):
-                self.contribute_property(section, prop_key, prop)
+                self.contribute_property(definition_list, prop_key, prop)
 
     def contribute_attributes(self, parent):
         if not self.attrs_schemata:
             return
         section = self._section(parent, _('Attributes'), '%s-attrs')
+        definition_list = nodes.definition_list()
+        section.append(definition_list)
+
         for prop_key, prop in sorted(self.attrs_schemata.items()):
             if prop.support_status.status != support.HIDDEN:
                 description = prop.description
-                attr_section = self._section(
-                    section, prop_key, '%s-attr-' + prop_key)
+                attr_section = self._prop_section(
+                    definition_list, prop_key, '%s-attr-' + prop_key)
 
                 self._status_str(prop.support_status, attr_section)
 
@@ -318,9 +384,12 @@ resources:
         if not self.update_policy_schemata:
             return
         section = self._section(parent, _('update_policy'), '%s-updpolicy')
+        definition_list = nodes.definition_list()
+        section.append(definition_list)
+
         for _key, _prop in sorted(self.update_policy_schemata.items(),
                                   key=cmp_to_key(self.cmp_prop)):
-            self.contribute_property(section, _key, _prop)
+            self.contribute_property(definition_list, _key, _prop)
 
 
 class IntegrateResourcePages(ResourcePages):
@@ -373,10 +442,13 @@ def _filter_resources(prefix=None, path=None, statuses=None):
                     else:
                         filtered_resources[name] = [cls]
 
-    return sorted(six.iteritems(filtered_resources))
+    return sorted(filtered_resources.items())
 
 
 def _load_all_resources():
+    from oslo_log import log as logging
+    logging.getLogger('heat.engine.environment').logger.setLevel(logging.ERROR)
+
     manager = plugin_manager.PluginManager('heat.engine.resources')
     resource_mapping = plugin_manager.PluginMapping('resource')
     res_plugin_mappings = resource_mapping.load_all(manager)

@@ -12,21 +12,24 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
-import mox
 from neutronclient.common import exceptions as qe
 from neutronclient.neutron import v2_0 as neutronV20
 from neutronclient.v2_0 import client as neutronclient
+from openstack import exceptions
+from oslo_utils import excutils
 
 from heat.common import exception
 from heat.common import template_format
 from heat.common import timeutils
 from heat.engine.clients.os import neutron
 from heat.engine.hot import functions as hot_funcs
+from heat.engine import node_data
 from heat.engine import rsrc_defn
 from heat.engine import scheduler
 from heat.engine import stack as parser
+from heat.engine import stk_defn
 from heat.engine import template as tmpl
 from heat.tests import common
 from heat.tests import utils
@@ -54,6 +57,16 @@ resources:
     properties:
       floatingip_id: { get_resource: floating_ip }
       port_id: { get_resource: port_floating }
+
+  port_forwarding:
+    type: OS::Neutron::FloatingIPPortForward
+    properties:
+      internal_ip_address: 10.0.0.10
+      internal_port_number: 8080
+      external_port: 80
+      protocol: tcp
+      internal_port: { get_resource: port_floating }
+      floating_ip: { get_resource: floating_ip }
 
   router:
     type: OS::Neutron::Router
@@ -122,28 +135,43 @@ class NeutronFloatingIPTest(common.HeatTestCase):
 
     def setUp(self):
         super(NeutronFloatingIPTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client, 'create_floatingip')
-        self.m.StubOutWithMock(neutronclient.Client, 'delete_floatingip')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_floatingip')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_floatingip')
-        self.m.StubOutWithMock(neutronclient.Client, 'create_port')
-        self.m.StubOutWithMock(neutronclient.Client, 'delete_port')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_port')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_port')
-        self.m.StubOutWithMock(neutronV20,
-                               'find_resourceid_by_name_or_id')
-        self.m.StubOutWithMock(timeutils, 'retry_backoff_delay')
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
+
+        def lookup(client, lookup_type, name, cmd_resource):
+            return name
+
+        self.patchobject(neutronV20,
+                         'find_resourceid_by_name_or_id',
+                         side_effect=lookup)
+
         self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
                          return_value=True)
 
+        class FakeOpenStackPlugin(object):
+
+            @excutils.exception_filter
+            def ignore_not_found(self, ex):
+                if not isinstance(ex, exceptions.ResourceNotFound):
+                    raise ex
+
+            def find_network_port(self, value):
+                return '9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151'
+
+            def find_network_ip(self, value):
+                return '477e8273-60a7-4c41-b683-1d497e53c384'
+
+        self.ctx = utils.dummy_context()
+        tpl = template_format.parse(neutron_floating_template)
+        self.stack = utils.parse_stack(tpl)
+        self.sdkclient = mock.Mock()
+        self.port_forward = self.stack['port_forwarding']
+        self.port_forward.client = mock.Mock(return_value=self.sdkclient)
+        self.port_forward.client_plugin = mock.Mock(
+            return_value=FakeOpenStackPlugin()
+        )
+
     def test_floating_ip_validate(self):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        self.m.ReplayAll()
         t = template_format.parse(neutron_floating_no_assoc_template)
         stack = utils.parse_stack(t)
         fip = stack['floating_ip']
@@ -155,7 +183,6 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         fip = stack['floating_ip']
         self.assertRaises(exception.ResourcePropertyDependency,
                           fip.validate)
-        self.m.VerifyAll()
 
     def test_floating_ip_router_interface(self):
         t = template_format.parse(neutron_floating_template)
@@ -178,58 +205,50 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         self._test_floating_ip(t, r_iface=False)
 
     def _test_floating_ip(self, tmpl, r_iface=True):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronclient.Client.create_floatingip({
-            'floatingip': {'floating_network_id': u'abcd1234'}
-        }).AndReturn({'floatingip': {
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_network_id': u'abcd1234'
-        }})
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                'floating_network_id': 'abcd1234'
+            }
+        }
 
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndRaise(qe.NeutronClientException(status_code=404))
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'floatingip': {
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_network_id': u'abcd1234'
-        }})
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'floatingip': {
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_network_id': u'abcd1234'
-        }})
+        self.mockclient.show_floatingip.side_effect = [
+            qe.NeutronClientException(status_code=404),
+            {
+                'floatingip': {
+                    'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                    'floating_network_id': 'abcd1234'
+                }
+            },
+            {
+                'floatingip': {
+                    'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                    'floating_network_id': 'abcd1234'
+                }
+            },
+            # Start delete
+            {
+                'floatingip': {
+                    'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                    'floating_network_id': 'abcd1234'
+                }
+            },
+            qe.NeutronClientException(status_code=404),
+        ]
 
-        timeutils.retry_backoff_delay(1, jitter_max=2.0).AndReturn(0.01)
-        neutronclient.Client.delete_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766').AndReturn(None)
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'floatingip': {
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_network_id': u'abcd1234'
-        }})
-        neutronclient.Client.delete_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766').AndReturn(None)
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766').AndRaise(
-                qe.NeutronClientException(status_code=404))
-        neutronclient.Client.delete_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766').AndRaise(
-                qe.NeutronClientException(status_code=404))
+        retry_delay = self.patchobject(timeutils, 'retry_backoff_delay',
+                                       return_value=0.01)
+        self.mockclient.delete_floatingip.side_effect = [
+            None,
+            None,
+            qe.NeutronClientException(status_code=404),
+        ]
+
         self.stub_NetworkConstraint_validate()
         stack = utils.parse_stack(tmpl)
 
         # assert the implicit dependency between the floating_ip
         # and the gateway
-        self.m.ReplayAll()
 
         if r_iface:
             required_by = set(stack.dependencies.required_by(
@@ -253,187 +272,131 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         self.assertRaises(exception.InvalidTemplateAttribute,
                           fip.FnGetAtt, 'Foo')
 
-        self.assertEqual(u'abcd1234', fip.FnGetAtt('floating_network_id'))
+        self.assertEqual('abcd1234', fip.FnGetAtt('floating_network_id'))
         scheduler.TaskRunner(fip.delete)()
         fip.state_set(fip.CREATE, fip.COMPLETE, 'to delete again')
         scheduler.TaskRunner(fip.delete)()
 
-        self.m.VerifyAll()
+        self.mockclient.create_floatingip.assert_called_once_with({
+            'floatingip': {'floating_network_id': 'abcd1234'}
+        })
+        self.mockclient.show_floatingip.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
+        retry_delay.assert_called_once_with(1, jitter_max=2.0)
+        self.mockclient.delete_floatingip.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
 
     def test_FnGetRefId(self):
-        self.m.ReplayAll()
         t = template_format.parse(neutron_floating_template)
         stack = utils.parse_stack(t)
         rsrc = stack['floating_ip']
         rsrc.resource_id = 'xyz'
         self.assertEqual('xyz', rsrc.FnGetRefId())
-        self.m.VerifyAll()
 
     def test_FnGetRefId_convergence_cache_data(self):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('sub1234')
-        self.m.ReplayAll()
         t = template_format.parse(neutron_floating_template)
         template = tmpl.Template(t)
         stack = parser.Stack(utils.dummy_context(), 'test', template,
                              cache_data={
-                                 'floating_ip': {
+                                 'floating_ip': node_data.NodeData.from_dict({
                                      'uuid': mock.ANY,
                                      'id': mock.ANY,
                                      'action': 'CREATE',
                                      'status': 'COMPLETE',
-                                     'reference_id': 'abc'}})
+                                     'reference_id': 'abc'})})
 
-        rsrc = stack['floating_ip']
+        rsrc = stack.defn['floating_ip']
         self.assertEqual('abc', rsrc.FnGetRefId())
 
     def test_floatip_association_port(self):
         t = template_format.parse(neutron_floating_template)
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('sub1234')
-        neutronclient.Client.create_floatingip({
-            'floatingip': {'floating_network_id': u'abcd1234'}
-        }).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+            }
+        }
+        self.mockclient.create_port.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+            }
+        }
+        self.mockclient.show_port.side_effect = [
+            {
+                'port': {
+                    "status": "ACTIVE",
+                    "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+                }
+            },
+            # delete
+            qe.PortNotFoundClient(status_code=404),
+        ]
 
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'abcd1234',
-            'fixed_ips': [
-                {'subnet_id': u'sub1234', 'ip_address': u'10.0.0.10'}
-            ],
-            'name': utils.PhysName(stack.name, 'port_floating'),
-            'admin_state_up': True}}
-        ).AndReturn({'port': {
-            "status": "BUILD",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        # create as
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+        self.mockclient.update_floatingip.side_effect = [
+            # create as
             {
                 'floatingip': {
-                    'port_id': u'fc68ea2c-b60b-4b4f-bd82-94ec81110766'}}
-        ).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        # update as with port_id
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                    "status": "ACTIVE",
+                    "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+                }
+            },
+            # update as with port_id
             {
                 'floatingip': {
-                    'port_id': u'2146dfbf-ba77-4083-8e86-d052f671ece5',
-                    'fixed_ip_address': None}}
-        ).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        # update as with floatingip_id
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            {'floatingip': {
-                'port_id': None
-            }}).AndReturn(None)
-        neutronclient.Client.update_floatingip(
-            '2146dfbf-ba77-4083-8e86-d052f671ece5',
+                    "status": "ACTIVE",
+                    "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+                }
+            },
+            # update as with floatingip_id
+            None,
             {
                 'floatingip': {
-                    'port_id': u'2146dfbf-ba77-4083-8e86-d052f671ece5',
-                    'fixed_ip_address': None}}
-        ).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "2146dfbf-ba77-4083-8e86-d052f671ece5"
-        }})
-        # update as with both
-        neutronclient.Client.update_floatingip(
-            '2146dfbf-ba77-4083-8e86-d052f671ece5',
-            {'floatingip': {
-                'port_id': None
-            }}).AndReturn(None)
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                    "status": "ACTIVE",
+                    "id": "2146dfbf-ba77-4083-8e86-d052f671ece5"
+                }
+            },
+            # update as with both
+            None,
             {
                 'floatingip': {
-                    'port_id': u'ade6fcac-7d47-416e-a3d7-ad12efe445c1',
-                    'fixed_ip_address': None}}
-        ).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        # delete as
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            {'floatingip': {
-                'port_id': None
-            }}).AndReturn(None)
+                    "status": "ACTIVE",
+                    "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+                }
+            },
+            # delete as
+            None,
+        ]
 
-        neutronclient.Client.delete_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn(None)
+        self.mockclient.delete_port.side_effect = [
+            None,
+            qe.PortNotFoundClient(status_code=404),
+        ]
+        self.mockclient.delete_floatingip.side_effect = [
+            None,
+            qe.PortNotFoundClient(status_code=404),
+        ]
+        self.mockclient.show_floatingip.side_effect = (
+            qe.NeutronClientException(status_code=404))
 
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndRaise(qe.PortNotFoundClient(status_code=404))
-
-        neutronclient.Client.delete_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn(None)
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766').AndRaise(
-                qe.NeutronClientException(status_code=404))
-
-        neutronclient.Client.delete_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndRaise(qe.PortNotFoundClient(status_code=404))
-
-        neutronclient.Client.delete_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndRaise(qe.NeutronClientException(status_code=404))
         self.stub_PortConstraint_validate()
-
-        self.m.ReplayAll()
 
         fip = stack['floating_ip']
         scheduler.TaskRunner(fip.create)()
         self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(stack.defn, fip.name, fip.node_data())
 
         p = stack['port_floating']
         scheduler.TaskRunner(p.create)()
         self.assertEqual((p.CREATE, p.COMPLETE), p.state)
+        stk_defn.update_resource_data(stack.defn, p.name, p.node_data())
 
         fipa = stack['floating_ip_assoc']
         scheduler.TaskRunner(fipa.create)()
         self.assertEqual((fipa.CREATE, fipa.COMPLETE), fipa.state)
+        stk_defn.update_resource_data(stack.defn, fipa.name, fipa.node_data())
         self.assertIsNotNone(fipa.id)
         self.assertEqual(fipa.id, fipa.resource_id)
 
@@ -444,7 +407,7 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         update_port_id = '2146dfbf-ba77-4083-8e86-d052f671ece5'
         props['port_id'] = update_port_id
         update_snippet = rsrc_defn.ResourceDefinition(fipa.name, fipa.type(),
-                                                      stack.t.parse(stack,
+                                                      stack.t.parse(stack.defn,
                                                                     props))
 
         scheduler.TaskRunner(fipa.update, update_snippet)()
@@ -482,19 +445,66 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         self.assertIsNone(scheduler.TaskRunner(p.delete)())
         scheduler.TaskRunner(fip.delete)()
 
-        self.m.VerifyAll()
+        self.mockclient.create_floatingip.assert_called_once_with({
+            'floatingip': {'floating_network_id': 'abcd1234'}
+        })
+        self.mockclient.create_port.assert_called_once_with({
+            'port': {
+                'network_id': 'abcd1234',
+                'fixed_ips': [
+                    {'subnet_id': 'sub1234', 'ip_address': '10.0.0.10'}
+                ],
+                'name': utils.PhysName(stack.name, 'port_floating'),
+                'admin_state_up': True,
+                'device_owner': '',
+                'device_id': '',
+                'binding:vnic_type': 'normal'
+            }
+        })
+        self.mockclient.show_port.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
+        )
+        self.mockclient.update_floatingip.assert_has_calls([
+            # create as
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {
+                          'port_id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
+                      }}),
+            # update as with port_id
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {
+                          'port_id': '2146dfbf-ba77-4083-8e86-d052f671ece5',
+                          'fixed_ip_address': None
+                      }}),
+            # update as with floatingip_id
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {'port_id': None}}),
+            mock.call('2146dfbf-ba77-4083-8e86-d052f671ece5',
+                      {'floatingip': {
+                          'port_id': '2146dfbf-ba77-4083-8e86-d052f671ece5',
+                          'fixed_ip_address': None
+                      }}),
+            # update as with both
+            mock.call('2146dfbf-ba77-4083-8e86-d052f671ece5',
+                      {'floatingip': {'port_id': None}}),
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {
+                          'port_id': 'ade6fcac-7d47-416e-a3d7-ad12efe445c1',
+                          'fixed_ip_address': None
+                      }}),
+            # delete as
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {'port_id': None}})
+        ])
 
-    def _test_floating_dependancy(self):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'router',
-            'subnet_uuid',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('subnet_uuid')
-        self.m.ReplayAll()
+        self.mockclient.delete_port.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
+        self.mockclient.delete_floatingip.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
+        self.mockclient.show_floatingip.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
 
     def test_floatip_port_dependency_subnet(self):
-        self._test_floating_dependancy()
         t = template_format.parse(neutron_floating_no_assoc_template)
         stack = utils.parse_stack(t)
 
@@ -504,15 +514,13 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         required_by = set(stack.dependencies.required_by(
             stack['router_interface']))
         self.assertIn(stack['floating_ip'], required_by)
-        self.m.VerifyAll()
 
     def test_floatip_port_dependency_network(self):
-        self._test_floating_dependancy()
         t = template_format.parse(neutron_floating_no_assoc_template)
         del t['resources']['port_floating']['properties']['fixed_ips']
         stack = utils.parse_stack(t)
 
-        p_show = self.patchobject(neutronclient.Client, 'show_network')
+        p_show = self.mockclient.show_network
         p_show.return_value = {'network': {'subnets': ['subnet_uuid']}}
 
         p_result = self.patchobject(hot_funcs.GetResource, 'result',
@@ -530,33 +538,25 @@ class NeutronFloatingIPTest(common.HeatTestCase):
             stack['router_interface']))
         self.assertIn(stack['floating_ip'], required_by)
         p_show.assert_called_once_with('net_uuid')
-        self.m.VerifyAll()
 
     def test_floatingip_create_specify_ip_address(self):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
         self.stub_NetworkConstraint_validate()
-        neutronclient.Client.create_floatingip({
-            'floatingip': {'floating_network_id': u'abcd1234',
-                           'floating_ip_address': '172.24.4.98'}
-        }).AndReturn({'floatingip': {
-            'status': 'ACTIVE',
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_ip_address': '172.24.4.98'
-        }})
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'floatingip': {
-            'status': 'ACTIVE',
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_ip_address': '172.24.4.98'
-        }})
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                'status': 'ACTIVE',
+                'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                'floating_ip_address': '172.24.4.98'
+            }
+        }
 
-        self.m.ReplayAll()
+        self.mockclient.show_floatingip.return_value = {
+            'floatingip': {
+                'status': 'ACTIVE',
+                'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                'floating_ip_address': '172.24.4.98'
+            }
+        }
+
         t = template_format.parse(neutron_floating_template)
         props = t['resources']['floating_ip']['properties']
         props['floating_ip_address'] = '172.24.4.98'
@@ -566,27 +566,23 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
         self.assertEqual('172.24.4.98', fip.FnGetAtt('floating_ip_address'))
 
-        self.m.VerifyAll()
+        self.mockclient.create_floatingip.assert_called_once_with({
+            'floatingip': {'floating_network_id': 'abcd1234',
+                           'floating_ip_address': '172.24.4.98'}
+        })
+        self.mockclient.show_floatingip.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
 
     def test_floatingip_create_specify_dns(self):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
         self.stub_NetworkConstraint_validate()
-        neutronclient.Client.create_floatingip({
-            'floatingip': {'floating_network_id': u'abcd1234',
-                           'dns_name': 'myvm',
-                           'dns_domain': 'openstack.org.'}
-        }).AndReturn({'floatingip': {
-            'status': 'ACTIVE',
-            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            'floating_ip_address': '172.24.4.98'
-        }})
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                'status': 'ACTIVE',
+                'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                'floating_ip_address': '172.24.4.98'
+            }
+        }
 
-        self.m.ReplayAll()
         t = template_format.parse(neutron_floating_template)
         props = t['resources']['floating_ip']['properties']
         props['dns_name'] = 'myvm'
@@ -596,7 +592,34 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         scheduler.TaskRunner(fip.create)()
         self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
 
-        self.m.VerifyAll()
+        self.mockclient.create_floatingip.assert_called_once_with({
+            'floatingip': {'floating_network_id': 'abcd1234',
+                           'dns_name': 'myvm',
+                           'dns_domain': 'openstack.org.'}
+        })
+
+    def test_floatingip_create_specify_subnet(self):
+        self.stub_NetworkConstraint_validate()
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                'status': 'ACTIVE',
+                'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                'floating_ip_address': '172.24.4.98'
+            }
+        }
+
+        t = template_format.parse(neutron_floating_template)
+        props = t['resources']['floating_ip']['properties']
+        props['floating_subnet'] = 'sub1234'
+        stack = utils.parse_stack(t)
+        fip = stack['floating_ip']
+        scheduler.TaskRunner(fip.create)()
+        self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+
+        self.mockclient.create_floatingip.assert_called_once_with({
+            'floatingip': {'floating_network_id': 'abcd1234',
+                           'subnet_id': 'sub1234'}
+        })
 
     def test_floatip_port(self):
         t = template_format.parse(neutron_floating_no_assoc_template)
@@ -606,93 +629,42 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         t['resources']['router_interface']['properties']['subnet'] = "sub1234"
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'xyz1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('xyz1234')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('sub1234')
-
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'xyz1234',
-            'fixed_ips': [
-                {'subnet_id': u'sub1234', 'ip_address': u'10.0.0.10'}
-            ],
-            'name': utils.PhysName(stack.name, 'port_floating'),
-            'admin_state_up': True}}
-        ).AndReturn({'port': {
-            "status": "BUILD",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronclient.Client.create_floatingip({
-            'floatingip': {
-                'floating_network_id': u'abcd1234',
-                'port_id': u'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
+        self.mockclient.create_port.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
             }
-        }).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        # update with new port_id
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+        }
+        self.mockclient.show_port.side_effect = [
             {
-                'floatingip': {
-                    'port_id': u'2146dfbf-ba77-4083-8e86-d052f671ece5',
-                    'fixed_ip_address': None}}
-        ).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
+                'port': {
+                    "status": "ACTIVE",
+                    "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+                }
+            },
+            # delete
+            qe.PortNotFoundClient(status_code=404),
+        ]
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+            }
+        }
 
-        # update with None port_id
-        neutronclient.Client.update_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            {
-                'floatingip': {
-                    'port_id': None,
-                    'fixed_ip_address': None}}
-        ).AndReturn({'floatingip': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
+        self.mockclient.update_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+            }
+        }
 
-        neutronclient.Client.delete_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn(None)
-        neutronclient.Client.show_floatingip(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766').AndRaise(
-                qe.NeutronClientException(status_code=404))
+        self.mockclient.delete_floatingip.return_value = None
+        self.mockclient.delete_port.return_value = None
+        self.mockclient.show_floatingip.side_effect = (
+            qe.PortNotFoundClient(status_code=404))
 
-        neutronclient.Client.delete_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn(None)
-
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndRaise(qe.PortNotFoundClient(status_code=404))
         self.stub_PortConstraint_validate()
-
-        self.m.ReplayAll()
 
         # check dependencies for fip resource
         required_by = set(stack.dependencies.required_by(
@@ -702,26 +674,29 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         p = stack['port_floating']
         scheduler.TaskRunner(p.create)()
         self.assertEqual((p.CREATE, p.COMPLETE), p.state)
+        stk_defn.update_resource_data(stack.defn, p.name, p.node_data())
 
         fip = stack['floating_ip']
         scheduler.TaskRunner(fip.create)()
         self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(stack.defn, fip.name, fip.node_data())
 
         # test update FloatingIp with port_id
         props = copy.deepcopy(fip.properties.data)
         update_port_id = '2146dfbf-ba77-4083-8e86-d052f671ece5'
         props['port_id'] = update_port_id
         update_snippet = rsrc_defn.ResourceDefinition(fip.name, fip.type(),
-                                                      stack.t.parse(stack,
+                                                      stack.t.parse(stack.defn,
                                                                     props))
         scheduler.TaskRunner(fip.update, update_snippet)()
         self.assertEqual((fip.UPDATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(stack.defn, fip.name, fip.node_data())
 
         # test update FloatingIp with None port_id
         props = copy.deepcopy(fip.properties.data)
-        del(props['port_id'])
+        del props['port_id']
         update_snippet = rsrc_defn.ResourceDefinition(fip.name, fip.type(),
-                                                      stack.t.parse(stack,
+                                                      stack.t.parse(stack.defn,
                                                                     props))
         scheduler.TaskRunner(fip.update, update_snippet)()
         self.assertEqual((fip.UPDATE, fip.COMPLETE), fip.state)
@@ -729,7 +704,48 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         scheduler.TaskRunner(fip.delete)()
         scheduler.TaskRunner(p.delete)()
 
-        self.m.VerifyAll()
+        self.mockclient.create_port.assert_called_once_with({
+            'port': {
+                'network_id': 'xyz1234',
+                'fixed_ips': [
+                    {'subnet_id': 'sub1234', 'ip_address': '10.0.0.10'}
+                ],
+                'name': utils.PhysName(stack.name, 'port_floating'),
+                'admin_state_up': True,
+                'binding:vnic_type': 'normal',
+                'device_owner': '',
+                'device_id': ''
+            }
+        })
+        self.mockclient.show_port.assert_called_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
+        self.mockclient.create_floatingip.assert_called_once_with({
+            'floatingip': {
+                'floating_network_id': 'abcd1234',
+                'port_id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
+            }
+        })
+        self.mockclient.update_floatingip.assert_has_calls([
+            # update with new port_id
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {
+                          'port_id': '2146dfbf-ba77-4083-8e86-d052f671ece5',
+                          'fixed_ip_address': None
+                      }}),
+            # update with None port_id
+            mock.call('fc68ea2c-b60b-4b4f-bd82-94ec81110766',
+                      {'floatingip': {
+                          'port_id': None,
+                          'fixed_ip_address': None
+                      }})
+        ])
+
+        self.mockclient.delete_floatingip.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
+        self.mockclient.show_floatingip.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
+        self.mockclient.delete_port.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
 
     def test_add_dependencies(self):
         t = template_format.parse(neutron_floating_template)
@@ -762,3 +778,231 @@ class NeutronFloatingIPTest(common.HeatTestCase):
         deps.graph.return_value = {fipa: [port]}
         fipa.add_dependencies(deps)
         self.assertEqual([], dep_list)
+
+    def test_fip_port_forward_create(self):
+        pfid = mock.Mock(id='180941c5-9e82-41c7-b64d-6a57302ec211')
+
+        props = {'internal_ip_address': '10.0.0.10',
+                 'internal_port': 8080,
+                 'external_port': 80,
+                 'internal_port_id': '9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151',
+                 'protocol': 'tcp'}
+
+        mock_create = self.patchobject(self.sdkclient.network,
+                                       'create_floating_ip_port_forwarding',
+                                       return_value=pfid)
+
+        self.mockclient.create_port.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.show_port.return_value = {
+            'port': {
+                "status": "ACTIVE",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "477e8273-60a7-4c41-b683-1d497e53c384"
+            }
+        }
+
+        p = self.stack['port_floating']
+        scheduler.TaskRunner(p.create)()
+        self.assertEqual((p.CREATE, p.COMPLETE), p.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      p.name,
+                                      p.node_data())
+
+        fip = self.stack['floating_ip']
+        scheduler.TaskRunner(fip.create)()
+        self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      fip.name,
+                                      fip.node_data())
+
+        port_forward = self.stack['port_forwarding']
+        scheduler.TaskRunner(port_forward.create)()
+        self.assertEqual((port_forward.CREATE, port_forward.COMPLETE),
+                         port_forward.state)
+        mock_create.assert_called_once_with(
+            '477e8273-60a7-4c41-b683-1d497e53c384',
+            **props)
+
+    def test_fip_port_forward_update(self):
+        pfid = mock.Mock(id='180941c5-9e82-41c7-b64d-6a57302ec211')
+        fip_id = '477e8273-60a7-4c41-b683-1d497e53c384'
+
+        prop_diff = {'external_port': 8080}
+
+        mock_update = self.patchobject(self.sdkclient.network,
+                                       'update_floating_ip_port_forwarding',
+                                       return_value=pfid)
+        self.patchobject(self.sdkclient.network,
+                         'create_floating_ip_port_forwarding',
+                         return_value=pfid)
+        self.mockclient.create_port.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.show_port.return_value = {
+            'port': {
+                "status": "ACTIVE",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "477e8273-60a7-4c41-b683-1d497e53c384"
+            }
+        }
+
+        p = self.stack['port_floating']
+        scheduler.TaskRunner(p.create)()
+        self.assertEqual((p.CREATE, p.COMPLETE), p.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      p.name,
+                                      p.node_data())
+
+        fip = self.stack['floating_ip']
+        scheduler.TaskRunner(fip.create)()
+        self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      fip.name,
+                                      fip.node_data())
+
+        port_forward = self.stack['port_forwarding']
+        scheduler.TaskRunner(port_forward.create)()
+        self.port_forward.handle_update(port_forward.name, port_forward.type(),
+                                        prop_diff)
+
+        mock_update.assert_called_once_with(
+            fip_id,
+            '180941c5-9e82-41c7-b64d-6a57302ec211',
+            **prop_diff)
+
+    def test_fip_port_forward_delete(self):
+        pfid = mock.Mock(id='180941c5-9e82-41c7-b64d-6a57302ec211')
+        fip_id = '477e8273-60a7-4c41-b683-1d497e53c384'
+
+        self.patchobject(self.sdkclient.network,
+                         'create_floating_ip_port_forwarding',
+                         return_value=pfid)
+
+        mock_delete = self.patchobject(self.sdkclient.network,
+                                       'delete_floating_ip_port_forwarding',
+                                       return_value=None)
+
+        self.mockclient.create_port.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.show_port.return_value = {
+            'port': {
+                "status": "ACTIVE",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "477e8273-60a7-4c41-b683-1d497e53c384"
+            }
+        }
+
+        p = self.stack['port_floating']
+        scheduler.TaskRunner(p.create)()
+        self.assertEqual((p.CREATE, p.COMPLETE), p.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      p.name,
+                                      p.node_data())
+
+        fip = self.stack['floating_ip']
+        scheduler.TaskRunner(fip.create)()
+        self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      fip.name,
+                                      fip.node_data())
+
+        port_forward = self.stack['port_forwarding']
+        scheduler.TaskRunner(port_forward.create)()
+        self.port_forward.handle_delete()
+        mock_delete.assert_called_once_with(
+            fip_id,
+            '180941c5-9e82-41c7-b64d-6a57302ec211',
+            ignore_missing=True
+        )
+
+    def test_fip_port_forward_check(self):
+        pfid = mock.Mock(id='180941c5-9e82-41c7-b64d-6a57302ec211')
+        fip_id = '477e8273-60a7-4c41-b683-1d497e53c384'
+
+        self.patchobject(self.sdkclient.network,
+                         'create_floating_ip_port_forwarding',
+                         return_value=pfid)
+
+        self.mockclient.create_port.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.show_port.return_value = {
+            'port': {
+                "status": "ACTIVE",
+                "id": "9c1eb3fe-7bba-479d-bd43-fdb0bc7cd151"
+            }
+        }
+        self.mockclient.create_floatingip.return_value = {
+            'floatingip': {
+                "status": "ACTIVE",
+                "id": "477e8273-60a7-4c41-b683-1d497e53c384"
+            }
+        }
+
+        p = self.stack['port_floating']
+        scheduler.TaskRunner(p.create)()
+        self.assertEqual((p.CREATE, p.COMPLETE), p.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      p.name,
+                                      p.node_data())
+
+        fip = self.stack['floating_ip']
+        scheduler.TaskRunner(fip.create)()
+        self.assertEqual((fip.CREATE, fip.COMPLETE), fip.state)
+        stk_defn.update_resource_data(self.stack.defn,
+                                      fip.name,
+                                      fip.node_data())
+
+        port_forward = self.stack['port_forwarding']
+        scheduler.TaskRunner(port_forward.create)()
+        self.port_forward.handle_check()
+        mock_check = self.sdkclient.network.get_port_forwarding
+
+        mock_check.assert_called_once_with(
+            '180941c5-9e82-41c7-b64d-6a57302ec211',
+            fip_id
+        )
+
+    def test_pf_add_dependencies(self):
+        port = self.stack['port_floating']
+        r_int = self.stack['router_interface']
+        pf_port = self.stack['port_forwarding']
+        deps = mock.MagicMock()
+        dep_list = []
+
+        def iadd(obj):
+            dep_list.append(obj[1])
+        deps.__iadd__.side_effect = iadd
+        deps.graph.return_value = {pf_port: [port]}
+        pf_port.add_dependencies(deps)
+        self.assertEqual([r_int], dep_list)

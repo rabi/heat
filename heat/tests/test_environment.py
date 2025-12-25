@@ -12,12 +12,10 @@
 #    under the License.
 
 import os.path
-import sys
+from unittest import mock
 
 import fixtures
-import mock
 from oslo_config import cfg
-import six
 
 from heat.common import environment_format
 from heat.common import exception
@@ -40,60 +38,61 @@ class EnvironmentTest(common.HeatTestCase):
         self.g_env = resources.global_env()
 
     def test_load_old_parameters(self):
-        old = {u'a': u'ff', u'b': u'ss'}
-        expected = {u'parameters': old,
-                    u'encrypted_param_names': [],
-                    u'parameter_defaults': {},
-                    u'event_sinks': [],
-                    u'resource_registry': {u'resources': {}}}
+        old = {'a': 'ff', 'b': 'ss'}
+        expected = {'parameters': old,
+                    'encrypted_param_names': [],
+                    'parameter_defaults': {},
+                    'event_sinks': [],
+                    'resource_registry': {'resources': {}}}
         env = environment.Environment(old)
         self.assertEqual(expected, env.env_as_dict())
-        del(expected['encrypted_param_names'])
+        del expected['encrypted_param_names']
         self.assertEqual(expected, env.user_env_as_dict())
 
     def test_load_new_env(self):
-        new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
-                   u'encrypted_param_names': [],
-                   u'parameter_defaults': {u'ff': 'new_def'},
-                   u'event_sinks': [],
-                   u'resource_registry': {u'OS::Food': u'fruity.yaml',
-                                          u'resources': {}}}
+        new_env = {'parameters': {'a': 'ff', 'b': 'ss'},
+                   'encrypted_param_names': [],
+                   'parameter_defaults': {'ff': 'new_def'},
+                   'event_sinks': [],
+                   'resource_registry': {'OS::Food': 'fruity.yaml',
+                                         'resources': {}}}
         env = environment.Environment(new_env)
         self.assertEqual(new_env, env.env_as_dict())
-        del(new_env['encrypted_param_names'])
+        del new_env['encrypted_param_names']
         self.assertEqual(new_env, env.user_env_as_dict())
 
     def test_global_registry(self):
         self.g_env.register_class('CloudX::Nova::Server',
                                   generic_resource.GenericResource)
-        new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
-                   u'resource_registry': {u'OS::*': 'CloudX::*'}}
+        new_env = {'parameters': {'a': 'ff', 'b': 'ss'},
+                   'resource_registry': {'OS::*': 'CloudX::*'}}
         env = environment.Environment(new_env)
         self.assertEqual('CloudX::Nova::Server',
                          env.get_resource_info('OS::Nova::Server',
                                                'my_db_server').name)
 
     def test_global_registry_many_to_one(self):
-        new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
-                   u'resource_registry': {u'OS::Nova::*': 'OS::Heat::None'}}
+        new_env = {'parameters': {'a': 'ff', 'b': 'ss'},
+                   'resource_registry': {'OS::Nova::*': 'OS::Heat::None'}}
         env = environment.Environment(new_env)
         self.assertEqual('OS::Heat::None',
                          env.get_resource_info('OS::Nova::Server',
                                                'my_db_server').name)
 
     def test_global_registry_many_to_one_no_recurse(self):
-        new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
-                   u'resource_registry': {u'OS::*': 'OS::Heat::None'}}
+        new_env = {'parameters': {'a': 'ff', 'b': 'ss'},
+                   'resource_registry': {'OS::*': 'OS::Heat::None'}}
         env = environment.Environment(new_env)
         self.assertEqual('OS::Heat::None',
                          env.get_resource_info('OS::Some::Name',
                                                'my_db_server').name)
 
     def test_map_one_resource_type(self):
-        new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
-                   u'resource_registry': {u'resources':
-                                          {u'my_db_server':
-                                           {u'OS::DBInstance': 'db.yaml'}}}}
+        new_env = {
+            'parameters': {'a': 'ff', 'b': 'ss'},
+            'resource_registry': {
+                'resources': {
+                    'my_db_server': {'OS::DBInstance': 'db.yaml'}}}}
         env = environment.Environment(new_env)
 
         info = env.get_resource_info('OS::DBInstance', 'my_db_server')
@@ -103,10 +102,10 @@ class EnvironmentTest(common.HeatTestCase):
         self.g_env.register_class('OS::Nova::FloatingIP',
                                   generic_resource.GenericResource)
 
-        new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
-                   u'resource_registry':
-                   {u'OS::Networking::FloatingIP': 'OS::Nova::FloatingIP',
-                    u'OS::Loadbalancer': 'lb.yaml'}}
+        new_env = {'parameters': {'a': 'ff', 'b': 'ss'},
+                   'resource_registry':
+                   {'OS::Networking::FloatingIP': 'OS::Nova::FloatingIP',
+                    'OS::Loadbalancer': 'lb.yaml'}}
 
         env = environment.Environment(new_env)
         self.assertEqual('OS::Nova::FloatingIP',
@@ -114,9 +113,9 @@ class EnvironmentTest(common.HeatTestCase):
                                                'my_fip').name)
 
     def test_resource_sort_order_len(self):
-        new_env = {u'resource_registry': {u'resources': {u'my_fip': {
-            u'OS::Networking::FloatingIP': 'ip.yaml'}}},
-            u'OS::Networking::FloatingIP': 'OS::Nova::FloatingIP'}
+        new_env = {'resource_registry': {'resources': {'my_fip': {
+            'OS::Networking::FloatingIP': 'ip.yaml'}}},
+            'OS::Networking::FloatingIP': 'OS::Nova::FloatingIP'}
 
         env = environment.Environment(new_env)
         self.assertEqual('ip.yaml',
@@ -124,8 +123,8 @@ class EnvironmentTest(common.HeatTestCase):
                                                'my_fip').value)
 
     def test_env_load(self):
-        new_env = {u'resource_registry': {u'resources': {u'my_fip': {
-            u'OS::Networking::FloatingIP': 'ip.yaml'}}}}
+        new_env = {'resource_registry': {'resources': {'my_fip': {
+            'OS::Networking::FloatingIP': 'ip.yaml'}}}}
 
         env = environment.Environment()
         self.assertRaises(exception.EntityNotFound,
@@ -170,7 +169,7 @@ class EnvironmentTest(common.HeatTestCase):
         env.register_constraint("constraint2", second_constraint)
         self.assertIs(first_constraint, env.get_constraint("constraint1"))
         self.assertIs(second_constraint, env.get_constraint("constraint2"))
-        self.assertIs(None, env.get_constraint("no_constraint"))
+        self.assertIsNone(env.get_constraint("no_constraint"))
 
     def test_constraints_registry(self):
         constraint_content = '''
@@ -184,16 +183,14 @@ def constraint_mapping():
         plugin_file = os.path.join(plugin_dir.path, 'test.py')
         with open(plugin_file, 'w+') as ef:
             ef.write(constraint_content)
-        self.addCleanup(sys.modules.pop, "heat.engine.plugins.test")
-        cfg.CONF.set_override('plugin_dirs', plugin_dir.path,
-                              enforce_type=True)
+        cfg.CONF.set_override('plugin_dirs', plugin_dir.path)
 
         env = environment.Environment({})
         resources._load_global_environment(env)
 
         self.assertEqual("MyConstraint",
                          env.get_constraint("constraint1").__name__)
-        self.assertIs(None, env.get_constraint("no_constraint"))
+        self.assertIsNone(env.get_constraint("no_constraint"))
 
     def test_constraints_registry_error(self):
         constraint_content = '''
@@ -204,14 +201,12 @@ def constraint_mapping():
         plugin_file = os.path.join(plugin_dir.path, 'test.py')
         with open(plugin_file, 'w+') as ef:
             ef.write(constraint_content)
-        self.addCleanup(sys.modules.pop, "heat.engine.plugins.test")
-        cfg.CONF.set_override('plugin_dirs', plugin_dir.path,
-                              enforce_type=True)
+        cfg.CONF.set_override('plugin_dirs', plugin_dir.path)
 
         env = environment.Environment({})
         error = self.assertRaises(ValueError,
                                   resources._load_global_environment, env)
-        self.assertEqual("oops", six.text_type(error))
+        self.assertEqual("oops", str(error))
 
     def test_constraints_registry_stevedore(self):
         env = environment.Environment({})
@@ -219,7 +214,7 @@ def constraint_mapping():
 
         self.assertEqual("FlavorConstraint",
                          env.get_constraint("nova.flavor").__name__)
-        self.assertIs(None, env.get_constraint("no_constraint"))
+        self.assertIsNone(env.get_constraint("no_constraint"))
 
     def test_event_sinks(self):
         env = environment.Environment(
@@ -256,8 +251,8 @@ class EnvironmentDuplicateTest(common.HeatTestCase):
         super(EnvironmentDuplicateTest, self).setUp(quieten_logging=False)
 
     def test_env_load(self):
-        env_initial = {u'resource_registry': {
-            u'OS::Test::Dummy': 'test.yaml'}}
+        env_initial = {'resource_registry': {
+            'OS::Test::Dummy': 'test.yaml'}}
 
         env = environment.Environment()
         env.load(env_initial)
@@ -266,8 +261,8 @@ class EnvironmentDuplicateTest(common.HeatTestCase):
                                                      'test.yaml',
                                                      self.resource_type)
         self.assertNotIn(replace_log, self.LOG.output)
-        env_test = {u'resource_registry': {
-            u'OS::Test::Dummy': self.resource_type}}
+        env_test = {'resource_registry': {
+            'OS::Test::Dummy': self.resource_type}}
         env.load(env_test)
 
         if self.expected_equal:
@@ -282,8 +277,8 @@ class EnvironmentDuplicateTest(common.HeatTestCase):
                                                       'my_fip'))
 
     def test_env_register_while_get_resource_info(self):
-        env_test = {u'resource_registry': {
-            u'OS::Test::Dummy': self.resource_type}}
+        env_test = {'resource_registry': {
+            'OS::Test::Dummy': self.resource_type}}
         env = environment.Environment()
         env.load(env_test)
         env.get_resource_info('OS::Test::Dummy')
@@ -292,13 +287,13 @@ class EnvironmentDuplicateTest(common.HeatTestCase):
                          env.user_env_as_dict().get(
                              environment_format.RESOURCE_REGISTRY))
 
-        env_test = {u'resource_registry': {
-            u'resources': {u'test': {u'OS::Test::Dummy': self.resource_type}}}}
+        env_test = {'resource_registry': {
+            'resources': {'test': {'OS::Test::Dummy': self.resource_type}}}}
         env.load(env_test)
         env.get_resource_info('OS::Test::Dummy')
-        self.assertEqual({u'OS::Test::Dummy': self.resource_type,
-                          'resources': {u'test': {u'OS::Test::Dummy':
-                                                  self.resource_type}}},
+        self.assertEqual({'OS::Test::Dummy': self.resource_type,
+                          'resources': {'test': {'OS::Test::Dummy':
+                                                 self.resource_type}}},
                          env.user_env_as_dict().get(
                              environment_format.RESOURCE_REGISTRY))
 
@@ -399,8 +394,7 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
         envfile = os.path.join(envdir.path, 'test.yaml')
         with open(envfile, 'w+') as ef:
             ef.write(g_env_content)
-        cfg.CONF.set_override('environment_dir', envdir.path,
-                              enforce_type=True)
+        cfg.CONF.set_override('environment_dir', envdir.path)
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
@@ -422,8 +416,7 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
         envfile = os.path.join(envdir.path, 'test.yaml')
         with open(envfile, 'w+') as ef:
             ef.write(g_env_content)
-        cfg.CONF.set_override('environment_dir', envdir.path,
-                              enforce_type=True)
+        cfg.CONF.set_override('environment_dir', envdir.path)
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
@@ -449,8 +442,7 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
         envfile = os.path.join(envdir.path, 'test.yaml')
         with open(envfile, 'w+') as ef:
             ef.write(g_env_content)
-        cfg.CONF.set_override('environment_dir', envdir.path,
-                              enforce_type=True)
+        cfg.CONF.set_override('environment_dir', envdir.path)
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
@@ -492,8 +484,7 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
             ef.write(g_env_content)
         with open(os.path.join(envdir.path, 'b.yaml'), 'w+') as ef:
             ef.write(g_env_content)
-        cfg.CONF.set_override('environment_dir', envdir.path,
-                              enforce_type=True)
+        cfg.CONF.set_override('environment_dir', envdir.path)
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
@@ -550,8 +541,8 @@ class ChildEnvTest(common.HeatTestCase):
         self.assertEqual(expected, cenv.env_as_dict())
 
     def test_registry_merge_simple(self):
-        env1 = {u'resource_registry': {u'OS::Food': u'fruity.yaml'}}
-        env2 = {u'resource_registry': {u'OS::Fruit': u'apples.yaml'}}
+        env1 = {'resource_registry': {'OS::Food': 'fruity.yaml'}}
+        env2 = {'resource_registry': {'OS::Fruit': 'apples.yaml'}}
         penv = environment.Environment(env=env1)
         cenv = environment.get_child_environment(penv, env2)
         rr = cenv.user_env_as_dict()['resource_registry']
@@ -559,15 +550,15 @@ class ChildEnvTest(common.HeatTestCase):
         self.assertIn('OS::Fruit', rr)
 
     def test_registry_merge_favor_child(self):
-        env1 = {u'resource_registry': {u'OS::Food': u'carrots.yaml'}}
-        env2 = {u'resource_registry': {u'OS::Food': u'apples.yaml'}}
+        env1 = {'resource_registry': {'OS::Food': 'carrots.yaml'}}
+        env2 = {'resource_registry': {'OS::Food': 'apples.yaml'}}
         penv = environment.Environment(env=env1)
         cenv = environment.get_child_environment(penv, env2)
         res = cenv.get_resource_info('OS::Food')
         self.assertEqual('apples.yaml', res.value)
 
     def test_item_to_remove_simple(self):
-        env = {u'resource_registry': {u'OS::Food': u'fruity.yaml'}}
+        env = {'resource_registry': {'OS::Food': 'fruity.yaml'}}
         penv = environment.Environment(env)
         victim = penv.get_resource_info('OS::Food', resource_name='abc')
         self.assertIsNotNone(victim)
@@ -583,9 +574,9 @@ class ChildEnvTest(common.HeatTestCase):
         self.assertIsNotNone(innocent)
 
     def test_item_to_remove_complex(self):
-        env = {u'resource_registry': {u'OS::Food': u'fruity.yaml',
-                                      u'resources': {u'abc': {
-                                          u'OS::Food': u'nutty.yaml'}}}}
+        env = {'resource_registry': {
+            'OS::Food': 'fruity.yaml',
+            'resources': {'abc': {'OS::Food': 'nutty.yaml'}}}}
         penv = environment.Environment(env)
         # the victim we want is the most specific one.
         victim = penv.get_resource_info('OS::Food', resource_name='abc')
@@ -602,7 +593,7 @@ class ChildEnvTest(common.HeatTestCase):
         self.assertEqual(['resources', 'abc', 'OS::Food'], innocent2.path)
 
     def test_item_to_remove_none(self):
-        env = {u'resource_registry': {u'OS::Food': u'fruity.yaml'}}
+        env = {'resource_registry': {'OS::Food': 'fruity.yaml'}}
         penv = environment.Environment(env)
         victim = penv.get_resource_info('OS::Food', resource_name='abc')
         self.assertIsNotNone(victim)
@@ -612,19 +603,19 @@ class ChildEnvTest(common.HeatTestCase):
 
     def test_drill_down_to_child_resource(self):
         env = {
-            u'resource_registry': {
-                u'OS::Food': u'fruity.yaml',
-                u'resources': {
-                    u'a': {
-                        u'OS::Fruit': u'apples.yaml',
-                        u'hooks': 'pre-create',
+            'resource_registry': {
+                'OS::Food': 'fruity.yaml',
+                'resources': {
+                    'a': {
+                        'OS::Fruit': 'apples.yaml',
+                        'hooks': 'pre-create',
                     },
-                    u'nested': {
-                        u'b': {
-                            u'OS::Fruit': u'carrots.yaml',
+                    'nested': {
+                        'b': {
+                            'OS::Fruit': 'carrots.yaml',
                         },
-                        u'nested_res': {
-                            u'hooks': 'pre-create',
+                        'nested_res': {
+                            'hooks': 'pre-create',
                         }
                     }
                 }
@@ -632,7 +623,7 @@ class ChildEnvTest(common.HeatTestCase):
         }
         penv = environment.Environment(env)
         cenv = environment.get_child_environment(
-            penv, None, child_resource_name=u'nested')
+            penv, None, child_resource_name='nested')
         registry = cenv.user_env_as_dict()['resource_registry']
         resources = registry['resources']
         self.assertIn('nested_res', resources)
@@ -644,21 +635,21 @@ class ChildEnvTest(common.HeatTestCase):
                           'OS::Fruit', resource_name='a')
         res = cenv.get_resource_info('OS::Fruit', resource_name='b')
         self.assertIsNotNone(res)
-        self.assertEqual(u'carrots.yaml', res.value)
+        self.assertEqual('carrots.yaml', res.value)
 
     def test_drill_down_non_matching_wildcard(self):
         env = {
-            u'resource_registry': {
-                u'resources': {
-                    u'nested': {
-                        u'c': {
-                            u'OS::Fruit': u'carrots.yaml',
-                            u'hooks': 'pre-create',
+            'resource_registry': {
+                'resources': {
+                    'nested': {
+                        'c': {
+                            'OS::Fruit': 'carrots.yaml',
+                            'hooks': 'pre-create',
                         },
                     },
-                    u'*_doesnt_match_nested': {
-                        u'nested_res': {
-                            u'hooks': 'pre-create',
+                    '*_doesnt_match_nested': {
+                        'nested_res': {
+                            'hooks': 'pre-create',
                         },
                     }
                 }
@@ -666,28 +657,28 @@ class ChildEnvTest(common.HeatTestCase):
         }
         penv = environment.Environment(env)
         cenv = environment.get_child_environment(
-            penv, None, child_resource_name=u'nested')
+            penv, None, child_resource_name='nested')
         registry = cenv.user_env_as_dict()['resource_registry']
         resources = registry['resources']
         self.assertIn('c', resources)
         self.assertNotIn('nested_res', resources)
         res = cenv.get_resource_info('OS::Fruit', resource_name='c')
         self.assertIsNotNone(res)
-        self.assertEqual(u'carrots.yaml', res.value)
+        self.assertEqual('carrots.yaml', res.value)
 
     def test_drill_down_matching_wildcard(self):
         env = {
-            u'resource_registry': {
-                u'resources': {
-                    u'nested': {
-                        u'c': {
-                            u'OS::Fruit': u'carrots.yaml',
-                            u'hooks': 'pre-create',
+            'resource_registry': {
+                'resources': {
+                    'nested': {
+                        'c': {
+                            'OS::Fruit': 'carrots.yaml',
+                            'hooks': 'pre-create',
                         },
                     },
-                    u'nest*': {
-                        u'nested_res': {
-                            u'hooks': 'pre-create',
+                    'nest*': {
+                        'nested_res': {
+                            'hooks': 'pre-create',
                         },
                     }
                 }
@@ -695,70 +686,70 @@ class ChildEnvTest(common.HeatTestCase):
         }
         penv = environment.Environment(env)
         cenv = environment.get_child_environment(
-            penv, None, child_resource_name=u'nested')
+            penv, None, child_resource_name='nested')
         registry = cenv.user_env_as_dict()['resource_registry']
         resources = registry['resources']
         self.assertIn('c', resources)
         self.assertIn('nested_res', resources)
         res = cenv.get_resource_info('OS::Fruit', resource_name='c')
         self.assertIsNotNone(res)
-        self.assertEqual(u'carrots.yaml', res.value)
+        self.assertEqual('carrots.yaml', res.value)
 
     def test_drill_down_prefer_exact_match(self):
         env = {
-            u'resource_registry': {
-                u'resources': {
-                    u'*esource': {
-                        u'hooks': 'pre-create',
+            'resource_registry': {
+                'resources': {
+                    '*esource': {
+                        'hooks': 'pre-create',
                     },
-                    u'res*': {
-                        u'hooks': 'pre-create',
+                    'res*': {
+                        'hooks': 'pre-create',
                     },
-                    u'resource': {
-                        u'OS::Fruit': u'carrots.yaml',
-                        u'hooks': 'pre-update',
+                    'resource': {
+                        'OS::Fruit': 'carrots.yaml',
+                        'hooks': 'pre-update',
                     },
-                    u'resource*': {
-                        u'hooks': 'pre-create',
+                    'resource*': {
+                        'hooks': 'pre-create',
                     },
-                    u'*resource': {
-                        u'hooks': 'pre-create',
+                    '*resource': {
+                        'hooks': 'pre-create',
                     },
-                    u'*sour*': {
-                        u'hooks': 'pre-create',
+                    '*sour*': {
+                        'hooks': 'pre-create',
                     },
                 }
             }
         }
         penv = environment.Environment(env)
         cenv = environment.get_child_environment(
-            penv, None, child_resource_name=u'resource')
+            penv, None, child_resource_name='resource')
         registry = cenv.user_env_as_dict()['resource_registry']
         resources = registry['resources']
-        self.assertEqual(u'carrots.yaml', resources[u'OS::Fruit'])
-        self.assertEqual('pre-update', resources[u'hooks'])
+        self.assertEqual('carrots.yaml', resources['OS::Fruit'])
+        self.assertEqual('pre-update', resources['hooks'])
 
 
 class ResourceRegistryTest(common.HeatTestCase):
 
     def test_resources_load(self):
         resources = {
-            u'pre_create': {
-                u'OS::Fruit': u'apples.yaml',
-                u'hooks': 'pre-create',
+            'pre_create': {
+                'OS::Fruit': 'apples.yaml',
+                'hooks': 'pre-create',
             },
-            u'pre_update': {
-                u'hooks': 'pre-update',
+            'pre_update': {
+                'hooks': 'pre-update',
             },
-            u'both': {
-                u'hooks': ['pre-create', 'pre-update'],
+            'both': {
+                'hooks': ['pre-create', 'pre-update'],
             },
-            u'b': {
-                u'OS::Food': u'fruity.yaml',
+            'b': {
+                'OS::Food': 'fruity.yaml',
             },
-            u'nested': {
-                u'res': {
-                    u'hooks': 'pre-create',
+            'nested': {
+                'res': {
+                    'hooks': 'pre-create',
                 },
             },
         }
@@ -780,9 +771,9 @@ class ResourceRegistryTest(common.HeatTestCase):
 
     def test_load_registry_invalid_hook_type(self):
         resources = {
-            u'resources': {
-                u'a': {
-                    u'hooks': 'invalid-type',
+            'resources': {
+                'a': {
+                    'hooks': 'invalid-type',
                 }
             }
         }
@@ -794,7 +785,7 @@ class ResourceRegistryTest(common.HeatTestCase):
                '\'post-delete\')')
         ex = self.assertRaises(exception.InvalidBreakPointHook,
                                registry.load, {'resources': resources})
-        self.assertEqual(msg, six.text_type(ex))
+        self.assertEqual(msg, str(ex))
 
     def test_list_type_validation_invalid_support_status(self):
         registry = environment.ResourceRegistry(None, {})
@@ -803,7 +794,7 @@ class ResourceRegistryTest(common.HeatTestCase):
                                registry.get_types,
                                support_status='junk')
         msg = ('Invalid support status and should be one of %s' %
-               six.text_type(support.SUPPORT_STATUSES))
+               str(support.SUPPORT_STATUSES))
 
         self.assertIn(msg, ex.message)
 
@@ -844,12 +835,13 @@ class ResourceRegistryTest(common.HeatTestCase):
             generic_resource.GenericResource,
             'is_service_available',
             side_effect=exception.ClientNotAvailable(client_name='generic'))
-        types = registry.get_types(utils.dummy_context())
+        types = registry.get_types(utils.dummy_context(),
+                                   type_name='GenericResourceType')
         self.assertNotIn('GenericResourceType', types)
 
     def test_list_type_with_invalid_type_name(self):
         registry = resources.global_env().registry
-        types = registry.get_types(type_name="r'[^\+]'")
+        types = registry.get_types(type_name="r'[^\\+]'")
         self.assertEqual([], types)
 
     def test_list_type_with_version(self):
@@ -879,22 +871,22 @@ class HookMatchTest(common.HeatTestCase):
         other_hook = next(hook for hook in environment.HOOK_TYPES
                           if hook != self.hook)
         resources = {
-            u'a': {
-                u'OS::Fruit': u'apples.yaml',
-                u'hooks': [self.hook, other_hook]
+            'a': {
+                'OS::Fruit': 'apples.yaml',
+                'hooks': [self.hook, other_hook]
             },
-            u'b': {
-                u'OS::Food': u'fruity.yaml',
+            'b': {
+                'OS::Food': 'fruity.yaml',
             },
-            u'nested': {
-                u'res': {
-                    u'hooks': self.hook,
+            'nested': {
+                'res': {
+                    'hooks': self.hook,
                 },
             },
         }
         registry = environment.ResourceRegistry(None, {})
         registry.load({
-            u'OS::Fruit': u'apples.yaml',
+            'OS::Fruit': 'apples.yaml',
             'resources': resources})
 
         self.assertTrue(registry.matches_hook('a', self.hook))
@@ -907,14 +899,14 @@ class HookMatchTest(common.HeatTestCase):
         other_hook = next(hook for hook in environment.HOOK_TYPES
                           if hook != self.hook)
         resources = {
-            u'prefix_*': {
-                u'hooks': self.hook
+            'prefix_*': {
+                'hooks': self.hook
             },
-            u'*_suffix': {
-                u'hooks': self.hook
+            '*_suffix': {
+                'hooks': self.hook
             },
-            u'*': {
-                u'hooks': other_hook
+            '*': {
+                'hooks': other_hook
             },
         }
         registry = environment.ResourceRegistry(None, {})
@@ -933,15 +925,15 @@ class HookMatchTest(common.HeatTestCase):
 
     def test_hook_types(self):
         resources = {
-            u'hook': {
-                u'hooks': self.hook
+            'hook': {
+                'hooks': self.hook
             },
-            u'not-hook': {
-                u'hooks': [hook for hook in environment.HOOK_TYPES if hook !=
-                           self.hook]
+            'not-hook': {
+                'hooks': [hook for hook in environment.HOOK_TYPES if hook !=
+                          self.hook]
             },
-            u'all': {
-                u'hooks': environment.HOOK_TYPES
+            'all': {
+                'hooks': environment.HOOK_TYPES
             },
         }
         registry = environment.ResourceRegistry(None, {})
@@ -956,22 +948,22 @@ class ActionRestrictedTest(common.HeatTestCase):
 
     def test_plain_matches(self):
         resources = {
-            u'a': {
-                u'OS::Fruit': u'apples.yaml',
-                u'restricted_actions': [u'update', u'replace'],
+            'a': {
+                'OS::Fruit': 'apples.yaml',
+                'restricted_actions': ['update', 'replace'],
             },
-            u'b': {
-                u'OS::Food': u'fruity.yaml',
+            'b': {
+                'OS::Food': 'fruity.yaml',
             },
-            u'nested': {
-                u'res': {
-                    u'restricted_actions': 'update',
+            'nested': {
+                'res': {
+                    'restricted_actions': 'update',
                 },
             },
         }
         registry = environment.ResourceRegistry(None, {})
         registry.load({
-            u'OS::Fruit': u'apples.yaml',
+            'OS::Fruit': 'apples.yaml',
             'resources': resources})
 
         self.assertIn(environment.UPDATE,
@@ -987,14 +979,14 @@ class ActionRestrictedTest(common.HeatTestCase):
 
     def test_wildcard_matches(self):
         resources = {
-            u'prefix_*': {
-                u'restricted_actions': 'update',
+            'prefix_*': {
+                'restricted_actions': 'update',
             },
-            u'*_suffix': {
-                u'restricted_actions': 'update',
+            '*_suffix': {
+                'restricted_actions': 'update',
             },
-            u'*': {
-                u'restricted_actions': 'replace',
+            '*': {
+                'restricted_actions': 'replace',
             },
         }
         registry = environment.ResourceRegistry(None, {})
@@ -1021,14 +1013,14 @@ class ActionRestrictedTest(common.HeatTestCase):
 
     def test_restricted_action_types(self):
         resources = {
-            u'update': {
-                u'restricted_actions': 'update',
+            'update': {
+                'restricted_actions': 'update',
             },
-            u'replace': {
-                u'restricted_actions': 'replace',
+            'replace': {
+                'restricted_actions': 'replace',
             },
-            u'all': {
-                u'restricted_actions': ['update', 'replace'],
+            'all': {
+                'restricted_actions': ['update', 'replace'],
             },
         }
         registry = environment.ResourceRegistry(None, {})

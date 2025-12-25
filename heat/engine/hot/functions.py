@@ -12,12 +12,14 @@
 #    under the License.
 
 import collections
+import functools
 import hashlib
 import itertools
 
 from oslo_config import cfg
+from oslo_log import log as logging
 from oslo_serialization import jsonutils
-import six
+from urllib import parse as urlparse
 import yaql
 from yaql.language import exceptions
 
@@ -26,7 +28,11 @@ from heat.common.i18n import _
 from heat.engine import attributes
 from heat.engine import function
 
-opts = [
+
+LOG = logging.getLogger(__name__)
+
+yaql_group = cfg.OptGroup('yaql')
+yaql_opts = [
     cfg.IntOpt('limit_iterators',
                default=200,
                help=_('The maximum number of elements in collection '
@@ -36,7 +42,11 @@ opts = [
                help=_('The maximum size of memory in bytes that '
                       'expression can take for its evaluation.'))
 ]
-cfg.CONF.register_opts(opts, group='yaql')
+cfg.CONF.register_opts(yaql_opts, group=yaql_group)
+
+
+def list_opts():
+    yield yaql_group.name, yaql_opts
 
 
 class GetParam(function.Function):
@@ -57,26 +67,31 @@ class GetParam(function.Function):
     def __init__(self, stack, fn_name, args):
         super(GetParam, self).__init__(stack, fn_name, args)
 
-        self.parameters = self.stack.parameters
+        if self.stack is not None:
+            self.parameters = self.stack.parameters
+        else:
+            self.parameters = None
 
     def result(self):
+        assert self.parameters is not None, "No stack definition in Function"
+
         args = function.resolve(self.args)
 
         if not args:
             raise ValueError(_('Function "%s" must have arguments') %
                              self.fn_name)
 
-        if isinstance(args, six.string_types):
+        if isinstance(args, str):
             param_name = args
             path_components = []
-        elif isinstance(args, collections.Sequence):
+        elif isinstance(args, collections.abc.Sequence):
             param_name = args[0]
             path_components = args[1:]
         else:
             raise TypeError(_('Argument to "%s" must be string or list') %
                             self.fn_name)
 
-        if not isinstance(param_name, six.string_types):
+        if not isinstance(param_name, str):
             raise TypeError(_('Parameter name in "%s" must be string') %
                             self.fn_name)
 
@@ -86,16 +101,16 @@ class GetParam(function.Function):
             raise exception.UserParameterMissing(key=param_name)
 
         def get_path_component(collection, key):
-            if not isinstance(collection, (collections.Mapping,
-                                           collections.Sequence)):
+            if not isinstance(collection, (collections.abc.Mapping,
+                                           collections.abc.Sequence)):
                 raise TypeError(_('"%s" can\'t traverse path') % self.fn_name)
 
-            if not isinstance(key, (six.string_types, int)):
+            if not isinstance(key, (str, int)):
                 raise TypeError(_('Path components in "%s" '
                                   'must be strings') % self.fn_name)
 
-            if isinstance(collection, collections.Sequence
-                          ) and isinstance(key, six.string_types):
+            if isinstance(collection, collections.abc.Sequence
+                          ) and isinstance(key, str):
                 try:
                     key = int(key)
                 except ValueError:
@@ -106,7 +121,7 @@ class GetParam(function.Function):
             return collection[key]
 
         try:
-            return six.moves.reduce(get_path_component, path_components,
+            return functools.reduce(get_path_component, path_components,
                                     parameter)
         except (KeyError, IndexError, TypeError):
             return ''
@@ -157,8 +172,8 @@ class GetAttThenSelect(function.Function):
          self._path_components) = self._parse_args()
 
     def _parse_args(self):
-        if (not isinstance(self.args, collections.Sequence) or
-                isinstance(self.args, six.string_types)):
+        if (not isinstance(self.args, collections.abc.Sequence) or
+                isinstance(self.args, str)):
             raise TypeError(_('Argument to "%s" must be a list') %
                             self.fn_name)
 
@@ -169,8 +184,11 @@ class GetAttThenSelect(function.Function):
 
         return self.args[0], self.args[1], self.args[2:]
 
+    def _res_name(self):
+        return function.resolve(self._resource_name)
+
     def _resource(self, path='unknown'):
-        resource_name = function.resolve(self._resource_name)
+        resource_name = self._res_name()
 
         try:
             return self.stack[resource_name]
@@ -178,14 +196,29 @@ class GetAttThenSelect(function.Function):
             raise exception.InvalidTemplateReference(resource=resource_name,
                                                      key=path)
 
+    def _attr_path(self):
+        return function.resolve(self._attribute)
+
     def dep_attrs(self, resource_name):
-        if self._resource().name == resource_name:
-            attrs = [function.resolve(self._attribute)]
+        if self._res_name() == resource_name:
+            try:
+                attrs = [self._attr_path()]
+            except Exception as exc:
+                LOG.debug("Ignoring exception calculating required attributes"
+                          ": %s %s", type(exc).__name__, str(exc))
+                attrs = []
         else:
             attrs = []
         return itertools.chain(super(GetAttThenSelect,
                                      self).dep_attrs(resource_name),
                                attrs)
+
+    def all_dep_attrs(self):
+        try:
+            attrs = [(self._res_name(), self._attr_path())]
+        except Exception:
+            attrs = []
+        return itertools.chain(function.all_dep_attrs(self.args), attrs)
 
     def dependencies(self, path):
         return itertools.chain(super(GetAttThenSelect,
@@ -206,20 +239,13 @@ class GetAttThenSelect(function.Function):
                 return
 
         attr = function.resolve(self._attribute)
-        from heat.engine import resource
-        if (type(res).get_attribute == resource.Resource.get_attribute and
-                attr not in res.attributes_schema):
+        if attr not in res.attributes_schema:
             raise exception.InvalidTemplateAttribute(
                 resource=self._resource_name, key=attr)
 
     def _result_ready(self, r):
         if r.action in (r.CREATE, r.ADOPT, r.SUSPEND, r.RESUME,
                         r.UPDATE, r.ROLLBACK, r.SNAPSHOT, r.CHECK):
-            return True
-
-        # NOTE(sirushtim): Add r.INIT to states above once convergence
-        # is the default.
-        if r.stack.has_cache_data(r.name) and r.action == r.INIT:
             return True
 
         return False
@@ -262,18 +288,13 @@ class GetAtt(GetAttThenSelect):
         else:
             return None
 
-    def dep_attrs(self, resource_name):
-        if self._resource().name == resource_name:
-            path = function.resolve(self._path_components)
-            attr = [function.resolve(self._attribute)]
-            if path:
-                attrs = [tuple(attr + path)]
-            else:
-                attrs = attr
+    def _attr_path(self):
+        path = function.resolve(self._path_components)
+        attr = function.resolve(self._attribute)
+        if path:
+            return tuple([attr] + path)
         else:
-            attrs = []
-        return itertools.chain(function.dep_attrs(self.args, resource_name),
-                               attrs)
+            return attr
 
 
 class GetAttAllAttributes(GetAtt):
@@ -298,7 +319,7 @@ class GetAttAllAttributes(GetAtt):
                                'forms: [resource_name] or '
                                '[resource_name, attribute, (path), ...]'
                                ) % self.fn_name)
-        elif isinstance(self.args, collections.Sequence):
+        elif isinstance(self.args, collections.abc.Sequence):
             if len(self.args) > 1:
                 return super(GetAttAllAttributes, self)._parse_args()
             else:
@@ -307,17 +328,10 @@ class GetAttAllAttributes(GetAtt):
             raise TypeError(_('Argument to "%s" must be a list') %
                             self.fn_name)
 
-    def dep_attrs(self, resource_name):
-        """Check if there is no attribute_name defined, return empty chain."""
-        if self._attribute is not None:
-            return super(GetAttAllAttributes, self).dep_attrs(resource_name)
-        elif self._resource().name == resource_name:
-            res = self._resource()
-            attrs = six.iterkeys(res.attributes_schema)
-        else:
-            attrs = []
-        return itertools.chain(function.dep_attrs(self.args,
-                                                  resource_name), attrs)
+    def _attr_path(self):
+        if self._attribute is None:
+            return attributes.ALL_ATTRIBUTES
+        return super(GetAttAllAttributes, self)._attr_path()
 
     def result(self):
         if self._attribute is None:
@@ -355,17 +369,20 @@ class Replace(function.Function):
     of equal length, lexicographically smaller keys are preferred.
     """
 
+    _strict = False
+    _allow_empty_value = True
+
     def __init__(self, stack, fn_name, args):
         super(Replace, self).__init__(stack, fn_name, args)
 
         self._mapping, self._string = self._parse_args()
         if not isinstance(self._mapping,
-                          (collections.Mapping, function.Function)):
+                          (collections.abc.Mapping, function.Function)):
             raise TypeError(_('"%s" parameters must be a mapping') %
                             self.fn_name)
 
     def _parse_args(self):
-        if not isinstance(self.args, collections.Mapping):
+        if not isinstance(self.args, collections.abc.Mapping):
             raise TypeError(_('Arguments to "%s" must be a map') %
                             self.fn_name)
 
@@ -373,36 +390,40 @@ class Replace(function.Function):
             mapping = self.args['params']
             string = self.args['template']
         except (KeyError, TypeError):
-            example = ('''str_replace:
+            example = _('''%s:
               template: This is var1 template var2
               params:
                 var1: a
-                var2: string''')
-            raise KeyError(_('"str_replace" syntax should be %s') %
-                           example)
+                var2: string''') % self.fn_name
+            raise KeyError(_('"%(fn_name)s" syntax should be %(example)s') %
+                           {'fn_name': self.fn_name, 'example': example})
         else:
             return mapping, string
 
-    def _validate_replacement(self, value):
+    def _validate_replacement(self, value, param):
         if value is None:
             return ''
 
         if not isinstance(value,
-                          (six.string_types, six.integer_types,
+                          (str, int,
                            float, bool)):
-            raise TypeError(_('"%s" params must be strings or numbers') %
-                            self.fn_name)
+            raise TypeError(_('"%(name)s" params must be strings or numbers, '
+                              'param %(param)s is not valid') %
+                            {'name': self.fn_name, 'param': param})
 
-        return six.text_type(value)
+        return str(value)
 
     def result(self):
         template = function.resolve(self._string)
         mapping = function.resolve(self._mapping)
 
-        if not isinstance(template, six.string_types):
+        if self._strict:
+            unreplaced_keys = set(mapping)
+
+        if not isinstance(template, str):
             raise TypeError(_('"%s" template must be a string') % self.fn_name)
 
-        if not isinstance(mapping, collections.Mapping):
+        if not isinstance(mapping, collections.abc.Mapping):
             raise TypeError(_('"%s" params must be a map') % self.fn_name)
 
         def replace(strings, keys):
@@ -410,17 +431,31 @@ class Replace(function.Function):
                 return strings
 
             placeholder = keys[0]
-            if not isinstance(placeholder, six.string_types):
+            if not isinstance(placeholder, str):
                 raise TypeError(_('"%s" param placeholders must be strings') %
                                 self.fn_name)
 
             remaining_keys = keys[1:]
-            value = self._validate_replacement(mapping[placeholder])
-            return [value.join(replace(s.split(placeholder),
+            value = self._validate_replacement(mapping[placeholder],
+                                               placeholder)
+
+            def string_split(s):
+                ss = s.split(placeholder)
+                if self._strict and len(ss) > 1:
+                    unreplaced_keys.discard(placeholder)
+                return ss
+
+            return [value.join(replace(string_split(s),
                                        remaining_keys)) for s in strings]
 
-        return replace([template], sorted(sorted(mapping),
-                                          key=len, reverse=True))[0]
+        ret_val = replace([template], sorted(sorted(mapping),
+                                             key=len, reverse=True))[0]
+        if self._strict and len(unreplaced_keys) > 0:
+            raise ValueError(
+                _("The following params were not found in the template: %s") %
+                ','.join(sorted(sorted(unreplaced_keys),
+                                key=len, reverse=True)))
+        return ret_val
 
 
 class ReplaceJson(Replace):
@@ -446,15 +481,28 @@ class ReplaceJson(Replace):
     being substituted in.
     """
 
-    def _validate_replacement(self, value):
-        if value is None:
-            return ''
+    def _validate_replacement(self, value, param):
 
-        if not isinstance(value, (six.string_types, six.integer_types,
-                                  float, bool)):
-            if isinstance(value, (collections.Mapping, collections.Sequence)):
+        def _raise_empty_param_value_error():
+            raise ValueError(
+                _('%(name)s has an undefined or empty value for param '
+                  '%(param)s, must be a defined non-empty value') %
+                {'name': self.fn_name, 'param': param})
+
+        if value is None:
+            if self._allow_empty_value:
+                return ''
+            else:
+                _raise_empty_param_value_error()
+
+        if not isinstance(value, (str, int, float, bool)):
+            if isinstance(
+                value, (collections.abc.Mapping, collections.abc.Sequence)
+            ):
+                if not self._allow_empty_value and len(value) == 0:
+                    _raise_empty_param_value_error()
                 try:
-                    return jsonutils.dumps(value, default=None)
+                    return jsonutils.dumps(value, default=None, sort_keys=True)
                 except TypeError:
                     raise TypeError(_('"%(name)s" params must be strings, '
                                       'numbers, list or map. '
@@ -465,7 +513,30 @@ class ReplaceJson(Replace):
                 raise TypeError(_('"%s" params must be strings, numbers, '
                                   'list or map.') % self.fn_name)
 
-        return six.text_type(value)
+        ret_value = str(value)
+        if not self._allow_empty_value and not ret_value:
+            _raise_empty_param_value_error()
+        return ret_value
+
+
+class ReplaceJsonStrict(ReplaceJson):
+    """A function for performing string substitutions.
+
+    str_replace_strict is identical to the str_replace function, only
+    a ValueError is raised if any of the params are not present in
+    the template.
+    """
+    _strict = True
+
+
+class ReplaceJsonVeryStrict(ReplaceJsonStrict):
+    """A function for performing string substitutions.
+
+    str_replace_vstrict is identical to the str_replace_strict
+    function, only a ValueError is raised if any of the params are
+    None or empty.
+    """
+    _allow_empty_value = False
 
 
 class GetFile(function.Function):
@@ -482,11 +553,13 @@ class GetFile(function.Function):
     def __init__(self, stack, fn_name, args):
         super(GetFile, self).__init__(stack, fn_name, args)
 
-        self.files = self.stack.t.files
+        self.files = self.stack.t.files if self.stack is not None else None
 
     def result(self):
+        assert self.files is not None, "No stack definition in Function"
+
         args = function.resolve(self.args)
-        if not (isinstance(args, six.string_types)):
+        if not (isinstance(args, str)):
             raise TypeError(_('Argument to "%s" must be a string') %
                             self.fn_name)
 
@@ -536,19 +609,19 @@ class Join(function.Function):
         strings = function.resolve(self._strings)
         if strings is None:
             strings = []
-        if (isinstance(strings, six.string_types) or
-                not isinstance(strings, collections.Sequence)):
+        if (isinstance(strings, str) or
+                not isinstance(strings, collections.abc.Sequence)):
             raise TypeError(_('"%s" must operate on a list') % self.fn_name)
 
         delim = function.resolve(self._delim)
-        if not isinstance(delim, six.string_types):
+        if not isinstance(delim, str):
             raise TypeError(_('"%s" delimiter must be a string') %
                             self.fn_name)
 
         def ensure_string(s):
             if s is None:
                 return ''
-            if not isinstance(s, six.string_types):
+            if not isinstance(s, str):
                 raise TypeError(
                     _('Items to join must be strings not %s'
                       ) % (repr(s)[:200]))
@@ -601,15 +674,15 @@ class JoinMultiple(function.Function):
         strings = []
         for jl in r_joinlists:
             if jl:
-                if (isinstance(jl, six.string_types) or
-                        not isinstance(jl, collections.Sequence)):
+                if (isinstance(jl, str) or
+                        not isinstance(jl, collections.abc.Sequence)):
                     raise TypeError(_('"%s" must operate on '
                                       'a list') % self.fn_name)
 
                 strings += jl
 
         delim = function.resolve(self._delim)
-        if not isinstance(delim, six.string_types):
+        if not isinstance(delim, str):
             raise TypeError(_('"%s" delimiter must be a string') %
                             self.fn_name)
 
@@ -618,11 +691,13 @@ class JoinMultiple(function.Function):
                     ) % (repr(s)[:200])
             if s is None:
                 return ''
-            elif isinstance(s, six.string_types):
+            elif isinstance(s, str):
                 return s
-            elif isinstance(s, (collections.Mapping, collections.Sequence)):
+            elif isinstance(
+                s, (collections.abc.Mapping, collections.abc.Sequence)
+            ):
                 try:
-                    return jsonutils.dumps(s, default=None)
+                    return jsonutils.dumps(s, default=None, sort_keys=True)
                 except TypeError:
                     msg = _('Items to join must be string, map or list. '
                             '%s failed json serialization'
@@ -645,7 +720,7 @@ class MapMerge(function.Function):
 
     And resolves to::
 
-        {"<k1>": "<v2>", "<k2>": "<v3>"}
+        {"<k1>": "<v3>", "<k2>": "<v2>"}
 
     """
 
@@ -658,17 +733,19 @@ class MapMerge(function.Function):
     def result(self):
         args = function.resolve(self.args)
 
-        if not isinstance(args, collections.Sequence):
+        if not isinstance(args, collections.abc.Sequence):
             raise TypeError(_('Incorrect arguments to "%(fn_name)s" '
                               'should be: %(example)s') % self.fmt_data)
 
         def ensure_map(m):
             if m is None:
                 return {}
-            elif isinstance(m, collections.Mapping):
+            elif isinstance(m, collections.abc.Mapping):
                 return m
             else:
-                msg = _('Incorrect arguments: Items to merge must be maps.')
+                msg = _('Incorrect arguments: Items to merge must be maps. '
+                        '{} is type {} instead of a dict'.format(
+                            repr(m)[:200], type(m)))
                 raise TypeError(msg)
 
         ret_map = {}
@@ -709,7 +786,7 @@ class MapReplace(function.Function):
         def ensure_map(m):
             if m is None:
                 return {}
-            elif isinstance(m, collections.Mapping):
+            elif isinstance(m, collections.abc.Mapping):
                 return m
             else:
                 msg = (_('Incorrect arguments: to "%(fn_name)s", arguments '
@@ -734,11 +811,11 @@ class MapReplace(function.Function):
         repl_keys = ensure_map(repl_map.get('keys', {}))
         repl_values = ensure_map(repl_map.get('values', {}))
         ret_map = {}
-        for k, v in six.iteritems(in_map):
+        for k, v in in_map.items():
             key = repl_keys.get(k)
             if key is None:
                 key = k
-            elif key in in_map:
+            elif key in in_map and key != k:
                 # Keys collide
                 msg = _('key replacement %s collides with '
                         'a key in the input map')
@@ -828,10 +905,13 @@ class Repeat(function.Function):
     is a copy of <body> with any occurrences of <var> replaced with the
     corresponding item of <list>.
     """
+
     def __init__(self, stack, fn_name, args):
         super(Repeat, self).__init__(stack, fn_name, args)
+        self._parse_args()
 
-        if not isinstance(self.args, collections.Mapping):
+    def _parse_args(self):
+        if not isinstance(self.args, collections.abc.Mapping):
             raise TypeError(_('Arguments to "%s" must be a map') %
                             self.fn_name)
 
@@ -847,29 +927,32 @@ class Repeat(function.Function):
                 %var%: ['a', 'b', 'c']''')
             raise KeyError(_('"repeat" syntax should be %s') % example)
 
+        self._nested_loop = True
+
     def validate(self):
         super(Repeat, self).validate()
 
         if not isinstance(self._for_each, function.Function):
-            if not isinstance(self._for_each, collections.Mapping):
+            if not isinstance(self._for_each, collections.abc.Mapping):
                 raise TypeError(_('The "for_each" argument to "%s" must '
                                   'contain a map') % self.fn_name)
 
-    @staticmethod
-    def _valid_arg(arg):
-        return (isinstance(arg, (collections.Sequence,
+    def _valid_arg(self, arg):
+        if not (isinstance(arg, (collections.abc.Sequence,
                                  function.Function)) and
-                not isinstance(arg, six.string_types))
+                not isinstance(arg, str)):
+            raise TypeError(_('The values of the "for_each" argument to '
+                              '"%s" must be lists') % self.fn_name)
 
     def _do_replacement(self, keys, values, template):
-        if isinstance(template, six.string_types):
+        if isinstance(template, str):
             for (key, value) in zip(keys, values):
                 template = template.replace(key, value)
             return template
-        elif isinstance(template, collections.Sequence):
+        elif isinstance(template, collections.abc.Sequence):
             return [self._do_replacement(keys, values, elem)
                     for elem in template]
-        elif isinstance(template, collections.Mapping):
+        elif isinstance(template, collections.abc.Mapping):
             return dict((self._do_replacement(keys, values, k),
                          self._do_replacement(keys, values, v))
                         for (k, v) in template.items())
@@ -878,30 +961,105 @@ class Repeat(function.Function):
 
     def result(self):
         for_each = function.resolve(self._for_each)
-        if not all(self._valid_arg(l) for l in for_each.values()):
-            raise TypeError(_('The values of the "for_each" argument to '
-                              '"%s" must be lists') % self.fn_name)
+        keys, lists = zip(*for_each.items())
+
+        # use empty list for references(None) else validation will fail
+        value_lens = []
+        values = []
+        for value in lists:
+            if value is None:
+                values.append([])
+            else:
+                self._valid_arg(value)
+                values.append(value)
+                value_lens.append(len(value))
+        if not self._nested_loop and value_lens:
+            if len(set(value_lens)) != 1:
+                raise ValueError(_('For %s, the length of for_each values '
+                                   'should be equal if no nested '
+                                   'loop.') % self.fn_name)
 
         template = function.resolve(self._template)
+        iter_func = itertools.product if self._nested_loop else zip
 
-        keys, lists = six.moves.zip(*for_each.items())
         return [self._do_replacement(keys, replacements, template)
-                for replacements in itertools.product(*lists)]
+                for replacements in iter_func(*values)]
 
 
 class RepeatWithMap(Repeat):
-    """A function for iterating over a list of items.
+    """A function for iterating over a list of items or a dict of keys.
 
-    Behaves the same as Replace, but if tolerates a map as
-    values to be repeated, in which case it iterates the map keys.
+    Takes the form::
+
+        repeat:
+            template:
+                <body>
+            for_each:
+                <var>: <list> or <dict>
+
+    The result is a new list of the same size as <list> or <dict>, where each
+    element is a copy of <body> with any occurrences of <var> replaced with the
+    corresponding item of <list> or key of <dict>.
     """
 
-    @staticmethod
-    def _valid_arg(arg):
-        return (isinstance(arg, (collections.Sequence,
-                                 collections.Mapping,
+    def _valid_arg(self, arg):
+        if not (isinstance(arg, (collections.abc.Sequence,
+                                 collections.abc.Mapping,
                                  function.Function)) and
-                not isinstance(arg, six.string_types))
+                not isinstance(arg, str)):
+            raise TypeError(_('The values of the "for_each" argument to '
+                              '"%s" must be lists or maps') % self.fn_name)
+
+
+class RepeatWithNestedLoop(RepeatWithMap):
+    """A function for iterating over a list of items or a dict of keys.
+
+    Takes the form::
+
+        repeat:
+            template:
+                <body>
+            for_each:
+                <var>: <list> or <dict>
+
+    The result is a new list of the same size as <list> or <dict>, where each
+    element is a copy of <body> with any occurrences of <var> replaced with the
+    corresponding item of <list> or key of <dict>.
+
+    This function also allows to specify 'permutations' to decide
+    whether to iterate nested the over all the permutations of the
+    elements in the given lists.
+
+    Takes the form::
+
+        repeat:
+          template:
+            var: %var%
+            bar: %bar%
+          for_each:
+            %var%: <list1>
+            %bar%: <list2>
+          permutations: false
+
+    If 'permutations' is not specified, we set the default value to true to
+    compatible with before behavior. The args have to be lists instead of
+    dicts if 'permutations' is False because keys in a dict are unordered,
+    and the list args all have to be of the same length.
+    """
+
+    def _parse_args(self):
+        super(RepeatWithNestedLoop, self)._parse_args()
+        self._nested_loop = self.args.get('permutations', True)
+
+        if not isinstance(self._nested_loop, bool):
+            raise TypeError(_('"permutations" should be boolean type '
+                              'for %s function.') % self.fn_name)
+
+    def _valid_arg(self, arg):
+        if self._nested_loop:
+            super(RepeatWithNestedLoop, self)._valid_arg(arg)
+        else:
+            Repeat._valid_arg(self, arg)
 
 
 class Digest(function.Function):
@@ -919,7 +1077,7 @@ class Digest(function.Function):
 
     def validate_usage(self, args):
         if not (isinstance(args, list) and
-                all([isinstance(a, six.string_types) for a in args])):
+                all([isinstance(a, str) for a in args])):
             msg = _('Argument to function "%s" must be a list of strings')
             raise TypeError(msg % self.fn_name)
 
@@ -927,18 +1085,15 @@ class Digest(function.Function):
             msg = _('Function "%s" usage: ["<algorithm>", "<value>"]')
             raise ValueError(msg % self.fn_name)
 
-        if six.PY3:
-            algorithms = hashlib.algorithms_available
-        else:
-            algorithms = hashlib.algorithms
+        algorithms = hashlib.algorithms_available
 
         if args[0].lower() not in algorithms:
             msg = _('Algorithm must be one of %s')
-            raise ValueError(msg % six.text_type(algorithms))
+            raise ValueError(msg % str(algorithms))
 
     def digest(self, algorithm, value):
         _hash = hashlib.new(algorithm)
-        _hash.update(six.b(value))
+        _hash.update(value.encode('latin-1'))
 
         return _hash.hexdigest()
 
@@ -973,7 +1128,7 @@ class StrSplit(function.Function):
                          'example': example}
         self.fn_name = fn_name
 
-        if isinstance(args, (six.string_types, collections.Mapping)):
+        if isinstance(args, (str, collections.abc.Mapping)):
             raise TypeError(_('Incorrect arguments to "%(fn_name)s" '
                               'should be: %(example)s') % self.fmt_data)
 
@@ -1037,13 +1192,13 @@ class Yaql(function.Function):
                 'yaql.memoryQuota': cfg.CONF.yaql.memory_quota
             }
             cls._parser = yaql.YaqlFactory().create(global_options)
+            cls._context = yaql.create_context()
         return cls._parser
 
     def __init__(self, stack, fn_name, args):
         super(Yaql, self).__init__(stack, fn_name, args)
-        self._yaql_context = yaql.create_context()
 
-        if not isinstance(self.args, collections.Mapping):
+        if not isinstance(self.args, collections.abc.Mapping):
             raise TypeError(_('Arguments to "%s" must be a map.') %
                             self.fn_name)
 
@@ -1066,7 +1221,7 @@ class Yaql(function.Function):
             self._parse(self._expression)
 
     def _parse(self, expression):
-        if not isinstance(expression, six.string_types):
+        if not isinstance(expression, str):
             raise TypeError(_('The "expression" argument to %s must '
                               'contain a string.') % self.fn_name)
 
@@ -1079,7 +1234,8 @@ class Yaql(function.Function):
     def result(self):
         statement = self._parse(function.resolve(self._expression))
         data = function.resolve(self._data)
-        return statement.evaluate({'data': data}, self._yaql_context)
+        context = self._context.create_child_context()
+        return statement.evaluate({'data': data}, context)
 
 
 class Equals(function.Function):
@@ -1129,13 +1285,16 @@ class If(function.Macro):
     evaluates to false.
     """
 
+    def _read_args(self):
+        return self.args
+
     def parse_args(self, parse_func):
         try:
             if (not self.args or
-                    not isinstance(self.args, collections.Sequence) or
-                    isinstance(self.args, six.string_types)):
+                    not isinstance(self.args, collections.abc.Sequence) or
+                    isinstance(self.args, str)):
                 raise ValueError()
-            condition, value_if_true, value_if_false = self.args
+            condition, value_if_true, value_if_false = self._read_args()
         except ValueError:
             msg = _('Arguments to "%s" must be of the form: '
                     '[condition_name, value_if_true, value_if_false]')
@@ -1153,6 +1312,40 @@ class If(function.Macro):
         return self.template.conditions(self.stack).is_enabled(cond)
 
 
+class IfNullable(If):
+    """A function to return corresponding value based on condition evaluation.
+
+    Takes the form::
+
+        if:
+          - <condition_name>
+          - <value_if_true>
+          - <value_if_false>
+
+    The value_if_true to be returned if the specified condition evaluates
+    to true, the value_if_false to be returned if the specified condition
+    evaluates to false.
+
+    If the value_if_false is omitted and the condition is false, the enclosing
+    item (list item, dictionary key/value pair, property definition) will be
+    treated as if it were not mentioned in the template::
+
+        if:
+          - <condition_name>
+          - <value_if_true>
+    """
+
+    def _read_args(self):
+        if not (2 <= len(self.args) <= 3):
+            raise ValueError()
+
+        if len(self.args) == 2:
+            condition, value_if_true = self.args
+            return condition, value_if_true, Ellipsis
+
+        return self.args
+
+
 class ConditionBoolean(function.Function):
     """Abstract parent class of boolean condition functions."""
 
@@ -1161,8 +1354,8 @@ class ConditionBoolean(function.Function):
         self._check_args()
 
     def _check_args(self):
-        if not (isinstance(self.args, collections.Sequence) and
-                not isinstance(self.args, six.string_types)):
+        if not (isinstance(self.args, collections.abc.Sequence) and
+                not isinstance(self.args, str)):
             msg = _('Arguments to "%s" must be a list of conditions')
             raise ValueError(msg % self.fn_name)
         if not self.args or len(self.args) < 2:
@@ -1237,3 +1430,282 @@ class Or(ConditionBoolean):
     def result(self):
         return any(self._get_condition(cd)
                    for cd in function.resolve(self.args))
+
+
+class Filter(function.Function):
+    """A function for filtering out values from lists.
+
+    Takes the form::
+
+        filter:
+          - <values>
+          - <list>
+
+    Returns a new list without the values.
+    """
+    def __init__(self, stack, fn_name, args):
+        super(Filter, self).__init__(stack, fn_name, args)
+
+        self._values, self._sequence = self._parse_args()
+
+    def _parse_args(self):
+        if (not isinstance(self.args, collections.abc.Sequence) or
+                isinstance(self.args, str)):
+            raise TypeError(_('Argument to "%s" must be a list') %
+                            self.fn_name)
+
+        if len(self.args) != 2:
+            raise ValueError(_('"%(fn)s" expected 2 arguments of the form '
+                               '[values, sequence] but got %(len)d arguments '
+                               'instead') %
+                             {'fn': self.fn_name, 'len': len(self.args)})
+
+        return self.args[0], self.args[1]
+
+    def result(self):
+        sequence = function.resolve(self._sequence)
+        if not sequence:
+            return sequence
+        if not isinstance(sequence, list):
+            raise TypeError(_('"%s" only works with lists') % self.fn_name)
+
+        values = function.resolve(self._values)
+        if not values:
+            return sequence
+        if not isinstance(values, list):
+            raise TypeError(
+                _('"%(fn)s" filters a list of values') %
+                {'fn': self.fn_name})
+        return [i for i in sequence if i not in values]
+
+
+class MakeURL(function.Function):
+    """A function for performing substitutions on maps.
+
+    Takes the form::
+
+        make_url:
+          scheme: <protocol>
+          username: <username>
+          password: <password>
+          host: <hostname or IP>
+          port: <port>
+          path: <path>
+          query:
+            <key1>: <value1>
+          fragment: <fragment>
+
+    And resolves to a correctly-escaped URL constructed from the various
+    components.
+    """
+
+    _ARG_KEYS = (
+        SCHEME, USERNAME, PASSWORD, HOST, PORT,
+        PATH, QUERY, FRAGMENT,
+    ) = (
+        'scheme', 'username', 'password', 'host', 'port',
+        'path', 'query', 'fragment',
+    )
+
+    def _check_args(self, args):
+        for arg in self._ARG_KEYS:
+            if arg in args:
+                if arg == self.QUERY:
+                    if not isinstance(args[arg], (function.Function,
+                                                  collections.abc.Mapping)):
+                        raise TypeError(_('The "%(arg)s" argument to '
+                                          '"%(fn_name)s" must be a map') %
+                                        {'arg': arg,
+                                         'fn_name': self.fn_name})
+                    return
+                elif arg == self.PORT:
+                    port = args[arg]
+                    if not isinstance(port, function.Function):
+                        if not isinstance(port, int):
+                            try:
+                                port = int(port)
+                            except ValueError:
+                                raise ValueError(
+                                    _('Invalid URL port "%(port)s" '
+                                      'for %(fn_name)s called with '
+                                      '%(args)s')
+                                    % {'fn_name': self.fn_name,
+                                       'port': port, 'args': args})
+
+                        if not (0 < port <= 65535):
+                            raise ValueError(
+                                _('Invalid URL port %d, '
+                                  'must be in range 1-65535') % port)
+                else:
+                    if not isinstance(args[arg], (function.Function,
+                                                  str)):
+                        raise TypeError(_('The "%(arg)s" argument to '
+                                          '"%(fn_name)s" must be a string') %
+                                        {'arg': arg,
+                                         'fn_name': self.fn_name})
+
+    def validate(self):
+        super(MakeURL, self).validate()
+
+        if not isinstance(self.args, collections.abc.Mapping):
+            raise TypeError(_('The arguments to "%s" must '
+                              'be a map') % self.fn_name)
+
+        invalid_keys = set(self.args) - set(self._ARG_KEYS)
+        if invalid_keys:
+            raise ValueError(_('Invalid arguments to "%(fn)s": %(args)s') %
+                             {'fn': self.fn_name,
+                              'args': ', '.join(invalid_keys)})
+
+        self._check_args(self.args)
+
+    def result(self):
+        args = function.resolve(self.args)
+        self._check_args(args)
+
+        scheme = args.get(self.SCHEME, '')
+        if ':' in scheme:
+            raise ValueError(_('URL "%s" should not contain \':\'') %
+                             self.SCHEME)
+
+        def netloc():
+            username = urlparse.quote(args.get(self.USERNAME, ''), safe='')
+            password = urlparse.quote(args.get(self.PASSWORD, ''), safe='')
+            if username or password:
+                yield username
+                if password:
+                    yield ':'
+                    yield password
+                yield '@'
+
+            host = args.get(self.HOST, '')
+            if host.startswith('[') and host.endswith(']'):
+                host = host[1:-1]
+            host = urlparse.quote(host, safe=':')
+            if ':' in host:
+                host = '[%s]' % host
+            yield host
+
+            port = args.get(self.PORT, '')
+            if port:
+                yield ':'
+                yield str(port)
+
+        path = urlparse.quote(args.get(self.PATH, ''))
+
+        query_dict = args.get(self.QUERY, {})
+        query = urlparse.urlencode(query_dict).replace('%2F', '/')
+
+        fragment = urlparse.quote(args.get(self.FRAGMENT, ''))
+
+        return urlparse.urlunsplit((scheme, ''.join(netloc()),
+                                    path, query, fragment))
+
+
+class ListConcat(function.Function):
+    """A function for extending lists.
+
+    Takes the form::
+
+        list_concat:
+          - [<value 1>, <value 2>]
+          - [<value 3>, <value 4>]
+
+    And resolves to::
+
+        [<value 1>, <value 2>, <value 3>, <value 4>]
+
+    """
+
+    _unique = False
+
+    def __init__(self, stack, fn_name, args):
+        super(ListConcat, self).__init__(stack, fn_name, args)
+        example = (_('"%s" : [ [ <value 1>, <value 2> ], '
+                     '[ <value 3>, <value 4> ] ]')
+                   % fn_name)
+        self.fmt_data = {'fn_name': fn_name, 'example': example}
+
+    def result(self):
+        args = function.resolve(self.args)
+
+        if (isinstance(args, str) or
+                not isinstance(args, collections.abc.Sequence)):
+            raise TypeError(_('Incorrect arguments to "%(fn_name)s" '
+                              'should be: %(example)s') % self.fmt_data)
+
+        def ensure_list(m):
+            if m is None:
+                return []
+            elif (isinstance(m, collections.abc.Sequence) and
+                  not isinstance(m, str)):
+                return m
+            else:
+                msg = _('Incorrect arguments: Items to concat must be lists. '
+                        '%(args)s contains an item that is not a list: '
+                        '%(item)s')
+                raise TypeError(msg % dict(item=jsonutils.dumps(m),
+                                           args=jsonutils.dumps(args)))
+
+        ret_list = []
+        for m in args:
+            ret_list.extend(ensure_list(m))
+
+        if not self._unique:
+            return ret_list
+
+        unique_list = []
+        for item in ret_list:
+            if item not in unique_list:
+                unique_list.append(item)
+        return unique_list
+
+
+class ListConcatUnique(ListConcat):
+    """A function for extending lists with unique items.
+
+    list_concat_unique is identical to the list_concat function, only
+    contains unique items in retuning list.
+    """
+
+    _unique = True
+
+
+class Contains(function.Function):
+    """A function for checking whether specific value is in sequence.
+
+    Takes the form::
+
+        contains:
+          - <value>
+          - <sequence>
+
+    The value can be any type that you want to check. Returns true
+    if the specific value is in the sequence, otherwise returns false.
+    """
+
+    def __init__(self, stack, fn_name, args):
+        super(Contains, self).__init__(stack, fn_name, args)
+        example = '"%s" : [ "value1", [ "value1", "value2"]]' % self.fn_name
+        fmt_data = {'fn_name': self.fn_name,
+                    'example': example}
+
+        if not self.args or not isinstance(self.args, list):
+            raise TypeError(_('Incorrect arguments to "%(fn_name)s" '
+                              'should be: %(example)s') % fmt_data)
+        try:
+            self.value, self.sequence = self.args
+        except ValueError:
+            msg = _('Arguments to "%s" must be of the form: '
+                    '[value1, [value1, value2]]')
+            raise ValueError(msg % self.fn_name)
+
+    def result(self):
+        resolved_value = function.resolve(self.value)
+        resolved_sequence = function.resolve(self.sequence)
+
+        if not isinstance(resolved_sequence, collections.abc.Sequence):
+            raise TypeError(_('Second argument to "%s" should be '
+                              'a sequence.') % self.fn_name)
+
+        return resolved_value in resolved_sequence

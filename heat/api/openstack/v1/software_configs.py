@@ -11,7 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
 from webob import exc
 
 from heat.api.openstack.v1 import util
@@ -42,14 +41,26 @@ class SoftwareConfigController(object):
         try:
             return param_utils.extract_bool(name, value)
         except ValueError as e:
-            raise exc.HTTPBadRequest(six.text_type(e))
+            raise exc.HTTPBadRequest(str(e))
+
+    def _extract_int_param(self, name, value,
+                           allow_zero=True, allow_negative=False):
+        try:
+            return param_utils.extract_int(name, value,
+                                           allow_zero, allow_negative)
+        except ValueError as e:
+            raise exc.HTTPBadRequest(str(e))
 
     def _index(self, req, use_admin_cnxt=False):
-        whitelist = {
+        param_types = {
             'limit': util.PARAM_TYPE_SINGLE,
             'marker': util.PARAM_TYPE_SINGLE
         }
-        params = util.get_allowed_params(req.params, whitelist)
+        params = util.get_allowed_params(req.params, param_types)
+
+        key = rpc_api.PARAM_LIMIT
+        if key in params:
+            params[key] = self._extract_int_param(key, params[key])
 
         if use_admin_cnxt:
             cnxt = context.get_admin_context()
@@ -59,11 +70,11 @@ class SoftwareConfigController(object):
                                                     **params)
         return {'software_configs': scs}
 
-    @util.policy_enforce
+    @util.registered_policy_enforce
     def global_index(self, req):
         return self._index(req, use_admin_cnxt=True)
 
-    @util.policy_enforce
+    @util.registered_policy_enforce
     def index(self, req):
         """Lists summary information for all software configs."""
         global_tenant = False
@@ -74,18 +85,18 @@ class SoftwareConfigController(object):
                 req.params.get(name))
 
         if global_tenant:
-            return self.global_index(req, req.context.tenant_id)
+            return self.global_index(req, req.context.project_id)
 
         return self._index(req)
 
-    @util.policy_enforce
+    @util.registered_policy_enforce
     def show(self, req, config_id):
         """Gets detailed information for a software config."""
         sc = self.rpc_client.show_software_config(
             req.context, config_id)
         return {'software_config': sc}
 
-    @util.policy_enforce
+    @util.registered_policy_enforce
     def create(self, req, body):
         """Create a new software config."""
         create_data = {
@@ -100,7 +111,7 @@ class SoftwareConfigController(object):
             req.context, **create_data)
         return {'software_config': sc}
 
-    @util.policy_enforce
+    @util.registered_policy_enforce
     def delete(self, req, config_id):
         """Delete an existing software config."""
         res = self.rpc_client.delete_software_config(req.context, config_id)

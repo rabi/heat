@@ -11,15 +11,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from cinderclient import api_versions
 from cinderclient import client as cc
 from cinderclient import exceptions
 from keystoneauth1 import exceptions as ks_exceptions
+from oslo_config import cfg
 from oslo_log import log as logging
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.engine.clients import client_plugin
+from heat.engine.clients import microversion_mixin
 from heat.engine.clients import os as os_client
 from heat.engine import constraints
 
@@ -29,11 +31,17 @@ LOG = logging.getLogger(__name__)
 CLIENT_NAME = 'cinder'
 
 
-class CinderClientPlugin(client_plugin.ClientPlugin):
+class CinderClientPlugin(microversion_mixin.MicroversionMixin,
+                         os_client.ExtensionMixin,
+                         client_plugin.ClientPlugin):
 
     exceptions_module = exceptions
 
-    service_types = [VOLUME_V2, VOLUME_V3] = ['volumev2', 'volumev3']
+    service_types = [VOLUME_V3] = ['volumev3']
+
+    CINDER_API_VERSION = '3'
+
+    max_microversion = cfg.CONF.max_cinder_api_microversion
 
     def get_volume_api_version(self):
         '''Returns the most recent API version.'''
@@ -42,41 +50,42 @@ class CinderClientPlugin(client_plugin.ClientPlugin):
             self.context.keystone_session.get_endpoint(
                 service_type=self.VOLUME_V3,
                 interface=self.interface)
-            self.service_type = self.VOLUME_V3
-            self.client_version = '3'
         except ks_exceptions.EndpointNotFound:
-            try:
-                self.context.keystone_session.get_endpoint(
-                    service_type=self.VOLUME_V2,
-                    interface=self.interface)
-                self.service_type = self.VOLUME_V2
-                self.client_version = '2'
-            except ks_exceptions.EndpointNotFound:
-                raise exception.Error(_('No volume service available.'))
+            raise exception.Error(_('No volume service available.'))
 
-    def _create(self):
+    def _create(self, version=None):
+        if version is None:
+            version = self.CINDER_API_VERSION
         self.get_volume_api_version()
-        extensions = cc.discover_extensions(self.client_version)
+        extensions = cc.discover_extensions(self.CINDER_API_VERSION)
         args = {
             'session': self.context.keystone_session,
             'extensions': extensions,
             'interface': self.interface,
-            'service_type': self.service_type,
+            'service_type': self.VOLUME_V3,
+            'region_name': self._get_region_name(),
+            'connect_retries': cfg.CONF.client_retry_limit,
             'http_log_debug': self._get_client_option(CLIENT_NAME,
                                                       'http_log_debug')
         }
-
-        client = cc.Client(self.client_version, **args)
+        client = cc.Client(version, **args)
         return client
+
+    def get_max_microversion(self):
+        if not self.max_microversion:
+            self.max_microversion = api_versions.get_highest_version(
+                self._create()).get_string()
+        return self.max_microversion
+
+    def is_version_supported(self, version):
+        api_ver = api_versions.APIVersion(version)
+        max_api_ver = api_versions.APIVersion(self.get_max_microversion())
+        return max_api_ver >= api_ver
 
     @os_client.MEMOIZE_EXTENSIONS
     def _list_extensions(self):
         extensions = self.client().list_extensions.show_all()
         return set(extension.alias for extension in extensions)
-
-    def has_extension(self, alias):
-        """Check if specific extension is present."""
-        return alias in self._list_extensions()
 
     def get_volume(self, volume):
         try:
@@ -128,24 +137,29 @@ class CinderClientPlugin(client_plugin.ClientPlugin):
         return (isinstance(ex, exceptions.ClientException) and
                 ex.code == 409)
 
-    def check_detach_volume_complete(self, vol_id):
+    def check_detach_volume_complete(self, vol_id, server_id=None):
         try:
             vol = self.client().volumes.get(vol_id)
         except Exception as ex:
             self.ignore_not_found(ex)
             return True
 
-        if vol.status in ('in-use', 'detaching'):
-            LOG.debug('%s - volume still in use' % vol_id)
+        server_ids = [
+            a['server_id'] for a in vol.attachments if 'server_id' in a]
+        if server_id and server_id not in server_ids:
+            return True
+
+        if vol.status in ('in-use', 'detaching', 'reserved'):
+            LOG.debug('%s - volume still in use', vol_id)
             return False
 
-        LOG.debug('Volume %(id)s - status: %(status)s' % {
+        LOG.debug('Volume %(id)s - status: %(status)s', {
             'id': vol.id, 'status': vol.status})
 
         if vol.status not in ('available', 'deleting'):
             LOG.debug("Detachment failed - volume %(vol)s "
-                      "is in %(status)s status" % {"vol": vol.id,
-                                                   "status": vol.status})
+                      "is in %(status)s status",
+                      {"vol": vol.id, "status": vol.status})
             raise exception.ResourceUnknownStatus(
                 resource_status=vol.status,
                 result=_('Volume detachment failed'))
@@ -154,21 +168,21 @@ class CinderClientPlugin(client_plugin.ClientPlugin):
 
     def check_attach_volume_complete(self, vol_id):
         vol = self.client().volumes.get(vol_id)
-        if vol.status in ('available', 'attaching'):
+        if vol.status in ('available', 'attaching', 'reserved'):
             LOG.debug("Volume %(id)s is being attached - "
-                      "volume status: %(status)s" % {'id': vol_id,
-                                                     'status': vol.status})
+                      "volume status: %(status)s",
+                      {'id': vol_id, 'status': vol.status})
             return False
 
         if vol.status != 'in-use':
             LOG.debug("Attachment failed - volume %(vol)s is "
-                      "in %(status)s status" % {"vol": vol_id,
-                                                "status": vol.status})
+                      "in %(status)s status",
+                      {"vol": vol_id, "status": vol.status})
             raise exception.ResourceUnknownStatus(
                 resource_status=vol.status,
                 result=_('Volume attachment failed'))
 
-        LOG.info(_LI('Attaching volume %(id)s complete'), {'id': vol_id})
+        LOG.info('Attaching volume %(id)s complete', {'id': vol_id})
         return True
 
 

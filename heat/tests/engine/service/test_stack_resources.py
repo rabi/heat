@@ -10,16 +10,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
+
 from oslo_config import cfg
 from oslo_messaging.rpc import dispatcher
-import six
 
 from heat.common import exception
 from heat.common import identifier
+from heat.engine.clients.os import heat_plugin
 from heat.engine.clients.os import keystone
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.engine import dependencies
 from heat.engine import resource as res
+from heat.engine.resources.aws.ec2 import instance as ins
 from heat.engine import service
 from heat.engine import stack
 from heat.engine import stack_lock
@@ -27,7 +30,6 @@ from heat.engine import template as templatem
 from heat.objects import stack as stack_object
 from heat.tests import common
 from heat.tests.engine import tools
-from heat.tests import fakes as test_fakes
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
 
@@ -46,7 +48,8 @@ policy_template = '''
       }
     },
     "Random" : {
-      "Type" : "OS::Heat::RandomString"
+      "Type" : "OS::Heat::RandomString",
+      "DependsOn" : "WebServerScaleDownPolicy"
     }
   }
 }
@@ -68,8 +71,8 @@ class StackResourcesServiceTest(common.HeatTestCase):
     def _test_describe_stack_resource(self, mock_load):
         mock_load.return_value = self.stack
 
-        # Patch _resolve_all_attributes or it tries to call novaclient
-        self.patchobject(res.Resource, '_resolve_all_attributes',
+        # Patch _resolve_any_attribute or it tries to call novaclient
+        self.patchobject(res.Resource, '_resolve_any_attribute',
                          return_value=None)
 
         r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
@@ -100,7 +103,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
     @mock.patch.object(service.EngineService, '_get_stack')
     def test_stack_resource_describe_nonexist_stack(self, mock_get):
         non_exist_identifier = identifier.HeatIdentifier(
-            self.ctx.tenant_id, 'wibble',
+            self.ctx.project_id, 'wibble',
             '18d06e2e-44d3-4bef-9fbf-52480d604b02')
         mock_get.side_effect = exception.EntityNotFound(
             entity='Stack', name='test')
@@ -191,7 +194,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
 
     def test_stack_resources_describe_nonexist_stack(self):
         non_exist_identifier = identifier.HeatIdentifier(
-            self.ctx.tenant_id, 'wibble',
+            self.ctx.project_id, 'wibble',
             '18d06e2e-44d3-4bef-9fbf-52480d604b02')
 
         ex = self.assertRaises(dispatcher.ExpectedException,
@@ -242,7 +245,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
     @tools.stack_context('service_resources_list_test_stack_with_depth')
     def test_stack_resources_list_with_depth(self, mock_load):
         mock_load.return_value = self.stack
-        resources = six.itervalues(self.stack)
+        resources = self.stack.values()
         self.stack.iter_resources = mock.Mock(return_value=resources)
         self.eng.list_stack_resources(self.ctx,
                                       self.stack.identifier(),
@@ -254,7 +257,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
     @tools.stack_context('service_resources_list_test_stack_with_max_depth')
     def test_stack_resources_list_with_max_depth(self, mock_load):
         mock_load.return_value = self.stack
-        resources = six.itervalues(self.stack)
+        resources = self.stack.values()
         self.stack.iter_resources = mock.Mock(return_value=resources)
         self.eng.list_stack_resources(self.ctx,
                                       self.stack.identifier(),
@@ -267,7 +270,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
     @tools.stack_context('service_resources_list_test_stack')
     def test_stack_resources_filter_type(self, mock_load):
         mock_load.return_value = self.stack
-        resources = six.itervalues(self.stack)
+        resources = self.stack.values()
         self.stack.iter_resources = mock.Mock(return_value=resources)
         filters = {'type': 'AWS::EC2::Instance'}
         resources = self.eng.list_stack_resources(self.ctx,
@@ -281,7 +284,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
     @tools.stack_context('service_resources_list_test_stack')
     def test_stack_resources_filter_type_not_found(self, mock_load):
         mock_load.return_value = self.stack
-        resources = six.itervalues(self.stack)
+        resources = self.stack.values()
         self.stack.iter_resources = mock.Mock(return_value=resources)
         filters = {'type': 'NonExisted'}
         resources = self.eng.list_stack_resources(self.ctx,
@@ -293,17 +296,18 @@ class StackResourcesServiceTest(common.HeatTestCase):
 
     @mock.patch.object(stack.Stack, 'load')
     def test_stack_resources_list_deleted_stack(self, mock_load):
-        stk = tools.setup_stack('resource_list_deleted_stack', self.ctx)
+        stk = tools.setup_stack_with_mock(self, 'resource_list_deleted_stack',
+                                          self.ctx)
         stack_id = stk.identifier()
         mock_load.return_value = stk
-        tools.clean_up_stack(stk)
+        tools.clean_up_stack(self, stk)
         resources = self.eng.list_stack_resources(self.ctx, stack_id)
         self.assertEqual(0, len(resources))
 
     @mock.patch.object(service.EngineService, '_get_stack')
     def test_stack_resources_list_nonexist_stack(self, mock_get):
         non_exist_identifier = identifier.HeatIdentifier(
-            self.ctx.tenant_id, 'wibble',
+            self.ctx.project_id, 'wibble',
             '18d06e2e-44d3-4bef-9fbf-52480d604b02')
         mock_get.side_effect = exception.EntityNotFound(entity='Stack',
                                                         name='test')
@@ -317,7 +321,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
 
     def _stack_create(self, stack_name):
         self.patchobject(keystone.KeystoneClientPlugin, '_create',
-                         return_value=test_fakes.FakeKeystoneClient())
+                         return_value=fake_ks.FakeKeystoneClient())
 
         stk = tools.get_stack(stack_name, self.ctx, policy_template)
         stk.store()
@@ -332,7 +336,6 @@ class StackResourcesServiceTest(common.HeatTestCase):
         stack_name = 'signal_reception_async'
         self.stack = self._stack_create(stack_name)
         test_data = {'food': 'yum'}
-
         self.eng.resource_signal(self.ctx,
                                  dict(self.stack.identifier()),
                                  'WebServerScaleDownPolicy',
@@ -355,6 +358,20 @@ class StackResourcesServiceTest(common.HeatTestCase):
                                  test_data,
                                  sync_call=True)
         mock_signal.assert_called_once_with(mock.ANY, False)
+
+    def test_signal_reception_get_resource_none(self):
+        stack_name = 'signal_reception_no_resource'
+        self.stack = self._stack_create(stack_name)
+        test_data = {'food': 'yum'}
+
+        self.patchobject(stack.Stack, 'resource_get',
+                         return_value=None)
+        ex = self.assertRaises(dispatcher.ExpectedException,
+                               self.eng.resource_signal, self.ctx,
+                               dict(self.stack.identifier()),
+                               'WebServerScaleDownPolicy',
+                               test_data)
+        self.assertEqual(exception.ResourceNotFound, ex.exc_info[0])
 
     def test_signal_reception_no_resource(self):
         stack_name = 'signal_reception_no_resource'
@@ -416,7 +433,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
                                'WebServerScaleDownPolicy',
                                details)
         msg = 'Invalid hook type "invalid_hook"'
-        self.assertIn(msg, six.text_type(ex.exc_info[1]))
+        self.assertIn(msg, str(ex.exc_info[1]))
         self.assertEqual(exception.InvalidBreakPointHook,
                          ex.exc_info[0])
 
@@ -431,18 +448,20 @@ class StackResourcesServiceTest(common.HeatTestCase):
                                details)
         msg = ('The "pre-update" hook is not defined on '
                'AWSScalingPolicy "WebServerScaleDownPolicy"')
-        self.assertIn(msg, six.text_type(ex.exc_info[1]))
+        self.assertIn(msg, str(ex.exc_info[1]))
         self.assertEqual(exception.InvalidBreakPointHook,
                          ex.exc_info[0])
 
+    @mock.patch.object(heat_plugin.HeatClientPlugin, 'get_heat_cfn_url')
     @mock.patch.object(res.Resource, 'metadata_update')
     @mock.patch.object(res.Resource, 'signal')
     @mock.patch.object(service.EngineService, '_get_stack')
     def test_signal_calls_metadata_update(self, mock_get, mock_signal,
-                                          mock_update):
+                                          mock_update, mock_get_cfn):
+        mock_get_cfn.return_value = 'http://server.test:8000/v1'
         # fake keystone client
         self.patchobject(keystone.KeystoneClientPlugin, '_create',
-                         return_value=test_fakes.FakeKeystoneClient())
+                         return_value=fake_ks.FakeKeystoneClient())
 
         stk = tools.get_stack('signal_reception', self.ctx, policy_template)
         self.stack = stk
@@ -470,7 +489,7 @@ class StackResourcesServiceTest(common.HeatTestCase):
                                              mock_update):
         # fake keystone client
         self.patchobject(keystone.KeystoneClientPlugin, '_create',
-                         return_value=test_fakes.FakeKeystoneClient())
+                         return_value=fake_ks.FakeKeystoneClient())
 
         stk = tools.get_stack('signal_reception', self.ctx, policy_template)
         self.stack = stk
@@ -523,82 +542,99 @@ class StackResourcesServiceTest(common.HeatTestCase):
         self.assertIsInstance(stack_dependencies, dependencies.Dependencies)
         self.assertEqual(2, len(stack_dependencies.graph()))
 
+    @tools.stack_context('service_find_resource_logical_name')
+    def test_find_resource_logical_name(self):
+        rsrc = self.stack['WebServer']
+        physical_rsrc = self.eng._find_resource_in_stack(self.ctx,
+                                                         'WebServer',
+                                                         self.stack)
+        self.assertEqual(rsrc.id, physical_rsrc.id)
+
+    @tools.stack_context('service_find_resource_physical_id')
+    def test_find_resource_physical_id(self):
+        rsrc = self.stack['WebServer']
+        physical_rsrc = self.eng._find_resource_in_stack(self.ctx,
+                                                         rsrc.resource_id,
+                                                         self.stack)
+        self.assertEqual(rsrc.id, physical_rsrc.id)
+
+    @tools.stack_context('service_find_resource_not_found')
+    def test_find_resource_nonexist(self):
+        self.assertRaises(exception.ResourceNotFound,
+                          self.eng._find_resource_in_stack,
+                          self.ctx, 'wibble', self.stack)
+
+    def _test_mark_healthy_asserts(self, action='CHECK', status='FAILED',
+                                   reason='state changed', meta=None):
+        rs = self.eng.describe_stack_resource(
+            self.ctx, self.stack.identifier(),
+            'WebServer', with_attr=None)
+        self.assertIn('resource_action', rs)
+        self.assertIn('resource_status', rs)
+        self.assertIn('resource_status_reason', rs)
+
+        self.assertEqual(action, rs['resource_action'])
+        self.assertEqual(status, rs['resource_status'])
+        self.assertEqual(reason, rs['resource_status_reason'])
+        if meta is not None:
+            self.assertIn('metadata', rs)
+            self.assertEqual(meta, rs['metadata'])
+
     @tools.stack_context('service_mark_healthy_create_complete_test_stk')
     def test_mark_healthy_in_create_complete(self):
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', False,
                                          resource_status_reason='noop')
 
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-        self.assertIn('resource_action', r)
-        self.assertIn('resource_status', r)
-        self.assertIn('resource_status_reason', r)
-
-        self.assertEqual(r['resource_action'], 'CREATE')
-        self.assertEqual(r['resource_status'], 'COMPLETE')
-        self.assertEqual(r['resource_status_reason'], 'state changed')
+        self._test_mark_healthy_asserts(action='CREATE',
+                                        status='COMPLETE')
 
     @tools.stack_context('service_mark_unhealthy_create_complete_test_stk')
     def test_mark_unhealthy_in_create_complete(self):
+
+        reason = 'Some Reason'
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True,
-                                         resource_status_reason='Some Reason')
+                                         resource_status_reason=reason)
 
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'FAILED')
-        self.assertEqual(r['resource_status_reason'], 'Some Reason')
+        self._test_mark_healthy_asserts(reason=reason)
 
     @tools.stack_context('service_mark_healthy_check_failed_test_stk')
     def test_mark_healthy_check_failed(self):
+        reason = 'Some Reason'
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True,
-                                         resource_status_reason='Some Reason')
+                                         resource_status_reason=reason)
+        self._test_mark_healthy_asserts(reason=reason)
 
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
+        meta = {'for_test': True}
 
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'FAILED')
-        self.assertEqual(r['resource_status_reason'], 'Some Reason')
+        def override_metadata_reset(rsrc):
+            rsrc.metadata_set(meta)
 
+        ins.Instance.handle_metadata_reset = override_metadata_reset
+
+        reason = 'Good Reason'
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', False,
-                                         resource_status_reason='Good Reason')
-
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'COMPLETE')
-        self.assertEqual(r['resource_status_reason'], 'Good Reason')
+                                         resource_status_reason=reason)
+        self._test_mark_healthy_asserts(status='COMPLETE',
+                                        reason=reason,
+                                        meta=meta)
 
     @tools.stack_context('service_mark_unhealthy_check_failed_test_stack')
     def test_mark_unhealthy_check_failed(self):
+        reason = 'Some Reason'
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True,
-                                         resource_status_reason='Some Reason')
+                                         resource_status_reason=reason)
+        self._test_mark_healthy_asserts(reason=reason)
 
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'FAILED')
-        self.assertEqual(r['resource_status_reason'], 'Some Reason')
-
+        new_reason = 'New Reason'
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True,
-                                         resource_status_reason='New Reason')
-
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'FAILED')
-        self.assertEqual(r['resource_status_reason'], 'New Reason')
+                                         resource_status_reason=new_reason)
+        self._test_mark_healthy_asserts(reason=new_reason)
 
     @tools.stack_context('service_mark_unhealthy_invalid_value_test_stk')
     def test_mark_unhealthy_invalid_value(self):
@@ -614,28 +650,16 @@ class StackResourcesServiceTest(common.HeatTestCase):
     def test_mark_unhealthy_none_reason(self):
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True)
-
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'FAILED')
-        self.assertEqual(r['resource_status_reason'],
-                         'state changed by resource_mark_unhealthy api')
+        default_reason = 'state changed by resource_mark_unhealthy api'
+        self._test_mark_healthy_asserts(reason=default_reason)
 
     @tools.stack_context('service_mark_unhealthy_empty_reason_test_stk')
     def test_mark_unhealthy_empty_reason(self):
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True,
                                          resource_status_reason="")
-
-        r = self.eng.describe_stack_resource(self.ctx, self.stack.identifier(),
-                                             'WebServer', with_attr=None)
-
-        self.assertEqual(r['resource_action'], 'CHECK')
-        self.assertEqual(r['resource_status'], 'FAILED')
-        self.assertEqual(r['resource_status_reason'],
-                         'state changed by resource_mark_unhealthy api')
+        default_reason = 'state changed by resource_mark_unhealthy api'
+        self._test_mark_healthy_asserts(reason=default_reason)
 
     @tools.stack_context('service_mark_unhealthy_lock_no_converge_test_stk')
     def test_mark_unhealthy_lock_no_convergence(self):
@@ -657,25 +681,25 @@ class StackResourcesServiceTest(common.HeatTestCase):
     @tools.stack_context('service_mark_unhealthy_lock_converge_test_stk',
                          convergence=True)
     def test_mark_unhealthy_stack_lock_convergence(self):
-        mock_acquire = self.patchobject(res.Resource,
-                                        '_acquire',
-                                        return_value=None)
+        mock_store_with_lock = self.patchobject(res.Resource,
+                                                '_store_with_lock',
+                                                return_value=None)
 
         self.eng.resource_mark_unhealthy(self.ctx, self.stack.identifier(),
                                          'WebServer', True,
                                          resource_status_reason="")
 
-        mock_acquire.assert_called_once_with(self.eng.engine_id)
+        self.assertEqual(2, mock_store_with_lock.call_count)
 
     @tools.stack_context('service_mark_unhealthy_lockexc_converge_test_stk',
                          convergence=True)
     def test_mark_unhealthy_stack_lock_exc_convergence(self):
-        def _acquire(*args, **kwargs):
+        def _store_with_lock(*args, **kwargs):
             raise exception.UpdateInProgress(self.stack.name)
 
         self.patchobject(
             res.Resource,
-            '_acquire',
+            '_store_with_lock',
             return_value=None,
             side_effect=exception.UpdateInProgress(self.stack.name))
         ex = self.assertRaises(dispatcher.ExpectedException,

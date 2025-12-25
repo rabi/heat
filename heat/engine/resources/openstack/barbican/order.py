@@ -11,8 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import attributes
@@ -155,7 +153,7 @@ class Order(resource.Resource):
         ),
         PASS_PHRASE: properties.Schema(
             properties.Schema.STRING,
-            _('The passphrase the created key. Can be set only '
+            _('The passphrase of the created key. Can be set only '
               'for asymmetric type of order.'),
             support_status=support.SupportStatus(version='5.0.0'),
         ),
@@ -228,8 +226,8 @@ class Order(resource.Resource):
                 raise exception.ResourcePropertyDependency(
                     prop1=self.PROFILE, prop2=self.CA_ID
                 )
-        declared_props = sorted([k for k, v in six.iteritems(
-            self.properties) if k != self.TYPE and v is not None])
+        declared_props = sorted([k for k, v in self.properties.items()
+                                 if k != self.TYPE and v is not None])
         allowed_props = sorted(self.ALLOWED_PROPERTIES_FOR_TYPE[
             self.properties[self.TYPE]])
         diff = sorted(set(declared_props) - set(allowed_props))
@@ -255,6 +253,8 @@ class Order(resource.Resource):
         return order.status == 'ACTIVE'
 
     def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
         client = self.client()
         order = client.orders.get(self.resource_id)
         if name in (

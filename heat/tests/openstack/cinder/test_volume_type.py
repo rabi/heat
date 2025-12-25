@@ -11,8 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 import collections
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.engine.clients.os import cinder as c_plugin
@@ -93,7 +92,7 @@ class CinderVolumeTypeTest(common.HeatTestCase):
         self._test_handle_create(is_public=False)
 
     def test_volume_type_with_projects(self):
-        self.cinderclient.volume_api_version = 2
+        self.cinderclient.volume_api_version = 3
         self._test_handle_create(projects=['id1', 'id2'])
 
     def _test_update(self, update_args, is_update_metadata=False):
@@ -151,8 +150,8 @@ class CinderVolumeTypeTest(common.HeatTestCase):
             def __init__(self, idx, project):
                 self.volume_type_id = idx
                 self.project_id = project
-                self._info = {'volume_type_id': idx,
-                              'project_id': project}
+                info = {'volume_type_id': idx, 'project_id': project}
+                self.to_dict = mock.Mock(return_value=info)
 
         old_access = [Access(self.my_volume_type.resource_id, 'id1'),
                       Access(self.my_volume_type.resource_id, 'id2')]
@@ -179,13 +178,13 @@ class CinderVolumeTypeTest(common.HeatTestCase):
         props['projects'] = ['id1']
         self.my_volume_type.t = self.my_volume_type.t.freeze(properties=props)
         self.my_volume_type.reparse()
-        self.cinderclient.volume_api_version = 2
+        self.cinderclient.volume_api_version = 3
         self.stub_KeystoneProjectConstraint()
         ex = self.assertRaises(exception.StackValidationFailed,
                                self.my_volume_type.validate)
         expected = ('Can not specify property "projects" '
                     'if the volume type is public.')
-        self.assertEqual(expected, six.text_type(ex))
+        self.assertEqual(expected, str(ex))
 
     def test_validate_projects_when_private(self):
         tmpl = self.stack.t.t
@@ -194,7 +193,7 @@ class CinderVolumeTypeTest(common.HeatTestCase):
         props['projects'] = ['id1']
         self.my_volume_type.t = self.my_volume_type.t.freeze(properties=props)
         self.my_volume_type.reparse()
-        self.cinderclient.volume_api_version = 2
+        self.cinderclient.volume_api_version = 3
         self.stub_KeystoneProjectConstraint()
         self.assertIsNone(self.my_volume_type.validate())
 
@@ -240,7 +239,7 @@ class CinderVolumeTypeTest(common.HeatTestCase):
             def __init__(self, idx, project, info):
                 self.volumetype_id = idx
                 self.project_id = project
-                self._info = info
+                self.to_dict = mock.Mock(return_value=info)
 
         volume_type_access.list.return_value = [
             Access('1234', '1', {'volumetype_id': '1234', 'project_id': '1'}),

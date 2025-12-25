@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
-import six
+from unittest import mock
+
 import webob
 from webob import exc
 
@@ -29,7 +29,7 @@ class FakeApp(object):
     def __call__(self, environ, start_response):
         """Assert that headers are correctly set up when finally called."""
         resp = webob.Response()
-        resp.body = six.b('SUCCESS')
+        resp.body = 'SUCCESS'.encode('latin-1')
         return resp(environ, start_response)
 
 
@@ -45,7 +45,7 @@ class AuthUrlFilterTest(common.HeatTestCase):
     def test_adds_default_auth_url_from_clients_keystone(self, mock_cfg):
         self.config = {}
         mock_cfg.clients_keystone.auth_uri = 'foobar'
-        mock_cfg.keystone_authtoken.auth_uri = 'this-should-be-ignored'
+        mock_cfg.keystone_authtoken.www_authenticate_uri = 'should-be-ignored'
         mock_cfg.auth_password.multi_cloud = False
         with mock.patch('keystoneauth1.discover.Discover') as discover:
             class MockDiscover(object):
@@ -62,7 +62,7 @@ class AuthUrlFilterTest(common.HeatTestCase):
     def test_adds_default_auth_url_from_keystone_authtoken(self, mock_cfg):
         self.config = {}
         mock_cfg.clients_keystone.auth_uri = ''
-        mock_cfg.keystone_authtoken.auth_uri = 'foobar'
+        mock_cfg.keystone_authtoken.www_authenticate_uri = 'foobar'
         mock_cfg.auth_password.multi_cloud = False
         self.middleware = auth_url.AuthUrlFilter(self.app, self.config)
         req = webob.Request.blank('/tenant_id/')

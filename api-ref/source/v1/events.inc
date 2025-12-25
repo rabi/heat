@@ -96,8 +96,8 @@ Request Parameters
    - tenant_id: tenant_id
    - stack_name: stack_name_url
 
-Reponse Parameters
-------------------
+Response Parameters
+-------------------
 
 .. rest_parameters:: parameters.yaml
 
@@ -169,7 +169,7 @@ Shows details for an event.
 
 .. rest_status_code:: success status.yaml
 
-   - 200 
+   - 200
 
 .. rest_status_code:: error status.yaml
 

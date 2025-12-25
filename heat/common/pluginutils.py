@@ -13,12 +13,13 @@
 
 from oslo_log import log as logging
 
+
 LOG = logging.getLogger(__name__)
 
 
 def log_fail_msg(manager, entrypoint, exception):
     LOG.warning('Encountered exception while loading %(module_name)s: '
-                '"%(message)s". Not using %(name)s.' %
-                {'module_name': entrypoint.module_name,
-                 'message': exception.message,
+                '"%(message)s". Not using %(name)s.',
+                {'module_name': entrypoint.module,
+                 'message': getattr(exception, 'message', str(exception)),
                  'name': entrypoint.name})

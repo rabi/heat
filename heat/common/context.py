@@ -11,6 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import functools
+
 from keystoneauth1 import access
 from keystoneauth1.identity import access as access_plugin
 from keystoneauth1.identity import generic
@@ -19,23 +21,21 @@ from keystoneauth1 import session
 from keystoneauth1 import token_endpoint
 from oslo_config import cfg
 from oslo_context import context
+from oslo_db.sqlalchemy import enginefacade
 from oslo_log import log as logging
 import oslo_messaging
-from oslo_middleware import request_id as oslo_request_id
 from oslo_utils import importutils
-import six
 
 from heat.common import config
 from heat.common import endpoint_utils
 from heat.common import exception
-from heat.common.i18n import _LE, _LW
 from heat.common import policy
 from heat.common import wsgi
-from heat.db import api as db_api
 from heat.engine import clients
 
 LOG = logging.getLogger(__name__)
 
+cfg.CONF.import_opt('client_retry_limit', 'heat.common.config')
 
 # Note, we yield the options via list_opts to enable generation of the
 # sample heat.conf, but we don't register these options directly via
@@ -47,7 +47,7 @@ LOG = logging.getLogger(__name__)
 # username = heat
 # password = password
 # user_domain_id = default
-PASSWORD_PLUGIN = 'password'
+PASSWORD_PLUGIN = 'password'  # nosec Bandit B105
 TRUSTEE_CONF_GROUP = 'trustee'
 ks_loading.register_auth_conf_options(cfg.CONF, TRUSTEE_CONF_GROUP)
 
@@ -59,17 +59,7 @@ def list_opts():
     yield TRUSTEE_CONF_GROUP, trustee_opts
 
 
-def _moved_attr(new_name):
-
-    def getter(self):
-        return getattr(self, new_name)
-
-    def setter(self, value):
-        setattr(self, new_name, value)
-
-    return property(getter, setter)
-
-
+@enginefacade.transaction_context_provider
 class RequestContext(context.RequestContext):
     """Stores information about the security context.
 
@@ -78,44 +68,32 @@ class RequestContext(context.RequestContext):
     """
 
     def __init__(self, username=None, password=None, aws_creds=None,
-                 auth_url=None, roles=None, is_admin=None, read_only=False,
-                 show_deleted=False, overwrite=True, trust_id=None,
-                 trustor_user_id=None, request_id=None, auth_token_info=None,
-                 region_name=None, auth_plugin=None, trusts_auth_plugin=None,
-                 user_domain_id=None, project_domain_id=None,
-                 project_name=None, **kwargs):
+                 auth_url=None, is_admin=None, trust_id=None,
+                 trustor_user_id=None, auth_token_info=None, region_name=None,
+                 auth_plugin=None, trusts_auth_plugin=None,
+                 **kwargs):
         """Initialisation of the request context.
 
-        :param overwrite: Set to False to ensure that the greenthread local
-            copy of the index is not overwritten.
         """
-        if user_domain_id:
-            kwargs['user_domain'] = user_domain_id
-        if project_domain_id:
-            kwargs['project_domain'] = project_domain_id
-
-        super(RequestContext, self).__init__(is_admin=is_admin,
-                                             read_only=read_only,
-                                             show_deleted=show_deleted,
-                                             request_id=request_id,
-                                             roles=roles,
-                                             overwrite=overwrite,
-                                             **kwargs)
+        super(RequestContext, self).__init__(
+            is_admin=is_admin, **kwargs)
 
         self.username = username
         self.password = password
+        if username is None and password is None:
+            self.username = self.user_name
         self.region_name = region_name
         self.aws_creds = aws_creds
-        self.project_name = project_name
         self.auth_token_info = auth_token_info
         self.auth_url = auth_url
         self._session = None
         self._clients = None
         self._keystone_session = session.Session(
+            connect_retries=cfg.CONF.client_retry_limit,
             **config.get_ssl_options('keystone'))
         self.trust_id = trust_id
         self.trustor_user_id = trustor_user_id
-        self.policy = policy.Enforcer()
+        self.policy = policy.get_enforcer()
         self._auth_plugin = auth_plugin
         self._trusts_auth_plugin = trusts_auth_plugin
 
@@ -135,21 +113,10 @@ class RequestContext(context.RequestContext):
             self._object_cache[cache_cls] = cache
         return cache
 
-    user_id = _moved_attr('user')
-    tenant_id = _moved_attr('tenant')
-
-    @property
-    def session(self):
-        if self._session is None:
-            self._session = db_api.get_session()
-        return self._session
-
     @property
     def keystone_session(self):
-        if self.auth_needs_refresh():
-            self.reload_auth_plugin()
-            self.clients.invalidate_plugins()
-        self._keystone_session.auth = self.auth_plugin
+        if not self._keystone_session.auth:
+            self._keystone_session.auth = self.auth_plugin
         return self._keystone_session
 
     @property
@@ -158,15 +125,9 @@ class RequestContext(context.RequestContext):
             self._clients = clients.Clients(self)
         return self._clients
 
-    def auth_needs_refresh(self):
-        auth_ref = self.auth_plugin.get_auth_ref(self._keystone_session)
-        return (cfg.CONF.reauthentication_auth_method == 'trusts'
-                and auth_ref.will_expire_soon(
-                    cfg.CONF.stale_token_duration))
-
     def to_dict(self):
-        user_idt = '{user} {tenant}'.format(user=self.user_id or '-',
-                                            tenant=self.tenant_id or '-')
+        user_idt = '{user} {project}'.format(user=self.user_id or '-',
+                                             project=self.project_id or '-')
 
         return {'auth_token': self.auth_token,
                 'username': self.username,
@@ -174,7 +135,9 @@ class RequestContext(context.RequestContext):
                 'password': self.password,
                 'aws_creds': self.aws_creds,
                 'tenant': self.project_name,
-                'tenant_id': self.tenant_id,
+                'tenant_id': self.project_id,
+                'project_name': self.project_name,
+                'project_id': self.project_id,
                 'trust_id': self.trust_id,
                 'trustor_user_id': self.trustor_user_id,
                 'auth_token_info': self.auth_token_info,
@@ -183,22 +146,23 @@ class RequestContext(context.RequestContext):
                 'is_admin': self.is_admin,
                 'user': self.username,
                 'request_id': self.request_id,
+                'global_request_id': self.global_request_id,
                 'show_deleted': self.show_deleted,
                 'region_name': self.region_name,
                 'user_identity': user_idt,
-                'user_domain_id': self.user_domain,
-                'project_domain_id': self.project_domain}
+                'user_domain_id': self.user_domain_id,
+                'project_domain_id': self.project_domain_id}
 
     @classmethod
     def from_dict(cls, values):
         return cls(
             auth_token=values.get('auth_token'),
             username=values.get('username'),
-            user=values.get('user_id'),
+            user_id=values.get('user_id'),
             password=values.get('password'),
             aws_creds=values.get('aws_creds'),
-            project_name=values.get('tenant'),
-            tenant=values.get('tenant_id'),
+            project_name=values.get('project_name', values.get('tenant')),
+            project_id=values.get('project_id', values.get('tenant_id')),
             trust_id=values.get('trust_id'),
             trustor_user_id=values.get('trustor_user_id'),
             auth_token_info=values.get('auth_token_info'),
@@ -208,8 +172,8 @@ class RequestContext(context.RequestContext):
             request_id=values.get('request_id'),
             show_deleted=values.get('show_deleted', False),
             region_name=values.get('region_name'),
-            user_domain_id=values.get('user_domain'),
-            project_domain_id=values.get('project_domain')
+            user_domain_id=values.get('user_domain_id'),
+            project_domain_id=values.get('project_domain_id')
         )
 
     def to_policy_values(self):
@@ -220,7 +184,7 @@ class RequestContext(context.RequestContext):
         # what should be used when writing policy but are maintained for
         # compatibility.
         policy['user'] = self.user_id
-        policy['tenant'] = self.tenant_id
+        policy['tenant'] = self.project_id
         policy['is_admin'] = self.is_admin
         policy['auth_token_info'] = self.auth_token_info
 
@@ -235,40 +199,23 @@ class RequestContext(context.RequestContext):
             if auth_uri:
                 return auth_uri
             else:
-                LOG.error(_LE('Keystone API endpoint not provided. Set '
-                              'auth_uri in section [clients_keystone] '
-                              'of the configuration file.'))
+                LOG.error('Keystone API endpoint not provided. Set '
+                          'auth_uri in section [clients_keystone] '
+                          'of the configuration file.')
                 raise exception.AuthorizationFailure()
 
     @property
     def trusts_auth_plugin(self):
-        if self._trusts_auth_plugin:
-            return self._trusts_auth_plugin
+        if not self._trusts_auth_plugin:
+            self._trusts_auth_plugin = ks_loading.load_auth_from_conf_options(
+                cfg.CONF, TRUSTEE_CONF_GROUP, trust_id=self.trust_id)
 
-        self._trusts_auth_plugin = ks_loading.load_auth_from_conf_options(
-            cfg.CONF, TRUSTEE_CONF_GROUP, trust_id=self.trust_id)
+        if not self._trusts_auth_plugin:
+            LOG.error('Please add the trustee credentials you need '
+                      'to the %s section of your heat.conf file.',
+                      TRUSTEE_CONF_GROUP)
+            raise exception.AuthorizationFailure()
 
-        if self._trusts_auth_plugin:
-            return self._trusts_auth_plugin
-
-        LOG.warning(_LW('Using the keystone_authtoken user as the heat '
-                        'trustee user directly is deprecated. Please add the '
-                        'trustee credentials you need to the %s section of '
-                        'your heat.conf file.') % TRUSTEE_CONF_GROUP)
-
-        cfg.CONF.import_group('keystone_authtoken',
-                              'keystonemiddleware.auth_token')
-
-        trustee_user_domain = 'default'
-        if 'user_domain_id' in cfg.CONF.keystone_authtoken:
-            trustee_user_domain = cfg.CONF.keystone_authtoken.user_domain_id
-
-        self._trusts_auth_plugin = generic.Password(
-            username=cfg.CONF.keystone_authtoken.admin_user,
-            password=cfg.CONF.keystone_authtoken.admin_password,
-            user_domain_id=trustee_user_domain,
-            auth_url=self.keystone_v3_endpoint,
-            trust_id=self.trust_id)
         return self._trusts_auth_plugin
 
     def _create_auth_plugin(self):
@@ -278,6 +225,13 @@ class RequestContext(context.RequestContext):
             return access_plugin.AccessInfoPlugin(
                 auth_ref=access_info, auth_url=self.keystone_v3_endpoint)
 
+        if self.password:
+            return generic.Password(username=self.username,
+                                    password=self.password,
+                                    project_id=self.project_id,
+                                    user_domain_id=self.user_domain_id,
+                                    auth_url=self.keystone_v3_endpoint)
+
         if self.auth_token:
             # FIXME(jamielennox): This is broken but consistent. If you
             # only have a token but don't load a service catalog then
@@ -286,15 +240,8 @@ class RequestContext(context.RequestContext):
             return token_endpoint.Token(endpoint=self.keystone_v3_endpoint,
                                         token=self.auth_token)
 
-        if self.password:
-            return generic.Password(username=self.username,
-                                    password=self.password,
-                                    project_id=self.tenant_id,
-                                    user_domain_id=self.user_domain,
-                                    auth_url=self.keystone_v3_endpoint)
-
-        LOG.error(_LE("Keystone API connection failed, no password "
-                      "trust or auth_token!"))
+        LOG.error("Keystone API connection failed, no password "
+                  "trust or auth_token!")
         raise exception.AuthorizationFailure()
 
     def reload_auth_plugin(self):
@@ -314,16 +261,17 @@ class RequestContext(context.RequestContext):
 class StoredContext(RequestContext):
     def _load_keystone_data(self):
         self._keystone_loaded = True
-        auth_ref = self.clients.client('keystone').auth_ref
+        auth_ref = self.auth_plugin.get_access(self.keystone_session)
 
         self.roles = auth_ref.role_names
-        self.user_domain = auth_ref.user_domain_id
-        self.project_domain = auth_ref.project_domain_id
+        self.user_domain_id = auth_ref.user_domain_id
+        self.project_domain_id = auth_ref.project_domain_id
 
     @property
     def roles(self):
-        if not getattr(self, '_keystone_loaded', False):
-            self._load_keystone_data()
+        if self._roles is None:
+            if not getattr(self, '_keystone_loaded', False):
+                self._load_keystone_data()
         return self._roles
 
     @roles.setter
@@ -331,24 +279,26 @@ class StoredContext(RequestContext):
         self._roles = roles
 
     @property
-    def user_domain(self):
-        if not getattr(self, '_keystone_loaded', False):
-            self._load_keystone_data()
-        return self._user_domain
+    def user_domain_id(self):
+        if self._user_domain_id is None:
+            if not getattr(self, '_keystone_loaded', False):
+                self._load_keystone_data()
+        return self._user_domain_id
 
-    @user_domain.setter
-    def user_domain(self, user_domain):
-        self._user_domain = user_domain
+    @user_domain_id.setter
+    def user_domain_id(self, user_domain_id):
+        self._user_domain_id = user_domain_id
 
     @property
-    def project_domain(self):
-        if not getattr(self, '_keystone_loaded', False):
-            self._load_keystone_data()
-        return self._project_domain
+    def project_domain_id(self):
+        if self._project_domain_id is None:
+            if not getattr(self, '_keystone_loaded', False):
+                self._load_keystone_data()
+        return self._project_domain_id
 
-    @project_domain.setter
-    def project_domain(self, project_domain):
-        self._project_domain = project_domain
+    @project_domain_id.setter
+    def project_domain_id(self, project_domain_id):
+        self._project_domain_id = project_domain_id
 
 
 def get_admin_context(show_deleted=False):
@@ -384,22 +334,18 @@ class ContextMiddleware(wsgi.Middleware):
         elif headers.get('X-Auth-EC2-Creds') is not None:
             aws_creds = headers.get('X-Auth-EC2-Creds')
 
-        project_name = headers.get('X-Project-Name')
         region_name = headers.get('X-Region-Name')
         auth_url = headers.get('X-Auth-Url')
 
         token_info = environ.get('keystone.token_info')
         auth_plugin = environ.get('keystone.token_auth')
-        req_id = environ.get(oslo_request_id.ENV_REQUEST_ID)
 
         req.context = self.ctxcls.from_environ(
             environ,
-            project_name=project_name,
             aws_creds=aws_creds,
             username=username,
             password=password,
             auth_url=auth_url,
-            request_id=req_id,
             auth_token_info=token_info,
             region_name=region_name,
             auth_plugin=auth_plugin,
@@ -418,7 +364,7 @@ def ContextMiddleware_filter_factory(global_conf, **local_conf):
 
 
 def request_context(func):
-    @six.wraps(func)
+    @functools.wraps(func)
     def wrapped(self, ctx, *args, **kwargs):
         try:
             return func(self, ctx, *args, **kwargs)

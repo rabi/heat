@@ -12,13 +12,11 @@
 #    under the License.
 
 import collections
+import functools
 
 from oslo_utils import strutils
-import six
 
 from heat.common.i18n import _
-from heat.common.i18n import _LW
-from heat.common.i18n import repr_wrapper
 from heat.engine import constraints as constr
 from heat.engine import support
 
@@ -49,19 +47,19 @@ class Schema(constr.Schema):
     )
 
     TYPES = (
-        STRING, MAP, LIST, INTEGER, BOOLEAN
+        UNKNOWN, STRING, MAP, LIST, INTEGER, BOOLEAN
     ) = (
-        'String', 'Map', 'List', 'Integer', 'Boolean'
+        None, 'String', 'Map', 'List', 'Integer', 'Boolean'
     )
 
     def __init__(self, description=None,
                  support_status=support.SupportStatus(),
                  cache_mode=CACHE_LOCAL,
-                 type=None):
-        self.description = description
+                 type=UNKNOWN):
+        super(Schema, self).__init__(type, description)
         self.support_status = support_status
         self.cache_mode = cache_mode
-        self.type = type
+        self.validate()
 
     def __getitem__(self, key):
         if key == self.DESCRIPTION:
@@ -112,30 +110,66 @@ class Attribute(object):
         """
         if template_type == 'hot':
             return {
-                "value": '{"get_attr": ["%s", "%s"]}' % (resource_name,
-                                                         self.name),
+                "value": {"get_attr": [resource_name, self.name]},
                 "description": self.schema.description
             }
         else:
             return {
-                "Value": '{"Fn::GetAtt": ["%s", "%s"]}' % (resource_name,
-                                                           self.name),
+                "Value": {"Fn::GetAtt": [resource_name, self.name]},
                 "Description": self.schema.description
             }
 
 
-@repr_wrapper
-class Attributes(collections.Mapping):
+def _stack_id_output(resource_name, template_type='cfn'):
+    if template_type == 'hot':
+        return {
+            "value": {"get_resource": resource_name},
+        }
+    else:
+        return {
+            "Value": {"Ref": resource_name},
+        }
+
+
+BASE_ATTRIBUTES = (SHOW_ATTR, ) = ('show', )
+
+# Returned by function.dep_attrs() to indicate that all attributes are
+# referenced
+ALL_ATTRIBUTES = '*'
+
+
+class Attributes(collections.abc.Mapping):
     """Models a collection of Resource Attributes."""
 
     def __init__(self, res_name, schema, resolver):
         self._resource_name = res_name
         self._resolver = resolver
-        self._attributes = Attributes._make_attributes(schema)
+        self.set_schema(schema)
         self.reset_resolved_values()
 
+        assert ALL_ATTRIBUTES not in schema, \
+            "Invalid attribute name '%s'" % ALL_ATTRIBUTES
+
     def reset_resolved_values(self):
+        if hasattr(self, '_resolved_values'):
+            self._has_new_resolved = len(self._resolved_values) > 0
+        else:
+            self._has_new_resolved = False
         self._resolved_values = {}
+
+    def set_schema(self, schema):
+        self._attributes = self._make_attributes(schema)
+
+    def get_cache_mode(self, attribute_name):
+        """Return the cache mode for the specified attribute.
+
+        If the attribute is not defined in the schema, the default cache
+        mode (CACHE_LOCAL) is returned.
+        """
+        try:
+            return self._attributes[attribute_name].schema.cache_mode
+        except KeyError:
+            return Schema.CACHE_LOCAL
 
     @staticmethod
     def _make_attributes(schema):
@@ -158,8 +192,10 @@ class Attributes(collections.Mapping):
         attr_schema.update(resource_class.base_attributes_schema)
         attribs = Attributes._make_attributes(attr_schema).items()
 
-        return dict((n, att.as_output(resource_name,
+        outp = dict((n, att.as_output(resource_name,
                                       template_type)) for n, att in attribs)
+        outp['OS::stack_id'] = _stack_id_output(resource_name, template_type)
+        return outp
 
     @staticmethod
     def schema_from_outputs(json_snippet):
@@ -170,38 +206,62 @@ class Attributes(collections.Mapping):
 
     def _validate_type(self, attrib, value):
         if attrib.schema.type == attrib.schema.STRING:
-            if not isinstance(value, six.string_types):
-                LOG.warning(_LW("Attribute %(name)s is not of type "
-                                "%(att_type)s"),
+            if not isinstance(value, str):
+                LOG.warning("Attribute %(name)s is not of type "
+                            "%(att_type)s",
                             {'name': attrib.name,
                              'att_type': attrib.schema.STRING})
         elif attrib.schema.type == attrib.schema.LIST:
-            if (not isinstance(value, collections.Sequence)
-                    or isinstance(value, six.string_types)):
-                LOG.warning(_LW("Attribute %(name)s is not of type "
-                                "%(att_type)s"),
+            if (not isinstance(value, collections.abc.Sequence)
+                    or isinstance(value, str)):
+                LOG.warning("Attribute %(name)s is not of type "
+                            "%(att_type)s",
                             {'name': attrib.name,
                              'att_type': attrib.schema.LIST})
         elif attrib.schema.type == attrib.schema.MAP:
-            if not isinstance(value, collections.Mapping):
-                LOG.warning(_LW("Attribute %(name)s is not of type "
-                                "%(att_type)s"),
+            if not isinstance(value, collections.abc.Mapping):
+                LOG.warning("Attribute %(name)s is not of type "
+                            "%(att_type)s",
                             {'name': attrib.name,
                              'att_type': attrib.schema.MAP})
         elif attrib.schema.type == attrib.schema.INTEGER:
             if not isinstance(value, int):
-                LOG.warning(_LW("Attribute %(name)s is not of type "
-                                "%(att_type)s"),
+                LOG.warning("Attribute %(name)s is not of type "
+                            "%(att_type)s",
                             {'name': attrib.name,
                              'att_type': attrib.schema.INTEGER})
         elif attrib.schema.type == attrib.schema.BOOLEAN:
             try:
                 strutils.bool_from_string(value, strict=True)
             except ValueError:
-                LOG.warning(_LW("Attribute %(name)s is not of type "
-                                "%(att_type)s"),
+                LOG.warning("Attribute %(name)s is not of type "
+                            "%(att_type)s",
                             {'name': attrib.name,
                              'att_type': attrib.schema.BOOLEAN})
+
+    @property
+    def cached_attrs(self):
+        return self._resolved_values
+
+    @cached_attrs.setter
+    def cached_attrs(self, c_attrs):
+        if c_attrs is None:
+            self._resolved_values = {}
+        else:
+            self._resolved_values = c_attrs
+        self._has_new_resolved = False
+
+    def set_cached_attr(self, key, value):
+        self._resolved_values[key] = value
+        self._has_new_resolved = True
+
+    def has_new_cached_attrs(self):
+        """Returns True if cached_attrs have changed
+
+        Allows the caller to determine if this instance's cached_attrs
+        have been updated since they were initially set (if at all).
+        """
+        return self._has_new_resolved
 
     def __getitem__(self, key):
         if key not in self:
@@ -222,7 +282,7 @@ class Attributes(collections.Mapping):
             self._validate_type(attrib, value)
             # only store if not None, it may resolve to an actual value
             # on subsequent calls
-            self._resolved_values[key] = value
+            self.set_cached_attr(key, value)
         return value
 
     def __len__(self):
@@ -236,35 +296,7 @@ class Attributes(collections.Mapping):
 
     def __repr__(self):
         return ("Attributes for %s:\n\t" % self._resource_name +
-                '\n\t'.join(six.itervalues(self)))
-
-
-class DynamicSchemeAttributes(Attributes):
-    """The collection of attributes for resources without static attr scheme.
-
-    The class defines collection of attributes for such entities as Resource
-    Group, Software Deployment and so on that doesn't have static attribute
-    scheme. The attribute scheme for such kind of resources can contain
-    attribute from attribute scheme (like other resources) and dynamic
-    attributes (nested stack attrs or API response attrs).
-    """
-
-    def __getitem__(self, key):
-        try:
-            # check if the value can be resolved with attributes
-            # in attributes schema (static attributes)
-            return super(DynamicSchemeAttributes, self).__getitem__(key)
-        except KeyError:
-            # ok, the attribute is not present in attribute scheme
-            # try to check the attributes dynamically
-            if key in self._resolved_values:
-                return self._resolved_values[key]
-
-            value = self._resolver(key)
-            if value is not None:
-                self._resolved_values[key] = value
-
-            return value
+                '\n\t'.join(self.values()))
 
 
 def select_from_attribute(attribute_value, path):
@@ -275,16 +307,16 @@ def select_from_attribute(attribute_value, path):
     :returns: the selected attribute component value.
     """
     def get_path_component(collection, key):
-        if not isinstance(collection, (collections.Mapping,
-                                       collections.Sequence)):
+        if not isinstance(collection, (collections.abc.Mapping,
+                                       collections.abc.Sequence)):
             raise TypeError(_("Can't traverse attribute path"))
 
-        if not isinstance(key, (six.string_types, int)):
+        if not isinstance(key, (str, int)):
             raise TypeError(_('Path components in attributes must be strings'))
 
         return collection[key]
 
     try:
-        return six.moves.reduce(get_path_component, path, attribute_value)
+        return functools.reduce(get_path_component, path, attribute_value)
     except (KeyError, IndexError, TypeError):
         return None

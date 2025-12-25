@@ -10,7 +10,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import time
+import copy
 
 from heat_integrationtests.functional import functional_base
 
@@ -28,15 +28,15 @@ test_template = {
     }
 }
 
-env_both_restrict = {u'resource_registry': {
-    u'resources': {
+env_both_restrict = {'resource_registry': {
+    'resources': {
         'bar': {'restricted_actions': ['update', 'replace']}
     }
 }
 }
 
-env_replace_restrict = {u'resource_registry': {
-    u'resources': {
+env_replace_restrict = {'resource_registry': {
+    'resources': {
         '*ar': {'restricted_actions': 'replace'}
     }
 }
@@ -57,7 +57,7 @@ class UpdateRestrictedStackTest(functional_base.FunctionalTestsBase):
     def test_update(self):
         stack_identifier = self.stack_create(template=test_template)
 
-        update_template = test_template.copy()
+        update_template = copy.deepcopy(test_template)
         props = update_template['resources']['bar']['properties']
         props['value'] = '4567'
 
@@ -72,9 +72,6 @@ class UpdateRestrictedStackTest(functional_base.FunctionalTestsBase):
         self.assertTrue(
             self._check_for_restriction_reason(resource_events,
                                                reason_update_restrict))
-
-        # Ensure the timestamp changes, since this will be very quick
-        time.sleep(1)
 
         # check update succeeds - with only 'replace' restricted
         self.update_stack(stack_identifier, update_template,
@@ -94,8 +91,9 @@ class UpdateRestrictedStackTest(functional_base.FunctionalTestsBase):
     def test_replace(self):
         stack_identifier = self.stack_create(template=test_template)
 
-        update_template = test_template.copy()
+        update_template = copy.deepcopy(test_template)
         props = update_template['resources']['bar']['properties']
+        props['value'] = '4567'
         props['update_replace'] = True
 
         # check replace fails - with 'both' restricted
@@ -109,9 +107,6 @@ class UpdateRestrictedStackTest(functional_base.FunctionalTestsBase):
         self.assertTrue(
             self._check_for_restriction_reason(resource_events,
                                                reason_replace_restrict))
-
-        # Ensure the timestamp changes, since this will be very quick
-        time.sleep(1)
 
         # check replace fails - with only 'replace' restricted
         self.update_stack(stack_identifier, update_template,
@@ -131,7 +126,7 @@ class UpdateRestrictedStackTest(functional_base.FunctionalTestsBase):
     def test_update_type_changed(self):
         stack_identifier = self.stack_create(template=test_template)
 
-        update_template = test_template.copy()
+        update_template = copy.deepcopy(test_template)
         rsrc = update_template['resources']['bar']
         rsrc['type'] = 'OS::Heat::None'
 
@@ -146,9 +141,6 @@ class UpdateRestrictedStackTest(functional_base.FunctionalTestsBase):
         self.assertTrue(
             self._check_for_restriction_reason(resource_events,
                                                reason_replace_restrict))
-
-        # Ensure the timestamp changes, since this will be very quick
-        time.sleep(1)
 
         # check replace fails - with only 'replace' restricted
         self.update_stack(stack_identifier, update_template,

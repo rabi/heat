@@ -14,13 +14,13 @@
 Installing OpenStack and Heat on RHEL/Fedora/CentOS
 ---------------------------------------------------
 
-Go to the `OpenStack Documentation <http://docs.openstack.org/>`_ for
-the latest version of the Installation Guide for Red Hat Enterprise
-Linux, CentOS and Fedora which includes a chapter on installing the
-Orchestration module (Heat).
+Go to the `OpenStack Documentation
+<https://docs.openstack.org/#install-guides>`_ for the latest version of the
+Installation Guide for Red Hat Enterprise Linux, CentOS and Fedora which
+includes a chapter on installing the Orchestration module (Heat).
 
-There are instructions for `installing the RDO OpenStack distribution
-<https://www.rdoproject.org/Quickstart>`_ on Fedora and CentOS.
+There are instructions for `installing the RDO OpenStack
+<https://www.rdoproject.org/install/tripleo/>`_ on Fedora and CentOS.
 
 If installing with packstack, you can install heat by specifying
 ``--os-heat-install=y`` in your packstack invocation, or setting

@@ -12,7 +12,6 @@ Heat services
    heat-engine
    heat-api
    heat-api-cfn
-   heat-api-cloudwatch
 
 --------------
 Heat utilities
@@ -23,5 +22,5 @@ Heat utilities
 
    heat-manage
    heat-db-setup
-   heat-keystone-setup
    heat-keystone-setup-domain
+   heat-status

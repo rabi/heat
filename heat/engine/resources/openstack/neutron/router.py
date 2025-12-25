@@ -11,8 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import attributes
@@ -33,12 +31,16 @@ class Router(neutron.NeutronResource):
 
     required_service_extension = 'router'
 
+    entity = 'router'
+
     PROPERTIES = (
         NAME, EXTERNAL_GATEWAY, VALUE_SPECS, ADMIN_STATE_UP,
-        L3_AGENT_ID, L3_AGENT_IDS, DISTRIBUTED, HA,
+        L3_AGENT_ID, L3_AGENT_IDS, DISTRIBUTED, HA, AVAILABILITY_ZONE_HINTS,
+        TAGS, TENANT_ID,
     ) = (
         'name', 'external_gateway_info', 'value_specs', 'admin_state_up',
-        'l3_agent_id', 'l3_agent_ids', 'distributed', 'ha'
+        'l3_agent_id', 'l3_agent_ids', 'distributed', 'ha',
+        'availability_zone_hints', 'tags', 'tenant_id',
     )
 
     _EXTERNAL_GATEWAY_KEYS = (
@@ -171,6 +173,27 @@ class Router(neutron.NeutronResource):
               'do not support distributed and ha at the same time.'),
             support_status=support.SupportStatus(version='2015.1')
         ),
+        AVAILABILITY_ZONE_HINTS: properties.Schema(
+            properties.Schema.LIST,
+            _('Availability zone candidates for the router. It requires the '
+              'availability_zone extension to be available.'),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='19.0.0')
+        ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('The tags to be added to the router.'),
+            schema=properties.Schema(properties.Schema.STRING),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='9.0.0')
+        ),
+        TENANT_ID: properties.Schema(
+            properties.Schema.STRING,
+            _('The ID of the tenant which will own the router. Only '
+              'administrative users can set the tenant identifier; this '
+              'cannot be changed using authorization policies.'),
+            support_status=support.SupportStatus(version='24.0.0')
+        ),
     }
 
     attributes_schema = {
@@ -197,23 +220,26 @@ class Router(neutron.NeutronResource):
     }
 
     def translation_rules(self, props):
+        client_plugin = self.client_plugin()
         rules = [
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.EXTERNAL_GATEWAY, self.EXTERNAL_GATEWAY_NETWORK],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='network'),
+                entity=client_plugin.RES_TYPE_NETWORK
+            ),
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.EXTERNAL_GATEWAY, self.EXTERNAL_GATEWAY_FIXED_IPS,
                  self.SUBNET],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='subnet')
-            ]
+                entity=client_plugin.RES_TYPE_SUBNET
+            ),
+        ]
         if props.get(self.L3_AGENT_ID):
             rules.extend([
                 translation.TranslationRule(
@@ -254,9 +280,14 @@ class Router(neutron.NeutronResource):
         external_gw = self.properties[self.EXTERNAL_GATEWAY]
         if external_gw:
             external_gw_net = external_gw.get(self.EXTERNAL_GATEWAY_NETWORK)
-            for res in six.itervalues(self.stack):
+            for res in self.stack.values():
                 if res.has_interface('OS::Neutron::Subnet'):
-                    subnet_net = res.properties.get(subnet.Subnet.NETWORK)
+                    try:
+                        subnet_net = res.properties.get(subnet.Subnet.NETWORK)
+                    except (ValueError, TypeError):
+                        # Properties errors will be caught later in validation,
+                        # where we can report them in their proper context.
+                        continue
                     if subnet_net == external_gw_net:
                         deps += (self, res)
 
@@ -283,7 +314,7 @@ class Router(neutron.NeutronResource):
     def _resolve_subnet(self, gateway):
         external_gw_fixed_ips = gateway[self.EXTERNAL_GATEWAY_FIXED_IPS]
         for fixed_ip in external_gw_fixed_ips:
-            for key, value in six.iteritems(fixed_ip):
+            for key, value in fixed_ip.copy().items():
                 if value is None:
                     fixed_ip.pop(key)
             if self.SUBNET in fixed_ip:
@@ -295,16 +326,15 @@ class Router(neutron.NeutronResource):
             self.physical_resource_name())
         self._resolve_gateway(props)
         l3_agent_ids = self._get_l3_agent_list(props)
+        tags = props.pop(self.TAGS, [])
 
         router = self.client().create_router({'router': props})['router']
         self.resource_id_set(router['id'])
 
         if l3_agent_ids:
             self._replace_agent(l3_agent_ids)
-
-    def _show_resource(self):
-        return self.client().show_router(
-            self.resource_id)['router']
+        if tags:
+            self.set_tags(tags)
 
     def check_create_complete(self, *args):
         attributes = self._show_resource()
@@ -326,6 +356,10 @@ class Router(neutron.NeutronResource):
             l3_agent_ids = self._get_l3_agent_list(prop_diff)
             self._replace_agent(l3_agent_ids)
 
+        if self.TAGS in prop_diff:
+            tags = prop_diff.pop(self.TAGS)
+            self.set_tags(tags)
+
         if prop_diff:
             self.prepare_update_properties(prop_diff)
             self.client().update_router(
@@ -341,6 +375,27 @@ class Router(neutron.NeutronResource):
             for l3_agent_id in l3_agent_ids:
                 self.client().add_router_to_l3_agent(
                     l3_agent_id, {'router_id': self.resource_id})
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        result = super(Router, self).parse_live_resource_data(
+            resource_properties, resource_data)
+
+        try:
+            ret = self.client().list_l3_agent_hosting_routers(self.resource_id)
+            if ret:
+                result[self.L3_AGENT_IDS] = list(
+                    agent['id'] for agent in ret['agents'])
+        except self.client_plugin().exceptions.Forbidden:
+            # Just pass if forbidden
+            pass
+
+        gateway = resource_data.get(self.EXTERNAL_GATEWAY)
+        if gateway is not None:
+            result[self.EXTERNAL_GATEWAY] = {
+                self.EXTERNAL_GATEWAY_NETWORK: gateway.get('network_id'),
+                self.EXTERNAL_GATEWAY_ENABLE_SNAT: gateway.get('enable_snat')
+            }
+        return result
 
 
 class RouterInterface(neutron.NeutronResource):
@@ -434,6 +489,7 @@ class RouterInterface(neutron.NeutronResource):
     }
 
     def translation_rules(self, props):
+        client_plugin = self.client_plugin()
         return [
             translation.TranslationRule(
                 props,
@@ -457,25 +513,25 @@ class RouterInterface(neutron.NeutronResource):
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.PORT],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='port'
+                entity=client_plugin.RES_TYPE_PORT
             ),
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.ROUTER],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='router'
+                entity=client_plugin.RES_TYPE_ROUTER
             ),
             translation.TranslationRule(
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.SUBNET],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='subnet'
+                entity=client_plugin.RES_TYPE_SUBNET
             )
 
 
@@ -553,9 +609,14 @@ class RouterGateway(neutron.NeutronResource):
         NETWORK_ID: properties.Schema(
             properties.Schema.STRING,
             support_status=support.SupportStatus(
-                status=support.DEPRECATED,
+                status=support.HIDDEN,
                 message=_('Use property %s.') % NETWORK,
-                version='2014.2'),
+                version='9.0.0',
+                previous_status=support.SupportStatus(
+                    status=support.DEPRECATED,
+                    version='2014.2'
+                )
+            ),
             constraints=[
                 constraints.CustomConstraint('neutron.network')
             ],
@@ -571,6 +632,7 @@ class RouterGateway(neutron.NeutronResource):
     }
 
     def translation_rules(self, props):
+        client_plugin = self.client_plugin()
         return [
             translation.TranslationRule(
                 props,
@@ -582,36 +644,39 @@ class RouterGateway(neutron.NeutronResource):
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.NETWORK],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='network'
+                entity=client_plugin.RES_TYPE_NETWORK
             )
 
         ]
 
     def add_dependencies(self, deps):
         super(RouterGateway, self).add_dependencies(deps)
-        for resource in six.itervalues(self.stack):
+        for resource in self.stack.values():
             # depend on any RouterInterface in this template with the same
             # router_id as this router_id
             if resource.has_interface('OS::Neutron::RouterInterface'):
-                # Since RouterInterface translates router_id property to
-                # router, we should correctly resolve it for RouterGateway.
-                dep_router_id = self.client_plugin().resolve_router({
-                    RouterInterface.ROUTER: resource.properties.get(
-                        RouterInterface.ROUTER),
-                    RouterInterface.ROUTER_ID: None}, RouterInterface.ROUTER,
-                    RouterInterface.ROUTER_ID)
-                router_id = self.properties[self.ROUTER_ID]
+                try:
+                    dep_router_id = resource.properties[RouterInterface.ROUTER]
+                    router_id = self.properties[self.ROUTER_ID]
+                except (ValueError, TypeError):
+                    # Properties errors will be caught later in validation,
+                    # where we can report them in their proper context.
+                    continue
                 if dep_router_id == router_id:
                     deps += (self, resource)
             # depend on any subnet in this template with the same network_id
             # as this network_id, as the gateway implicitly creates a port
             # on that subnet
             if resource.has_interface('OS::Neutron::Subnet'):
-                dep_network = resource.properties.get(
-                    subnet.Subnet.NETWORK)
-                network = self.properties[self.NETWORK]
+                try:
+                    dep_network = resource.properties[subnet.Subnet.NETWORK]
+                    network = self.properties[self.NETWORK]
+                except (ValueError, TypeError):
+                    # Properties errors will be caught later in validation,
+                    # where we can report them in their proper context.
+                    continue
                 if dep_network == network:
                     deps += (self, resource)
 

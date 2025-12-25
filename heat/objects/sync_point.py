@@ -11,9 +11,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-
 """SyncPoint object."""
-
 
 from oslo_versionedobjects import base
 from oslo_versionedobjects import fields

@@ -12,20 +12,16 @@
 #    under the License.
 
 import copy
-
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import grouputils
-from heat.common import short_id
 from heat.common import template_format
-from heat.engine.clients.os import neutron
 from heat.engine import resource
 from heat.engine.resources.openstack.heat import instance_group as instgrp
 from heat.engine import rsrc_defn
 from heat.engine import scheduler
-from heat.engine import stack as parser
+from heat.engine import stk_defn
 from heat.tests.autoscaling import inline_templates
 from heat.tests import common
 from heat.tests import utils
@@ -62,7 +58,7 @@ class TestInstanceGroup(common.HeatTestCase):
         self.assertEqual(expected, self.instance_group.child_params())
 
     def test_tags_default(self):
-        expected = [{'Value': u'asg',
+        expected = [{'Value': 'asg',
                      'Key': 'metering.groupname'}]
         self.assertEqual(expected, self.instance_group._tags())
 
@@ -70,7 +66,7 @@ class TestInstanceGroup(common.HeatTestCase):
         self.instance_group.properties.data['Tags'] = [
             {'Key': 'fee', 'Value': 'foo'}]
         expected = [{'Key': 'fee', 'Value': 'foo'},
-                    {'Value': u'asg',
+                    {'Value': 'asg',
                      'Key': 'metering.groupname'}]
         self.assertEqual(expected, self.instance_group._tags())
 
@@ -86,14 +82,14 @@ class TestInstanceGroup(common.HeatTestCase):
         props['LaunchConfigurationName'] = 'JobServerConfig'
         error = self.assertRaises(ValueError, self.instance_group.validate)
         self.assertIn('(JobServerConfig) reference can not be found',
-                      six.text_type(error))
+                      str(error))
         # test resource name of instance group not WebServerGroup, so no ref
         props['LaunchConfigurationName'] = 'LaunchConfig'
         error = self.assertRaises(ValueError, self.instance_group.validate)
         self.assertIn('LaunchConfigurationName (LaunchConfig) requires a '
                       'reference to the configuration not just the '
                       'name of the resource.',
-                      six.text_type(error))
+                      str(error))
         # test validate ok if change instance_group name to 'WebServerGroup'
         self.instance_group.name = 'WebServerGroup'
         self.instance_group.validate()
@@ -134,9 +130,36 @@ class TestInstanceGroup(common.HeatTestCase):
         self.instance_group.resize.assert_called_once_with(5)
 
     def test_attributes(self):
+        get_output = mock.Mock(return_value={'z': '2.1.3.1',
+                                             'x': '2.1.3.2',
+                                             'c': '2.1.3.3'})
+        self.instance_group.get_output = get_output
+        inspector = self.instance_group._group_data()
+        inspector.member_names = mock.Mock(return_value=['z', 'x', 'c'])
+        res = self.instance_group._resolve_attribute('InstanceList')
+        self.assertEqual('2.1.3.1,2.1.3.2,2.1.3.3', res)
+        get_output.assert_called_once_with('InstanceList')
+
+    def test_attributes_format_fallback(self):
+        self.instance_group.get_output = mock.Mock(return_value=['2.1.3.2',
+                                                                 '2.1.3.1',
+                                                                 '2.1.3.3'])
         mock_members = self.patchobject(grouputils, 'get_members')
         instances = []
-        for ip_ex in six.moves.range(1, 4):
+        for ip_ex in range(1, 4):
+            inst = mock.Mock()
+            inst.FnGetAtt.return_value = '2.1.3.%d' % ip_ex
+            instances.append(inst)
+        mock_members.return_value = instances
+        res = self.instance_group._resolve_attribute('InstanceList')
+        self.assertEqual('2.1.3.1,2.1.3.2,2.1.3.3', res)
+
+    def test_attributes_fallback(self):
+        self.instance_group.get_output = mock.Mock(
+            side_effect=exception.NotFound)
+        mock_members = self.patchobject(grouputils, 'get_members')
+        instances = []
+        for ip_ex in range(1, 4):
             inst = mock.Mock()
             inst.FnGetAtt.return_value = '2.1.3.%d' % ip_ex
             instances.append(inst)
@@ -146,12 +169,9 @@ class TestInstanceGroup(common.HeatTestCase):
 
     def test_instance_group_refid_rsrc_name(self):
         self.instance_group.id = '123'
-
         self.instance_group.uuid = '9bfb9456-3fe8-41f4-b318-9dba18eeef74'
         self.instance_group.action = 'CREATE'
-        expected = '%s-%s-%s' % (self.instance_group.stack.name,
-                                 self.instance_group.name,
-                                 short_id.get_id(self.instance_group.uuid))
+        expected = self.instance_group.name
         self.assertEqual(expected, self.instance_group.FnGetRefId())
 
     def test_instance_group_refid_rsrc_id(self):
@@ -228,113 +248,70 @@ class LoadbalancerReloadTest(common.HeatTestCase):
              "LoadBalancerNames": ["ElasticLoadBalancer"]})
         group = instgrp.InstanceGroup('asg', defn, stack)
 
-        mock_members = self.patchobject(grouputils, 'get_member_refids')
-        mock_members.return_value = ['aaaa', 'bbb']
+        mocks = self.setup_mocks(group, ['aaaa', 'bbb'])
         expected = rsrc_defn.ResourceDefinition(
             'ElasticLoadBalancer',
             'AWS::ElasticLoadBalancing::LoadBalancer',
             {'Instances': ['aaaa', 'bbb'],
-             'Listeners': [{'InstancePort': u'80',
-                            'LoadBalancerPort': u'80',
+             'Listeners': [{'InstancePort': '80',
+                            'LoadBalancerPort': '80',
                             'Protocol': 'HTTP'}],
-             'AvailabilityZones': ['nova']},
-            metadata={},
-            deletion_policy='Delete'
+             'AvailabilityZones': ['nova']}
         )
 
         group._lb_reload()
-        mock_members.assert_called_once_with(group, exclude=[])
+        self.check_mocks(group, mocks)
         lb.update.assert_called_once_with(expected)
-
-    def test_members(self):
-        self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
-                         return_value=True)
-
-        t = template_format.parse(inline_templates.as_template)
-        t['Resources']['ElasticLoadBalancer'] = {
-            'Type': 'OS::Neutron::LoadBalancer',
-            'Properties': {
-                'protocol_port': 8080,
-            }
-        }
-        stack = utils.parse_stack(t)
-
-        lb = stack['ElasticLoadBalancer']
-        lb.update = mock.Mock(return_value=None)
-
-        defn = rsrc_defn.ResourceDefinition(
-            'asg', 'OS::Heat::InstanceGroup',
-            {'Size': 2,
-             'AvailabilityZones': ['zoneb'],
-             "LaunchConfigurationName": "LaunchConfig",
-             "LoadBalancerNames": ["ElasticLoadBalancer"]})
-        group = instgrp.InstanceGroup('asg', defn, stack)
-
-        mock_members = self.patchobject(grouputils, 'get_member_refids')
-        mock_members.return_value = ['aaaa', 'bbb']
-        expected = rsrc_defn.ResourceDefinition(
-            'ElasticLoadBalancer',
-            'OS::Neutron::LoadBalancer',
-            {'protocol_port': 8080,
-             'members': ['aaaa', 'bbb']},
-            metadata={},
-            deletion_policy='Delete')
-
-        group._lb_reload()
-        mock_members.assert_called_once_with(group, exclude=[])
-        lb.update.assert_called_once_with(expected)
-
-    def test_lb_reload_invalid_resource(self):
-        t = template_format.parse(inline_templates.as_template)
-        t['Resources']['ElasticLoadBalancer'] = {
-            'Type': 'AWS::EC2::Volume',
-            'Properties': {
-                'AvailabilityZone': 'nova'
-            }
-        }
-        stack = utils.parse_stack(t)
-
-        lb = stack['ElasticLoadBalancer']
-        lb.update = mock.Mock(return_value=None)
-
-        defn = rsrc_defn.ResourceDefinition(
-            'asg', 'OS::Heat::InstanceGroup',
-            {'Size': 2,
-             'AvailabilityZones': ['zoneb'],
-             "LaunchConfigurationName": "LaunchConfig",
-             "LoadBalancerNames": ["ElasticLoadBalancer"]})
-        group = instgrp.InstanceGroup('asg', defn, stack)
-
-        mock_members = self.patchobject(grouputils, 'get_member_refids')
-        mock_members.return_value = ['aaaa', 'bbb']
-
-        error = self.assertRaises(exception.Error,
-                                  group._lb_reload)
-        self.assertEqual(
-            "Unsupported resource 'ElasticLoadBalancer' in "
-            "LoadBalancerNames",
-            six.text_type(error))
 
     def test_lb_reload_static_resolve(self):
         t = template_format.parse(inline_templates.as_template)
         properties = t['Resources']['ElasticLoadBalancer']['Properties']
         properties['AvailabilityZones'] = {'Fn::GetAZs': ''}
 
-        self.patchobject(parser.Stack, 'get_availability_zones',
+        self.patchobject(stk_defn.StackDefinition, 'get_availability_zones',
                          return_value=['abc', 'xyz'])
-
-        mock_members = self.patchobject(grouputils, 'get_member_refids')
-        mock_members.return_value = ['aaaabbbbcccc']
 
         stack = utils.parse_stack(t, params=inline_templates.as_params)
         lb = stack['ElasticLoadBalancer']
         lb.state_set(lb.CREATE, lb.COMPLETE)
         lb.handle_update = mock.Mock(return_value=None)
         group = stack['WebServerGroup']
+        self.setup_mocks(group, ['aaaabbbbcccc'])
         group._lb_reload()
         lb.handle_update.assert_called_once_with(
             mock.ANY, mock.ANY,
             {'Instances': ['aaaabbbbcccc']})
+
+    def setup_mocks(self, group, member_refids):
+        refs = {str(i): r for i, r in enumerate(member_refids)}
+        group.get_output = mock.Mock(return_value=refs)
+        names = sorted(refs.keys())
+        group_data = group._group_data()
+        group_data.member_names = mock.Mock(return_value=names)
+        group._group_data = mock.Mock(return_value=group_data)
+
+    def check_mocks(self, group, unused):
+        pass
+
+
+class LoadbalancerReloadFallbackTest(LoadbalancerReloadTest):
+    def setup_mocks(self, group, member_refids):
+        # Raise NotFound when getting output, to force fallback to old-school
+        # grouputils functions
+        group.get_output = mock.Mock(side_effect=exception.NotFound)
+
+        def make_mock_member(refid):
+            mem = mock.Mock()
+            mem.FnGetRefId = mock.Mock(return_value=refid)
+            return mem
+
+        members = [make_mock_member(r) for r in member_refids]
+        mock_members = self.patchobject(grouputils, 'get_members',
+                                        return_value=members)
+        return mock_members
+
+    def check_mocks(self, group, mock_members):
+        mock_members.assert_called_once_with(group)
 
 
 class InstanceGroupWithNestedStack(common.HeatTestCase):
@@ -342,12 +319,12 @@ class InstanceGroupWithNestedStack(common.HeatTestCase):
         super(InstanceGroupWithNestedStack, self).setUp()
         t = template_format.parse(inline_templates.as_template)
         self.stack = utils.parse_stack(t, params=inline_templates.as_params)
-        lc = self.create_launch_config(t, self.stack)
-        lcid = lc.FnGetRefId()
+        self.create_launch_config(t, self.stack)
+        wsg_props = self.stack['WebServerGroup'].t._properties
         self.defn = rsrc_defn.ResourceDefinition(
             'asg', 'OS::Heat::InstanceGroup',
             {'Size': 2, 'AvailabilityZones': ['zoneb'],
-             'LaunchConfigurationName': lcid})
+             'LaunchConfigurationName': wsg_props['LaunchConfigurationName']})
         self.group = instgrp.InstanceGroup('asg', self.defn, self.stack)
 
         self.group._lb_reload = mock.Mock()
@@ -390,7 +367,10 @@ class ReplaceTest(InstanceGroupWithNestedStack):
 
     def setUp(self):
         super(ReplaceTest, self).setUp()
-        self.group._nested = self.get_fake_nested_stack(2)
+        nested = self.get_fake_nested_stack(2)
+        inspector = self.group._group_data()
+        inspector.size = mock.Mock(return_value=2)
+        inspector.template = mock.Mock(return_value=nested.defn._template)
 
     def test_rolling_updates(self):
         self.group._replace(self.min_in_service, self.batch_size, 0)
@@ -411,63 +391,65 @@ class ResizeWithFailedInstancesTest(InstanceGroupWithNestedStack):
 
     def setUp(self):
         super(ResizeWithFailedInstancesTest, self).setUp()
-        self.group._nested = self.get_fake_nested_stack(4)
-        self.nested = self.group.nested()
-        self.group.nested = mock.Mock(return_value=self.nested)
+        nested = self.get_fake_nested_stack(4)
 
-    def set_failed_instance(self, instance):
-        for r in six.itervalues(self.group.nested()):
-            if r.name == instance:
-                r.status = "FAILED"
+        inspector = mock.Mock(spec=grouputils.GroupInspector)
+        self.patchobject(grouputils.GroupInspector, 'from_parent_resource',
+                         return_value=inspector)
+        inspector.member_names.return_value = (self.failed +
+                                               sorted(self.content -
+                                                      set(self.failed)))
+        inspector.template.return_value = nested.defn._template
 
     def test_resize(self):
-        for inst in self.failed:
-            self.set_failed_instance(inst)
         self.group.resize(self.size)
         tmpl = self.group.update_with_template.call_args[0][0]
-        resources = tmpl.resource_definitions(self.group.nested())
-        self.assertEqual(set(resources.keys()), self.content)
+        resources = tmpl.resource_definitions(None)
+        self.assertEqual(self.content, set(resources.keys()))
 
 
 class TestGetBatches(common.HeatTestCase):
 
     scenarios = [
-        ('4_1_0', dict(curr_cap=4, bat_size=1, min_serv=0,
-                       batches=[(4, 1)] * 4)),
-        ('4_1_4', dict(curr_cap=4, bat_size=1, min_serv=4,
-                       batches=([(5, 1)] * 4) + [(4, 0)])),
-        ('4_1_5', dict(curr_cap=4, bat_size=1, min_serv=5,
-                       batches=([(5, 1)] * 4) + [(4, 0)])),
-        ('4_2_0', dict(curr_cap=4, bat_size=2, min_serv=0,
-                       batches=[(4, 2)] * 2)),
-        ('4_2_4', dict(curr_cap=4, bat_size=2, min_serv=4,
-                       batches=([(6, 2)] * 2) + [(4, 0)])),
-        ('5_2_0', dict(curr_cap=5, bat_size=2, min_serv=0,
-                       batches=([(5, 2)] * 2) + [(5, 1)])),
-        ('5_2_4', dict(curr_cap=5, bat_size=2, min_serv=4,
-                       batches=([(6, 2)] * 2) + [(5, 1)])),
-        ('3_2_0', dict(curr_cap=3, bat_size=2, min_serv=0,
-                       batches=[(3, 2), (3, 1)])),
-        ('3_2_4', dict(curr_cap=3, bat_size=2, min_serv=4,
-                       batches=[(5, 2), (4, 1), (3, 0)])),
-        ('4_4_0', dict(curr_cap=4, bat_size=4, min_serv=0,
-                       batches=[(4, 4)])),
-        ('4_5_0', dict(curr_cap=4, bat_size=5, min_serv=0,
-                       batches=[(4, 4)])),
-        ('4_4_1', dict(curr_cap=4, bat_size=4, min_serv=1,
-                       batches=[(5, 4), (4, 0)])),
-        ('4_6_1', dict(curr_cap=4, bat_size=6, min_serv=1,
-                       batches=[(5, 4), (4, 0)])),
-        ('4_4_2', dict(curr_cap=4, bat_size=4, min_serv=2,
-                       batches=[(6, 4), (4, 0)])),
-        ('4_4_4', dict(curr_cap=4, bat_size=4, min_serv=4,
-                       batches=[(8, 4), (4, 0)])),
-        ('4_5_6', dict(curr_cap=4, bat_size=5, min_serv=6,
-                       batches=[(8, 4), (4, 0)])),
+        ('4_4_1_0', dict(tgt_cap=4, curr_cap=4, bat_size=1, min_serv=0,
+                         batches=[(4, 1)] * 4)),
+        ('3_4_1_0', dict(tgt_cap=3, curr_cap=4, bat_size=1, min_serv=0,
+                         batches=[(3, 1)] * 3)),
+        ('4_4_1_4', dict(tgt_cap=4, curr_cap=4, bat_size=1, min_serv=4,
+                         batches=([(5, 1)] * 4) + [(4, 0)])),
+        ('4_4_1_5', dict(tgt_cap=4, curr_cap=4, bat_size=1, min_serv=5,
+                         batches=([(5, 1)] * 4) + [(4, 0)])),
+        ('4_4_2_0', dict(tgt_cap=4, curr_cap=4, bat_size=2, min_serv=0,
+                         batches=[(4, 2)] * 2)),
+        ('4_4_2_4', dict(tgt_cap=4, curr_cap=4, bat_size=2, min_serv=4,
+                         batches=([(6, 2)] * 2) + [(4, 0)])),
+        ('5_5_2_0', dict(tgt_cap=5, curr_cap=5, bat_size=2, min_serv=0,
+                         batches=([(5, 2)] * 2) + [(5, 1)])),
+        ('5_5_2_4', dict(tgt_cap=5, curr_cap=5, bat_size=2, min_serv=4,
+                         batches=([(6, 2)] * 2) + [(5, 1)])),
+        ('3_3_2_0', dict(tgt_cap=3, curr_cap=3, bat_size=2, min_serv=0,
+                         batches=[(3, 2), (3, 1)])),
+        ('3_3_2_4', dict(tgt_cap=3, curr_cap=3, bat_size=2, min_serv=4,
+                         batches=[(5, 2), (4, 1), (3, 0)])),
+        ('4_4_4_0', dict(tgt_cap=4, curr_cap=4, bat_size=4, min_serv=0,
+                         batches=[(4, 4)])),
+        ('4_4_5_0', dict(tgt_cap=4, curr_cap=4, bat_size=5, min_serv=0,
+                         batches=[(4, 4)])),
+        ('4_4_4_1', dict(tgt_cap=4, curr_cap=4, bat_size=4, min_serv=1,
+                         batches=[(5, 4), (4, 0)])),
+        ('4_4_6_1', dict(tgt_cap=4, curr_cap=4, bat_size=6, min_serv=1,
+                         batches=[(5, 4), (4, 0)])),
+        ('4_4_4_2', dict(tgt_cap=4, curr_cap=4, bat_size=4, min_serv=2,
+                         batches=[(6, 4), (4, 0)])),
+        ('4_4_4_4', dict(tgt_cap=4, curr_cap=4, bat_size=4, min_serv=4,
+                         batches=[(8, 4), (4, 0)])),
+        ('4_4_5_6', dict(tgt_cap=4, curr_cap=4, bat_size=5, min_serv=6,
+                         batches=[(8, 4), (4, 0)])),
     ]
 
     def test_get_batches(self):
-        batches = list(instgrp.InstanceGroup._get_batches(self.curr_cap,
+        batches = list(instgrp.InstanceGroup._get_batches(self.tgt_cap,
+                                                          self.curr_cap,
                                                           self.bat_size,
                                                           self.min_serv))
         self.assertEqual(self.batches, batches)

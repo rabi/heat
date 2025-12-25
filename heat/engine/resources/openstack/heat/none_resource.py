@@ -11,7 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
 import uuid
 
 from heat.engine import properties
@@ -32,23 +31,39 @@ class NoneResource(resource.Resource):
     properties_schema = {}
     attributes_schema = {}
 
+    IS_PLACEHOLDER = 'is_placeholder'
+
     def _needs_update(self, after, before, after_props, before_props,
                       prev_resource, check_init_complete=True):
         return False
 
-    def reparse(self, translate=True, client_resolve=True):
+    def frozen_definition(self):
+        return self.t.freeze(
+            properties=properties.Properties(schema={}, data={}))
+
+    def reparse(self, client_resolve=True):
         self.properties = properties.Properties(schema={}, data={})
-        if translate:
-            self.translate_properties(self.properties, client_resolve)
+        self.translate_properties(self.properties, client_resolve)
 
     def handle_create(self):
-        self.resource_id_set(six.text_type(uuid.uuid4()))
+        self.resource_id_set(str(uuid.uuid4()))
+        # set is_placeholder flag when resource trying to replace original
+        # resource with a placeholder resource.
+        self.data_set(self.IS_PLACEHOLDER, 'True')
 
     def validate(self):
         pass
 
     def get_attribute(self, key, *path):
         return None
+
+    def handle_delete(self):
+        # Will not triger the delete method in client if this is not
+        # a placeholder resource.
+        if not self.data().get(self.IS_PLACEHOLDER):
+            return super(NoneResource, self).handle_delete()
+
+        return self.resource_id
 
 
 def resource_mapping():

@@ -14,11 +14,9 @@
 import collections
 
 from oslo_log import log as logging
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.engine.resources import signal_responder
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +40,15 @@ class BaseWaitConditionHandle(signal_responder.SignalResponder):
         'SUCCESS',
     )
 
+    def _get_ec2_signed_url(self, signal_type=signal_responder.WAITCONDITION):
+        stored = self.data().get('ec2_signed_url')
+        if stored is not None:
+            return stored
+        url = super(BaseWaitConditionHandle,
+                    self)._get_ec2_signed_url(signal_type)
+        self.data_set('ec2_signed_url', url)
+        return url
+
     def handle_create(self):
         super(BaseWaitConditionHandle, self).handle_create()
         self.resource_id_set(self._get_user_id())
@@ -50,7 +57,7 @@ class BaseWaitConditionHandle(signal_responder.SignalResponder):
         return status in self.WAIT_STATUSES
 
     def _metadata_format_ok(self, metadata):
-        if not isinstance(metadata, collections.Mapping):
+        if not isinstance(metadata, collections.abc.Mapping):
             return False
         if set(metadata) != set(self.METADATA_KEYS):
             return False
@@ -67,15 +74,15 @@ class BaseWaitConditionHandle(signal_responder.SignalResponder):
                                                      latest_rsrc_metadata)
 
             if not self._metadata_format_ok(signal_data):
-                LOG.info(_LI("Metadata failed validation for %s"), self.name)
+                LOG.info("Metadata failed validation for %s", self.name)
                 raise ValueError(_("Metadata format invalid"))
 
             new_entry = signal_data.copy()
-            unique_id = new_entry.pop(self.UNIQUE_ID)
+            unique_id = str(new_entry.pop(self.UNIQUE_ID))
 
             new_rsrc_metadata = latest_rsrc_metadata.copy()
             if unique_id in new_rsrc_metadata:
-                LOG.info(_LI("Overwriting Metadata item for id %s!"),
+                LOG.info("Overwriting Metadata item for id %s!",
                          unique_id)
             new_rsrc_metadata.update({unique_id: new_entry})
 
@@ -93,12 +100,12 @@ class BaseWaitConditionHandle(signal_responder.SignalResponder):
     def get_status(self):
         """Return a list of the Status values for the handle signals."""
         return [v[self.STATUS]
-                for v in six.itervalues(self.metadata_get(refresh=True))]
+                for v in self.metadata_get(refresh=True).values()]
 
     def get_status_reason(self, status):
         """Return a list of reasons associated with a particular status."""
         return [v[self.REASON]
-                for v in six.itervalues(self.metadata_get(refresh=True))
+                for v in self.metadata_get(refresh=True).values()
                 if v[self.STATUS] == status]
 
 

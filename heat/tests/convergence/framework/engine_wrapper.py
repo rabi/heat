@@ -11,8 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from heat.db import api as db_api
 from heat.engine import service
 from heat.engine import stack
@@ -25,16 +23,16 @@ from heat.tests import utils
 class SynchronousThreadGroupManager(service.ThreadGroupManager):
     """Wrapper for thread group manager.
 
-    The start method of thread group manager needs to be overriden to
-    run the function synchronously so that the convergence scenario
-    tests can run.
+    The start method of thread group manager needs to be overridden to
+    run the function synchronously so the convergence scenario
+    tests can be run.
     """
     def start(self, stack_id, func, *args, **kwargs):
         func(*args, **kwargs)
 
 
 class Engine(message_processor.MessageProcessor):
-    """Wrapper to the engine service.
+    """Wrapper for the engine service.
 
     Methods of this class will be called from the scenario tests.
     """
@@ -49,20 +47,20 @@ class Engine(message_processor.MessageProcessor):
         """Converts the scenario template into hot template."""
         hot_tmpl = {"heat_template_version": "2013-05-23"}
         resources = {}
-        for res_name, res_def in six.iteritems(scenario_tmpl.resources):
+        for res_name, res_def in scenario_tmpl.resources.items():
             props = getattr(res_def, 'properties')
             depends = getattr(res_def, 'depends_on')
             res_defn = {"type": "OS::Heat::TestResource"}
             if props:
                 props_def = {}
                 for prop_name, prop_value in props.items():
-                    if type(prop_value) == scenario_template.GetRes:
-                        prop_res = getattr(prop_value, "target_name")
-                        prop_value = {'get_resource': prop_res}
-                    elif type(prop_value) == scenario_template.GetAtt:
+                    if isinstance(prop_value, scenario_template.GetAtt):
                         prop_res = getattr(prop_value, "target_name")
                         prop_attr = getattr(prop_value, "attr")
                         prop_value = {'get_attr': [prop_res, prop_attr]}
+                    elif isinstance(prop_value, scenario_template.GetRes):
+                        prop_res = getattr(prop_value, "target_name")
+                        prop_value = {'get_resource': prop_res}
                     props_def[prop_name] = prop_value
                 res_defn["properties"] = props_def
             if depends:
@@ -114,4 +112,5 @@ class Engine(message_processor.MessageProcessor):
         cntxt = utils.dummy_context()
         db_stack = db_api.stack_get_by_name(cntxt, stack_name)
         stk = stack.Stack.load(cntxt, stack=db_stack)
+        stk.thread_group_mgr = SynchronousThreadGroupManager()
         stk.rollback()

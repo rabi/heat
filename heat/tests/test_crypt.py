@@ -12,7 +12,6 @@
 #    under the License.
 
 from oslo_config import cfg
-import six
 
 from heat.common import config
 from heat.common import crypt
@@ -30,10 +29,47 @@ class CryptTest(common.HeatTestCase):
 
     def test_init_auth_encryption_key_length(self):
         """Test for length of the auth_encryption_length in config file"""
-        cfg.CONF.set_override('auth_encryption_key', 'abcdefghijklma',
-                              enforce_type=True)
+        cfg.CONF.set_override('auth_encryption_key', 'abcdefghijklma')
         err = self.assertRaises(exception.Error,
                                 config.startup_sanity_check)
         exp_msg = ('heat.conf misconfigured, auth_encryption_key '
                    'must be 32 characters')
-        self.assertIn(exp_msg, six.text_type(err))
+        self.assertIn(exp_msg, str(err))
+
+    def _test_encrypt_decrypt_dict(self, encryption_key=None):
+        data = {'p1': 'happy',
+                '2': ['a', 'little', 'blue'],
+                'p3': {'really': 'exited', 'ok int': 9},
+                '4': '',
+                'p5': True,
+                '6': 7}
+        encrypted_data = crypt.encrypted_dict(data, encryption_key)
+        for k in encrypted_data:
+            self.assertEqual('cryptography_decrypt_v1',
+                             encrypted_data[k][0])
+            self.assertEqual(2, len(encrypted_data[k]))
+        # the keys remain the same
+        self.assertEqual(set(data), set(encrypted_data))
+
+        decrypted_data = crypt.decrypted_dict(encrypted_data, encryption_key)
+        self.assertEqual(data, decrypted_data)
+
+    def test_encrypt_decrypt_dict_custom_enc_key(self):
+        self._test_encrypt_decrypt_dict('just for testing not so great re')
+
+    def test_encrypt_decrypt_dict_default_enc_key(self):
+        self._test_encrypt_decrypt_dict()
+
+    def test_decrypt_dict_invalid_key(self):
+        data = {'p1': 'happy',
+                '2': ['a', 'little', 'blue'],
+                '6': 7}
+        encrypted_data = crypt.encrypted_dict(
+            data, '767c3ed056cbaa3b9dfedb8c6f825bf0')
+        ex = self.assertRaises(exception.InvalidEncryptionKey,
+                               crypt.decrypted_dict,
+                               encrypted_data,
+                               '767c3ed056cbaa3b9dfedb8c6f825bf1')
+        self.assertEqual('Can not decrypt data with the auth_encryption_key '
+                         'in heat config.',
+                         str(ex))

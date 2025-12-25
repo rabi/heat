@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from heat.engine import worker
 from heat.tests.convergence.framework import message_processor
@@ -28,13 +28,17 @@ class Worker(message_processor.MessageProcessor):
     @message_processor.asynchronous
     def check_resource(self, ctxt, resource_id,
                        current_traversal, data,
-                       is_update, adopt_stack_data):
+                       is_update, adopt_stack_data, converge=False):
         worker.WorkerService("fake_host", "fake_topic",
                              "fake_engine", mock.Mock()).check_resource(
                                  ctxt, resource_id,
                                  current_traversal,
                                  data, is_update,
-                                 adopt_stack_data)
+                                 adopt_stack_data,
+                                 converge)
+
+    def stop_traversal(self, current_stack):
+        pass
 
     def stop_all_workers(self, current_stack):
         pass

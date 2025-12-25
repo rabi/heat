@@ -10,14 +10,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import queue
+from unittest import mock
 import uuid
 
-import eventlet.queue
-import mock
 from oslo_config import cfg
+from oslo_messaging import conffixture
 from oslo_messaging.rpc import dispatcher
-import six
 
+from heat.common import context
 from heat.common import environment_util as env_util
 from heat.common import exception
 from heat.common import messaging
@@ -26,6 +27,7 @@ from heat.common import template_format
 from heat.db import api as db_api
 from heat.engine.clients.os import glance
 from heat.engine.clients.os import nova
+from heat.engine.clients.os import swift
 from heat.engine import environment
 from heat.engine import resource
 from heat.engine import service
@@ -43,6 +45,8 @@ class ServiceStackUpdateTest(common.HeatTestCase):
 
     def setUp(self):
         super(ServiceStackUpdateTest, self).setUp()
+        self.useFixture(conffixture.ConfFixture(cfg.CONF))
+        self.patchobject(context, 'StoredContext')
         self.ctx = utils.dummy_context()
         self.man = service.EngineService('a-host', 'a-topic')
         self.man.thread_group_mgr = tools.DummyThreadGroupManager()
@@ -68,10 +72,11 @@ class ServiceStackUpdateTest(common.HeatTestCase):
 
         mock_validate = self.patchobject(stk, 'validate', return_value=None)
         msgq_mock = mock.Mock()
-        self.patchobject(eventlet.queue, 'LightQueue', return_value=msgq_mock)
+        self.patchobject(queue, 'Queue',
+                         side_effect=[msgq_mock, queue.Queue()])
 
         # do update
-        api_args = {'timeout_mins': 60}
+        api_args = {'timeout_mins': 60, rpc_api.PARAM_CONVERGE: True}
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
                                        template, params, None, api_args)
 
@@ -96,14 +101,17 @@ class ServiceStackUpdateTest(common.HeatTestCase):
             strict_validate=True,
             tenant_id='test_tenant_id',
             timeout_mins=60,
-            user_creds_id=u'1',
-            username='test_username')
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+            user_creds_id='1',
+            username='test_username',
+            converge=True
+        )
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
         mock_validate.assert_called_once_with()
 
-    def test_stack_update_with_environment_files(self):
+    def _test_stack_update_with_environment_files(self, stack_name,
+                                                  files_container=None):
         # Setup
-        stack_name = 'service_update_env_files_stack'
         params = {}
         template = '{ "Template": "data" }'
         old_stack = tools.get_stack(stack_name, self.ctx)
@@ -119,24 +127,55 @@ class ServiceStackUpdateTest(common.HeatTestCase):
         self.patchobject(templatem, 'Template', return_value=stk.t)
         self.patchobject(environment, 'Environment', return_value=stk.env)
         self.patchobject(stk, 'validate', return_value=None)
-        self.patchobject(eventlet.queue, 'LightQueue',
-                         return_value=mock.Mock())
+        self.patchobject(queue, 'Queue',
+                         side_effect=[mock.Mock(),
+                                      queue.Queue()])
 
         mock_merge = self.patchobject(env_util, 'merge_environments')
+
+        files = None
+        if files_container:
+            files = {'/env/test.yaml': "{'resource_registry': {}}"}
 
         # Test
         environment_files = ['env_1']
         self.man.update_stack(self.ctx, old_stack.identifier(),
-                              template, params, None, {},
-                              environment_files=environment_files)
-
+                              template, params, None,
+                              {rpc_api.PARAM_CONVERGE: False},
+                              environment_files=environment_files,
+                              files_container=files_container)
         # Verify
-        mock_merge.assert_called_once_with(environment_files, None,
+        mock_merge.assert_called_once_with(environment_files, files,
                                            params, mock.ANY)
+
+    def test_stack_update_with_environment_files(self):
+        stack_name = 'service_update_env_files_stack'
+        self._test_stack_update_with_environment_files(stack_name)
+
+    def test_stack_update_with_files_container(self):
+        stack_name = 'env_files_test_stack'
+        files_container = 'test_container'
+        fake_get_object = (None, "{'resource_registry': {}}")
+        fake_get_container = ({'x-container-bytes-used': 100},
+                              [{'name': '/env/test.yaml'}])
+        mock_client = mock.Mock()
+        mock_client.get_object.return_value = fake_get_object
+        mock_client.get_container.return_value = fake_get_container
+        self.patchobject(swift.SwiftClientPlugin, '_create',
+                         return_value=mock_client)
+        self._test_stack_update_with_environment_files(
+            stack_name, files_container=files_container)
+        mock_client.get_container.assert_called_with(files_container)
+        mock_client.get_object.assert_called_with(files_container,
+                                                  '/env/test.yaml')
 
     def test_stack_update_nested(self):
         stack_name = 'service_update_nested_test_stack'
-        old_stack = tools.get_stack(stack_name, self.ctx)
+        parent_stack = tools.get_stack(stack_name + '_parent', self.ctx)
+        owner_id = parent_stack.store()
+        old_stack = tools.get_stack(stack_name, self.ctx,
+                                    owner_id=owner_id, nested_depth=1,
+                                    user_creds_id=parent_stack.user_creds_id)
         sid = old_stack.store()
         old_stack.set_stack_user_project_id('1234')
         s = stack_object.Stack.get_by_id(self.ctx, sid)
@@ -153,10 +192,12 @@ class ServiceStackUpdateTest(common.HeatTestCase):
 
         mock_validate = self.patchobject(stk, 'validate', return_value=None)
         msgq_mock = mock.Mock()
-        self.patchobject(eventlet.queue, 'LightQueue', return_value=msgq_mock)
+        self.patchobject(queue, 'Queue',
+                         side_effect=[msgq_mock,
+                                      queue.Queue()])
 
         # do update
-        api_args = {'timeout_mins': 60}
+        api_args = {'timeout_mins': 60, rpc_api.PARAM_CONVERGE: False}
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
                                        None, None, None, api_args,
                                        template_id=tmpl_id)
@@ -174,16 +215,19 @@ class ServiceStackUpdateTest(common.HeatTestCase):
             prev_raw_template_id=None,
             current_deps=None,
             disable_rollback=True,
-            nested_depth=0,
-            owner_id=None,
+            nested_depth=1,
+            owner_id=owner_id,
             parent_resource=None,
             stack_user_project_id='1234',
             strict_validate=True,
             tenant_id='test_tenant_id',
             timeout_mins=60,
-            user_creds_id=u'1',
-            username='test_username')
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+            user_creds_id='1',
+            username='test_username',
+            converge=False
+        )
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
         mock_validate.assert_called_once_with()
 
     def test_stack_update_existing_parameters(self):
@@ -198,7 +242,8 @@ class ServiceStackUpdateTest(common.HeatTestCase):
                          'parameters': {'newparam': 123},
                          'resource_registry': {'resources': {}}}
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
-                    rpc_api.PARAM_EXISTING: True}
+                    rpc_api.PARAM_EXISTING: True,
+                    rpc_api.PARAM_CONVERGE: False}
         t = template_format.parse(tools.wp_template)
 
         stk = tools.get_stack(stack_name, self.ctx, with_params=True)
@@ -209,6 +254,7 @@ class ServiceStackUpdateTest(common.HeatTestCase):
         t['parameters']['newparam'] = {'type': 'number'}
         with mock.patch('heat.engine.stack.Stack') as mock_stack:
             stk.update = mock.Mock()
+            self.patchobject(service, 'NotifyEvent')
             mock_stack.load.return_value = stk
             mock_stack.validate.return_value = None
             result = self.man.update_stack(self.ctx, stk.identifier(),
@@ -223,7 +269,7 @@ class ServiceStackUpdateTest(common.HeatTestCase):
     def test_stack_update_existing_encrypted_parameters(self):
         # Create the stack with encryption enabled
         # On update encrypted_param_names should be used from existing stack
-        hidden_param_template = u'''
+        hidden_param_template = '''
 heat_template_version: 2013-05-23
 parameters:
    param2:
@@ -234,8 +280,7 @@ resources:
    a_resource:
        type: GenericResourceType
 '''
-        cfg.CONF.set_override('encrypt_parameters_and_properties', True,
-                              enforce_type=True)
+        cfg.CONF.set_override('encrypt_parameters_and_properties', True)
 
         stack_name = 'service_update_test_stack_encrypted_parameters'
         t = template_format.parse(hidden_param_template)
@@ -262,10 +307,12 @@ resources:
                          'parameters': {},
                          'resource_registry': {'resources': {}}}
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
-                    rpc_api.PARAM_EXISTING: True}
+                    rpc_api.PARAM_EXISTING: True,
+                    rpc_api.PARAM_CONVERGE: False}
 
         with mock.patch('heat.engine.stack.Stack') as mock_stack:
-            stk.update = mock.Mock()
+            loaded_stack.update = mock.Mock()
+            self.patchobject(service, 'NotifyEvent')
             mock_stack.load.return_value = loaded_stack
             mock_stack.validate.return_value = None
             result = self.man.update_stack(self.ctx, stk.identifier(),
@@ -273,10 +320,10 @@ resources:
                                            update_params,
                                            None, api_args)
             tmpl = mock_stack.call_args[0][2]
-            self.assertEqual({u'param2': u'bar'}, tmpl.env.params)
+            self.assertEqual({'param2': 'bar'}, tmpl.env.params)
             # encrypted_param_names must be passed from existing to new
             # stack otherwise the updated stack won't decrypt the params
-            self.assertEqual([u'param2'], tmpl.env.encrypted_param_names)
+            self.assertEqual(['param2'], tmpl.env.encrypted_param_names)
             self.assertEqual(stk.identifier(), result)
 
     def test_stack_update_existing_parameters_remove(self):
@@ -294,7 +341,8 @@ resources:
                          'resource_registry': {'resources': {}}}
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
                     rpc_api.PARAM_EXISTING: True,
-                    rpc_api.PARAM_CLEAR_PARAMETERS: ['removeme']}
+                    rpc_api.PARAM_CLEAR_PARAMETERS: ['removeme'],
+                    rpc_api.PARAM_CONVERGE: False}
         t = template_format.parse(tools.wp_template)
         t['parameters']['removeme'] = {'type': 'string'}
 
@@ -307,6 +355,7 @@ resources:
         t['parameters']['newparam'] = {'type': 'number'}
         with mock.patch('heat.engine.stack.Stack') as mock_stack:
             stk.update = mock.Mock()
+            self.patchobject(service, 'NotifyEvent')
             mock_stack.load.return_value = stk
             mock_stack.validate.return_value = None
             result = self.man.update_stack(self.ctx, stk.identifier(),
@@ -317,6 +366,51 @@ resources:
             self.assertEqual({'KeyName': 'test', 'newparam': 123},
                              tmpl.env.params)
             self.assertEqual(stk.identifier(), result)
+
+    def test_stack_update_with_tags(self):
+        """Test case for updating stack with tags.
+
+        Create a stack with tags, then update with/without
+        rpc_api.PARAM_EXISTING.
+        """
+        stack_name = 'service_update_test_stack_existing_tags'
+        api_args = {rpc_api.PARAM_TIMEOUT: 60,
+                    rpc_api.PARAM_EXISTING: True}
+        t = template_format.parse(tools.wp_template)
+
+        stk = utils.parse_stack(t, stack_name=stack_name, tags=['tag1'])
+        stk.set_stack_user_project_id('1234')
+        self.assertEqual(['tag1'], stk.tags)
+
+        self.patchobject(stack.Stack, 'validate')
+
+        # update keep old tags
+        _, _, updated_stack = self.man._prepare_stack_updates(
+            self.ctx, stk, t, {}, None, None, None, api_args, None)
+        self.assertEqual(['tag1'], updated_stack.tags)
+
+        # update clear old tags
+        api_args[rpc_api.STACK_TAGS] = []
+        _, _, updated_stack = self.man._prepare_stack_updates(
+            self.ctx, stk, t, {}, None, None, None, api_args, None)
+        self.assertEqual([], updated_stack.tags)
+
+        # with new tags
+        api_args[rpc_api.STACK_TAGS] = ['tag2']
+        _, _, updated_stack = self.man._prepare_stack_updates(
+            self.ctx, stk, t, {}, None, None, None, api_args, None)
+        self.assertEqual(['tag2'], updated_stack.tags)
+        api_args[rpc_api.STACK_TAGS] = ['tag3']
+        _, _, updated_stack = self.man._prepare_stack_updates(
+            self.ctx, stk, t, {}, None, None, None, api_args, None)
+        self.assertEqual(['tag3'], updated_stack.tags)
+
+        # with no PARAM_EXISTING flag and no tags
+        del api_args[rpc_api.PARAM_EXISTING]
+        del api_args[rpc_api.STACK_TAGS]
+        _, _, updated_stack = self.man._prepare_stack_updates(
+            self.ctx, stk, t, {}, None, None, None, api_args, None)
+        self.assertEqual([], updated_stack.tags)
 
     def test_stack_update_existing_registry(self):
         # Use a template with existing flag and ensure the
@@ -345,7 +439,8 @@ resources:
         update_files = {'newfoo2.yaml': 'newfoo',
                         'myother.yaml': 'myother'}
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
-                    rpc_api.PARAM_EXISTING: True}
+                    rpc_api.PARAM_EXISTING: True,
+                    rpc_api.PARAM_CONVERGE: False}
         t = template_format.parse(tools.wp_template)
 
         stk = utils.parse_stack(t, stack_name=stack_name, params=intial_params,
@@ -371,6 +466,7 @@ resources:
                           'myother.yaml': 'myother'}
         with mock.patch('heat.engine.stack.Stack') as mock_stack:
             stk.update = mock.Mock()
+            self.patchobject(service, 'NotifyEvent')
             mock_stack.load.return_value = stk
             mock_stack.validate.return_value = None
             result = self.man.update_stack(self.ctx, stk.identifier(),
@@ -401,7 +497,8 @@ resources:
                          'parameters': {},
                          'resource_registry': {}}
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
-                    rpc_api.PARAM_EXISTING: True}
+                    rpc_api.PARAM_EXISTING: True,
+                    rpc_api.PARAM_CONVERGE: False}
         t = template_format.parse(tools.wp_template)
 
         stk = utils.parse_stack(t, stack_name=stack_name, params=intial_params)
@@ -416,6 +513,7 @@ resources:
                         'resource_registry': {'resources': {}}}
         with mock.patch('heat.engine.stack.Stack') as mock_stack:
             stk.update = mock.Mock()
+            self.patchobject(service, 'NotifyEvent')
             mock_stack.load.return_value = stk
             mock_stack.validate.return_value = None
             result = self.man.update_stack(self.ctx, stk.identifier(),
@@ -451,7 +549,8 @@ resources:
 
         # do update
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
-                                       template, params, None, {})
+                                       template, params, None,
+                                       {rpc_api.PARAM_CONVERGE: False})
 
         # assertions
         self.assertEqual(old_stack.identifier(), result)
@@ -461,7 +560,8 @@ resources:
         mock_validate.assert_called_once_with()
         mock_tmpl.assert_called_once_with(template, files=None)
         mock_env.assert_called_once_with(params)
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
         mock_stack.assert_called_once_with(
             self.ctx, stk.name, stk.t,
             convergence=False,
@@ -472,8 +572,10 @@ resources:
             stack_user_project_id='1234',
             strict_validate=True,
             tenant_id='test_tenant_id', timeout_mins=1,
-            user_creds_id=u'1',
-            username='test_username')
+            user_creds_id='1',
+            username='test_username',
+            converge=False
+        )
 
     def test_stack_cancel_update_same_engine(self):
         stack_name = 'service_update_stack_test_cancel_same_engine'
@@ -482,8 +584,10 @@ resources:
         stk.disable_rollback = False
         stk.store()
 
+        self.man.engine_id = service_utils.generate_engine_id()
+
         self.patchobject(stack.Stack, 'load', return_value=stk)
-        self.patchobject(stack_lock.StackLock, 'try_acquire',
+        self.patchobject(stack_lock.StackLock, 'get_engine_id',
                          return_value=self.man.engine_id)
         self.patchobject(self.man.thread_group_mgr, 'send')
 
@@ -500,7 +604,7 @@ resources:
         stk.disable_rollback = False
         stk.store()
         self.patchobject(stack.Stack, 'load', return_value=stk)
-        self.patchobject(stack_lock.StackLock, 'try_acquire',
+        self.patchobject(stack_lock.StackLock, 'get_engine_id',
                          return_value=str(uuid.uuid4()))
         self.patchobject(service_utils, 'engine_alive',
                          return_value=True)
@@ -513,6 +617,23 @@ resources:
         self.assertRaises(dispatcher.ExpectedException,
                           self.man.stack_cancel_update,
                           self.ctx, stk.identifier())
+
+    def test_stack_cancel_update_no_lock(self):
+        stack_name = 'service_update_stack_test_cancel_same_engine'
+        stk = tools.get_stack(stack_name, self.ctx)
+        stk.state_set(stk.UPDATE, stk.IN_PROGRESS, 'test_override')
+        stk.disable_rollback = False
+        stk.store()
+
+        self.patchobject(stack.Stack, 'load', return_value=stk)
+        self.patchobject(stack_lock.StackLock, 'get_engine_id',
+                         return_value=None)
+        self.patchobject(self.man.thread_group_mgr, 'send')
+
+        self.man.stack_cancel_update(self.ctx, stk.identifier(),
+                                     cancel_with_rollback=False)
+
+        self.assertFalse(self.man.thread_group_mgr.send.called)
 
     def test_stack_cancel_update_wrong_state_fails(self):
         stack_name = 'service_update_cancel_test_stack'
@@ -528,7 +649,7 @@ resources:
         self.assertEqual(exception.NotSupported, ex.exc_info[0])
         self.assertIn("Cancelling update when stack is "
                       "UPDATE_COMPLETE",
-                      six.text_type(ex.exc_info[1]))
+                      str(ex.exc_info[1]))
 
     @mock.patch.object(stack_object.Stack, 'count_total_resources')
     def test_stack_update_equals(self, ctr):
@@ -560,9 +681,9 @@ resources:
         mock_validate = self.patchobject(stk, 'validate', return_value=None)
 
         # do update
-        cfg.CONF.set_override('max_resources_per_stack', 3, enforce_type=True)
+        cfg.CONF.set_override('max_resources_per_stack', 3)
 
-        api_args = {'timeout_mins': 60}
+        api_args = {'timeout_mins': 60, rpc_api.PARAM_CONVERGE: False}
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
                                        template, params, None, api_args)
 
@@ -584,9 +705,12 @@ resources:
             owner_id=None, parent_resource=None,
             stack_user_project_id='1234', strict_validate=True,
             tenant_id='test_tenant_id',
-            timeout_mins=60, user_creds_id=u'1',
-            username='test_username')
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+            timeout_mins=60, user_creds_id='1',
+            username='test_username',
+            converge=False
+        )
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
         mock_validate.assert_called_once_with()
 
     def test_stack_update_stack_id_equal(self):
@@ -621,7 +745,8 @@ resources:
                                      return_value=old_stack)
 
         result = self.man.update_stack(self.ctx, create_stack.identifier(),
-                                       tpl, {}, None, {})
+                                       tpl, {}, None,
+                                       {rpc_api.PARAM_CONVERGE: False})
 
         old_stack._persist_state()
         self.assertEqual((old_stack.UPDATE, old_stack.COMPLETE),
@@ -632,9 +757,11 @@ resources:
                          old_stack['A'].properties['Foo'])
 
         self.assertEqual(create_stack['A'].id, old_stack['A'].id)
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
 
     def test_stack_update_exceeds_resource_limit(self):
+        self.patchobject(context, 'StoredContext')
         stack_name = 'test_stack_update_exceeds_resource_limit'
         params = {}
         tpl = {'HeatTemplateFormatVersion': '2012-12-12',
@@ -648,15 +775,15 @@ resources:
         sid = old_stack.store()
         self.assertIsNotNone(sid)
 
-        cfg.CONF.set_override('max_resources_per_stack', 2, enforce_type=True)
+        cfg.CONF.set_override('max_resources_per_stack', 2)
 
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.man.update_stack, self.ctx,
                                old_stack.identifier(), tpl, params,
-                               None, {})
+                               None, {rpc_api.PARAM_CONVERGE: False})
         self.assertEqual(exception.RequestLimitExceeded, ex.exc_info[0])
         self.assertIn(exception.StackResourceLimitExceeded.msg_fmt,
-                      six.text_type(ex.exc_info[1]))
+                      str(ex.exc_info[1]))
 
     def test_stack_update_verify_err(self):
         stack_name = 'service_update_verify_err_test_stack'
@@ -681,7 +808,7 @@ resources:
         mock_validate = self.patchobject(stk, 'validate',
                                          side_effect=ex_expected)
         # do update
-        api_args = {'timeout_mins': 60}
+        api_args = {'timeout_mins': 60, rpc_api.PARAM_CONVERGE: False}
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.man.update_stack,
                                self.ctx, old_stack.identifier(),
@@ -700,9 +827,12 @@ resources:
             owner_id=None, parent_resource=None,
             stack_user_project_id='1234', strict_validate=True,
             tenant_id='test_tenant_id',
-            timeout_mins=60, user_creds_id=u'1',
-            username='test_username')
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+            timeout_mins=60, user_creds_id='1',
+            username='test_username',
+            converge=False
+        )
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
         mock_validate.assert_called_once_with()
 
     def test_stack_update_nonexist(self):
@@ -714,7 +844,7 @@ resources:
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.man.update_stack,
                                self.ctx, stk.identifier(), template,
-                               params, None, {})
+                               params, None, {rpc_api.PARAM_CONVERGE: False})
         self.assertEqual(exception.EntityNotFound, ex.exc_info[0])
 
     def test_stack_update_no_credentials(self):
@@ -741,14 +871,14 @@ resources:
         mock_env = self.patchobject(environment, 'Environment',
                                     return_value=stk.env)
 
-        api_args = {'timeout_mins': 60}
+        api_args = {'timeout_mins': 60, rpc_api.PARAM_CONVERGE: False}
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.man.update_stack, self.ctx,
                                stk.identifier(),
                                template, params, None, api_args)
         self.assertEqual(exception.MissingCredentialError, ex.exc_info[0])
         self.assertEqual('Missing required credential: X-Auth-Key',
-                         six.text_type(ex.exc_info[1]))
+                         str(ex.exc_info[1]))
 
         mock_get.assert_called_once_with(self.ctx, stk.identifier())
 
@@ -763,14 +893,18 @@ resources:
             stack_user_project_id='1234',
             strict_validate=True,
             tenant_id='test_tenant_id', timeout_mins=60,
-            user_creds_id=u'1', username='test_username')
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+            user_creds_id='1', username='test_username',
+            converge=False
+        )
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
 
     def test_stack_update_existing_template(self):
         '''Update a stack using the same template.'''
         stack_name = 'service_update_test_stack_existing_template'
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
-                    rpc_api.PARAM_EXISTING: True}
+                    rpc_api.PARAM_EXISTING: True,
+                    rpc_api.PARAM_CONVERGE: False}
         t = template_format.parse(tools.wp_template)
         # Don't actually run the update as the mocking breaks it, instead
         # we just ensure the expected template is passed in to the updated
@@ -786,6 +920,7 @@ resources:
         stack.status = stack.COMPLETE
 
         with mock.patch('heat.engine.stack.Stack') as mock_stack:
+            self.patchobject(service, 'NotifyEvent')
             mock_stack.load.return_value = stack
             mock_stack.validate.return_value = None
             result = self.man.update_stack(self.ctx, stack.identifier(),
@@ -802,7 +937,8 @@ resources:
         '''Update a stack using the same template doesn't work when FAILED.'''
         stack_name = 'service_update_test_stack_existing_template'
         api_args = {rpc_api.PARAM_TIMEOUT: 60,
-                    rpc_api.PARAM_EXISTING: True}
+                    rpc_api.PARAM_EXISTING: True,
+                    rpc_api.PARAM_CONVERGE: False}
         t = template_format.parse(tools.wp_template)
         # Don't actually run the update as the mocking breaks it, instead
         # we just ensure the expected template is passed in to the updated
@@ -824,7 +960,7 @@ resources:
 
         self.assertEqual(exception.NotSupported, ex.exc_info[0])
         self.assertIn("PATCH update to non-COMPLETE stack",
-                      six.text_type(ex.exc_info[1]))
+                      str(ex.exc_info[1]))
 
     def test_update_immutable_parameter_disallowed(self):
 
@@ -855,7 +991,7 @@ parameters:
                                 self.man.update_stack,
                                 self.ctx, old_stack.identifier(),
                                 old_stack.t.t, params,
-                                None, {})
+                                None, {rpc_api.PARAM_CONVERGE: False})
         self.assertEqual(exception.ImmutableParameterModified, exc.exc_info[0])
         self.assertEqual('The following parameters are immutable and may not '
                          'be updated: param1', exc.exc_info[1].message)
@@ -891,7 +1027,7 @@ parameters:
         params = {'param1': 'bar'}
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
                                        templatem.Template(template), params,
-                                       None, {})
+                                       None, {rpc_api.PARAM_CONVERGE: False})
         self.assertEqual(s.id, result['stack_id'])
 
     def test_update_immutable_parameter_same_value(self):
@@ -925,7 +1061,7 @@ parameters:
         params = {'param1': 'foo'}
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
                                        templatem.Template(template), params,
-                                       None, {})
+                                       None, {rpc_api.PARAM_CONVERGE: False})
         self.assertEqual(s.id, result['stack_id'])
 
 
@@ -995,12 +1131,12 @@ resources:
         mock_validate = self.patchobject(stk, 'validate', return_value=None)
         mock_merge = self.patchobject(env_util, 'merge_environments')
 
-        # Patch _resolve_all_attributes or it tries to call novaclient
-        self.patchobject(resource.Resource, '_resolve_all_attributes',
+        # Patch _resolve_any_attribute or it tries to call novaclient
+        self.patchobject(resource.Resource, '_resolve_any_attribute',
                          return_value=None)
 
         # do preview_update_stack
-        api_args = {'timeout_mins': 60}
+        api_args = {'timeout_mins': 60, rpc_api.PARAM_CONVERGE: False}
         result = self.man.preview_update_stack(
             self.ctx,
             old_stack.identifier(),
@@ -1016,7 +1152,9 @@ resources:
             disable_rollback=True, nested_depth=0, owner_id=None,
             parent_resource=None, stack_user_project_id='1234',
             strict_validate=True, tenant_id='test_tenant_id', timeout_mins=60,
-            user_creds_id=u'1', username='test_username')
+            user_creds_id='1', username='test_username',
+            converge=False
+        )
         mock_load.assert_called_once_with(self.ctx, stack=s)
         mock_tmpl.assert_called_once_with(new_template, files=None)
         mock_env.assert_called_once_with(params)
@@ -1102,3 +1240,41 @@ resources:
                                         environment_files=environment_files)
 
         # Assertions done in _test_stack_update_preview
+
+    def test_reset_stack_and_resources_in_progress(self):
+
+        def mock_stack_resource(name, action, status):
+            rs = mock.MagicMock()
+            rs.name = name
+            rs.action = action
+            rs.status = status
+            rs.IN_PROGRESS = 'IN_PROGRESS'
+            rs.FAILED = 'FAILED'
+
+            def mock_resource_state_set(a, s, reason='engine_down'):
+                rs.status = s
+                rs.action = a
+                rs.status_reason = reason
+
+            rs.state_set = mock_resource_state_set
+
+            return rs
+
+        stk_name = 'test_stack'
+        stk = tools.get_stack(stk_name, self.ctx)
+        stk.action = 'CREATE'
+        stk.status = 'IN_PROGRESS'
+
+        resources = {'r1': mock_stack_resource('r1', 'UPDATE', 'COMPLETE'),
+                     'r2': mock_stack_resource('r2', 'UPDATE', 'IN_PROGRESS'),
+                     'r3': mock_stack_resource('r3', 'UPDATE', 'FAILED')}
+
+        stk._resources = resources
+
+        reason = 'Test resetting stack and resources in progress'
+
+        stk.reset_stack_and_resources_in_progress(reason)
+        self.assertEqual('FAILED', stk.status)
+        self.assertEqual('COMPLETE', stk.resources.get('r1').status)
+        self.assertEqual('FAILED', stk.resources.get('r2').status)
+        self.assertEqual('FAILED', stk.resources.get('r3').status)

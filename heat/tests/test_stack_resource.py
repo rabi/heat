@@ -11,18 +11,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
 import json
+from unittest import mock
 import uuid
 
-import mock
 from oslo_config import cfg
 from oslo_messaging import exceptions as msg_exceptions
 from oslo_serialization import jsonutils
-import six
 
 from heat.common import exception
+from heat.common import identifier
 from heat.common import template_format
-from heat.engine import output
+from heat.engine import node_data
 from heat.engine import resource
 from heat.engine.resources import stack_resource
 from heat.engine import stack as parser
@@ -30,6 +31,7 @@ from heat.engine import template as templatem
 from heat.objects import raw_template
 from heat.objects import stack as stack_object
 from heat.objects import stack_lock
+from heat.rpc import api as rpc_api
 from heat.tests import common
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
@@ -77,7 +79,7 @@ main_template = '''
 heat_template_version: 2013-05-23
 resources:
   volume_server:
-    type: nested.yaml
+      type: file://tmp/nested.yaml
 '''
 
 my_wrong_nested_template = '''
@@ -203,12 +205,24 @@ class StackResourceTest(StackResourceBaseTest):
         self.assertEqual({}, ret)
 
     def test_abandon_nested_sends_rpc_abandon(self):
-        rpcc = mock.Mock()
+        rpcc = mock.MagicMock()
+
+        @contextlib.contextmanager
+        def exc_filter(*args):
+            try:
+                yield
+            except exception.NotFound:
+                pass
+
+        rpcc.ignore_error_by_name.side_effect = exc_filter
         self.parent_resource.rpc_client = rpcc
-        self.parent_resource.nested = mock.MagicMock()
+        self.parent_resource.resource_id = 'fake_id'
 
         self.parent_resource.prepare_abandon()
-        self.parent_resource.delete_nested()
+        status = ('CREATE', 'COMPLETE', '', 'now_time')
+        with mock.patch.object(stack_object.Stack, 'get_status',
+                               return_value=status):
+            self.parent_resource.delete_nested()
 
         rpcc.return_value.abandon_stack.assert_called_once_with(
             self.parent_resource.context, mock.ANY)
@@ -349,7 +363,8 @@ class StackResourceTest(StackResourceBaseTest):
         nest_stack = stk_resource._parse_nested_stack(
             "test_nest_stack", stk_resource.child_template(),
             stk_resource.child_params())
-        self.assertEqual(nest_stack._parent_stack, self.parent_stack)
+        self.assertEqual(self.parent_stack,
+                         nest_stack.parent_resource._stack())
 
     def test_preview_dict_validates_nested_resources(self):
         parent_t = self.parent_stack.t
@@ -384,17 +399,18 @@ class StackResourceTest(StackResourceBaseTest):
     def test_validate_error_reference(self):
         stack_name = 'validate_error_reference'
         tmpl = template_format.parse(main_template)
-        files = {'nested.yaml': my_wrong_nested_template}
+        files = {'file://tmp/nested.yaml': my_wrong_nested_template}
         stack = parser.Stack(utils.dummy_context(), stack_name,
                              templatem.Template(tmpl, files=files))
         rsrc = stack['volume_server']
-        raise_exc_msg = ('Failed to validate: resources.volume_server: '
-                         'The specified reference "instance" '
-                         '(in volume_attachment.Properties.instance_uuid) '
-                         'is incorrect.')
+        raise_exc_msg = ('InvalidTemplateReference: '
+                         'resources.volume_server<file://tmp/nested.yaml>: '
+                         'The specified reference "instance" (in '
+                         'volume_attachment.Properties.instance_uuid) is '
+                         'incorrect.')
         exc = self.assertRaises(exception.StackValidationFailed,
                                 rsrc.validate)
-        self.assertEqual(raise_exc_msg, six.text_type(exc))
+        self.assertEqual(raise_exc_msg, str(exc))
 
     def _test_validate_unknown_resource_type(self, stack_name, tmpl,
                                              resource_name):
@@ -404,7 +420,7 @@ class StackResourceTest(StackResourceBaseTest):
 
         exc = self.assertRaises(exception.StackValidationFailed,
                                 rsrc.validate)
-        self.assertIn(raise_exc_msg, six.text_type(exc))
+        self.assertIn(raise_exc_msg, str(exc))
 
     def test_validate_resource_group(self):
         # test validate without nested template
@@ -448,21 +464,20 @@ class StackResourceTest(StackResourceBaseTest):
     def test_get_attribute_autoscaling_convg(self):
         t = template_format.parse(heat_autoscaling_group_template)
         tmpl = templatem.Template(t)
-        cache_data = {'my_autoscaling_group': {
+        cache_data = {'my_autoscaling_group': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'attrs': {'current_size': 4}
-        }}
+        })}
         stack = parser.Stack(utils.dummy_context(), 'test_att', tmpl,
                              cache_data=cache_data)
-        rsrc = stack['my_autoscaling_group']
-        self.assertEqual(4, rsrc.FnGetAtt(rsrc.CURRENT_SIZE))
+        rsrc = stack.defn['my_autoscaling_group']
+        self.assertEqual(4, rsrc.FnGetAtt('current_size'))
 
     def test__validate_nested_resources_checks_num_of_resources(self):
-        stack_resource.cfg.CONF.set_override('max_resources_per_stack', 2,
-                                             enforce_type=True)
+        stack_resource.cfg.CONF.set_override('max_resources_per_stack', 2)
         tmpl = {'HeatTemplateFormatVersion': '2012-12-12',
                 'Resources': {
                     'r': {
@@ -479,24 +494,19 @@ class StackResourceTest(StackResourceBaseTest):
     def test_load_nested_ok(self):
         self.parent_resource._nested = None
         self.parent_resource.resource_id = 319
-        self.m.StubOutWithMock(parser.Stack, 'load')
-        parser.Stack.load(self.parent_resource.context,
-                          self.parent_resource.resource_id).AndReturn('s')
-        self.m.ReplayAll()
+        mock_load = self.patchobject(parser.Stack, 'load', return_value='s')
         self.parent_resource.nested()
-        self.m.VerifyAll()
+        mock_load.assert_called_once_with(self.parent_resource.context,
+                                          self.parent_resource.resource_id)
 
     def test_load_nested_non_exist(self):
         self.parent_resource._nested = None
         self.parent_resource.resource_id = '90-8'
-        self.m.StubOutWithMock(parser.Stack, 'load')
-        parser.Stack.load(self.parent_resource.context,
-                          self.parent_resource.resource_id).AndRaise(
-            exception.NotFound)
-        self.m.ReplayAll()
-
+        mock_load = self.patchobject(parser.Stack, 'load',
+                                     side_effect=[exception.NotFound])
         self.assertIsNone(self.parent_resource.nested())
-        self.m.VerifyAll()
+        mock_load.assert_called_once_with(self.parent_resource.context,
+                                          self.parent_resource.resource_id)
 
     def test_load_nested_cached(self):
         self.parent_resource._nested = 'gotthis'
@@ -507,14 +517,26 @@ class StackResourceTest(StackResourceBaseTest):
         self.assertIsNone(self.parent_resource.delete_nested())
 
     def test_delete_nested_not_found_nested_stack(self):
-        self.parent_resource._nested = mock.MagicMock()
-        rpcc = mock.Mock()
+        self.parent_resource.resource_id = 'fake_id'
+        rpcc = mock.MagicMock()
         self.parent_resource.rpc_client = rpcc
+
+        @contextlib.contextmanager
+        def exc_filter(*args):
+            try:
+                yield
+            except exception.EntityNotFound:
+                pass
+
+        rpcc.return_value.ignore_error_by_name.side_effect = exc_filter
         rpcc.return_value.delete_stack = mock.Mock(
-            side_effect=exception.NotFound())
-        self.assertIsNone(self.parent_resource.delete_nested())
+            side_effect=exception.EntityNotFound('Stack', 'nested'))
+        status = ('CREATE', 'COMPLETE', '', 'now_time')
+        with mock.patch.object(stack_object.Stack, 'get_status',
+                               return_value=status):
+            self.assertIsNone(self.parent_resource.delete_nested())
         rpcc.return_value.delete_stack.assert_called_once_with(
-            self.parent_resource.context, mock.ANY)
+            self.parent_resource.context, mock.ANY, cast=False)
 
     def test_need_update_for_nested_resource(self):
         """Test the resource with nested stack should need update.
@@ -523,6 +545,12 @@ class StackResourceTest(StackResourceBaseTest):
         need update.
         """
         self.parent_resource.action = self.parent_resource.CREATE
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        self.parent_resource._rpc_client.show_stack.return_value = [
+            {'stack_action': self.parent_resource.CREATE,
+             'stack_status': self.parent_resource.COMPLETE}]
+
         need_update = self.parent_resource._needs_update(
             self.parent_resource.t,
             self.parent_resource.t,
@@ -566,18 +594,40 @@ class StackResourceTest(StackResourceBaseTest):
                           self.parent_resource.properties,
                           self.parent_resource)
 
-    def test_need_update_in_check_failed_state_for_nested_resource(self):
-        """Test the resource should need replacement.
-
-        The resource in check_failed state should need update with
-        UpdateReplace.
-        """
+    def test_need_update_in_check_failed_state_after_stack_check(self):
+        self.parent_resource.resource_id = 'fake_id'
         self.parent_resource.state_set(self.parent_resource.CHECK,
                                        self.parent_resource.FAILED)
         self.nested = mock.MagicMock()
         self.nested.name = 'nested-stack'
         self.parent_resource.nested = mock.MagicMock(return_value=self.nested)
         self.parent_resource._nested = self.nested
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        self.parent_resource._rpc_client.show_stack.return_value = [
+            {'stack_action': self.parent_resource.CHECK,
+             'stack_status': self.parent_resource.FAILED}]
+
+        self.assertTrue(
+            self.parent_resource._needs_update(self.parent_resource.t,
+                                               self.parent_resource.t,
+                                               self.parent_resource.properties,
+                                               self.parent_resource.properties,
+                                               self.parent_resource))
+
+    def test_need_update_check_failed_state_after_mark_unhealthy(self):
+        self.parent_resource.resource_id = 'fake_id'
+        self.parent_resource.state_set(self.parent_resource.CHECK,
+                                       self.parent_resource.FAILED)
+        self.nested = mock.MagicMock()
+        self.nested.name = 'nested-stack'
+        self.parent_resource.nested = mock.MagicMock(return_value=self.nested)
+        self.parent_resource._nested = self.nested
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        self.parent_resource._rpc_client.show_stack.return_value = [
+            {'stack_action': self.parent_resource.CREATE,
+             'stack_status': self.parent_resource.COMPLETE}]
 
         self.assertRaises(resource.UpdateReplace,
                           self.parent_resource._needs_update,
@@ -622,97 +672,101 @@ class StackResourceLimitTest(StackResourceBaseTest):
 
 class StackResourceAttrTest(StackResourceBaseTest):
     def test_get_output_ok(self):
-        nested = self.m.CreateMockAnything()
-        self.m.StubOutWithMock(stack_resource.StackResource, 'nested')
-        stack_resource.StackResource.nested().AndReturn(nested)
-        nested.outputs = {"key": output.OutputDefinition("key", "value")}
-        self.m.ReplayAll()
+        self.parent_resource.nested_identifier = mock.Mock()
+        self.parent_resource.nested_identifier.return_value = {'foo': 'bar'}
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        output = {'outputs': [{'output_key': 'key', 'output_value': 'value'}]}
+        self.parent_resource._rpc_client.show_stack.return_value = [output]
 
         self.assertEqual("value", self.parent_resource.get_output("key"))
 
-        self.m.VerifyAll()
-
     def test_get_output_key_not_found(self):
-        nested = self.m.CreateMockAnything()
-        self.m.StubOutWithMock(stack_resource.StackResource, 'nested')
-        stack_resource.StackResource.nested().AndReturn(nested)
-        nested.outputs = {}
-        self.m.ReplayAll()
+        self.parent_resource.nested_identifier = mock.Mock()
+        self.parent_resource.nested_identifier.return_value = {'foo': 'bar'}
 
-        self.assertRaises(exception.InvalidTemplateAttribute,
+        self.parent_resource._rpc_client = mock.MagicMock()
+        output = {'outputs': []}
+        self.parent_resource._rpc_client.show_stack.return_value = [output]
+
+        self.assertRaises(exception.NotFound,
                           self.parent_resource.get_output,
                           "key")
 
-        self.m.VerifyAll()
+    def test_get_output_key_no_outputs_from_rpc(self):
+        self.parent_resource.nested_identifier = mock.Mock()
+        self.parent_resource.nested_identifier.return_value = {'foo': 'bar'}
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        output = {}
+        self.parent_resource._rpc_client.show_stack.return_value = [output]
+
+        self.assertRaises(exception.NotFound,
+                          self.parent_resource.get_output,
+                          "key")
 
     def test_resolve_attribute_string(self):
-        nested = self.m.CreateMockAnything()
-        self.m.StubOutWithMock(stack_resource.StackResource, 'nested')
-        stack_resource.StackResource.nested().AndReturn(nested)
-        nested.outputs = {'key': output.OutputDefinition('key', 'value')}
-        self.m.ReplayAll()
+        self.parent_resource.nested_identifier = mock.Mock()
+        self.parent_resource.nested_identifier.return_value = {'foo': 'bar'}
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        output = {'outputs': [{'output_key': 'key', 'output_value': 'value'}]}
+        self.parent_resource._rpc_client.show_stack.return_value = [output]
 
         self.assertEqual('value',
                          self.parent_resource._resolve_attribute("key"))
 
-        self.m.VerifyAll()
-
     def test_resolve_attribute_dict(self):
-        nested = self.m.CreateMockAnything()
-        self.m.StubOutWithMock(stack_resource.StackResource, 'nested')
-        stack_resource.StackResource.nested().AndReturn(nested)
-        nested.outputs = {'key': output.OutputDefinition('key',
-                                                         {'a': 1, 'b': 2})}
-        self.m.ReplayAll()
+        self.parent_resource.nested_identifier = mock.Mock()
+        self.parent_resource.nested_identifier.return_value = {'foo': 'bar'}
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        output = {'outputs': [{'output_key': 'key',
+                               'output_value': {'a': 1, 'b': 2}}]}
+        self.parent_resource._rpc_client.show_stack.return_value = [output]
 
         self.assertEqual({'a': 1, 'b': 2},
                          self.parent_resource._resolve_attribute("key"))
 
-        self.m.VerifyAll()
-
     def test_resolve_attribute_list(self):
-        nested = self.m.CreateMockAnything()
-        self.m.StubOutWithMock(stack_resource.StackResource, 'nested')
-        stack_resource.StackResource.nested().AndReturn(nested)
-        nested.outputs = {'key': output.OutputDefinition('key', [1, 2, 3])}
-        self.m.ReplayAll()
+        self.parent_resource.nested_identifier = mock.Mock()
+        self.parent_resource.nested_identifier.return_value = {'foo': 'bar'}
+
+        self.parent_resource._rpc_client = mock.MagicMock()
+        output = {'outputs': [{'output_key': 'key',
+                               'output_value': [1, 2, 3]}]}
+        self.parent_resource._rpc_client.show_stack.return_value = [output]
 
         self.assertEqual([1, 2, 3],
                          self.parent_resource._resolve_attribute("key"))
 
-        self.m.VerifyAll()
-
     def test_validate_nested_stack(self):
         self.parent_resource.child_template = mock.Mock(return_value='foo')
         self.parent_resource.child_params = mock.Mock(return_value={})
-        nested = self.m.CreateMockAnything()
-        nested.validate().AndReturn(True)
-        self.m.StubOutWithMock(stack_resource.StackResource,
-                               '_parse_nested_stack')
+        nested = mock.Mock()
+        nested.validate.return_value = True
+        mock_parse_nested = self.patchobject(stack_resource.StackResource,
+                                             '_parse_nested_stack',
+                                             return_value=nested)
         name = '%s-%s' % (self.parent_stack.name, self.parent_resource.name)
-        stack_resource.StackResource._parse_nested_stack(
-            name, 'foo', {}).AndReturn(nested)
 
-        self.m.ReplayAll()
         self.parent_resource.validate_nested_stack()
         self.assertFalse(nested.strict_validate)
-        self.m.VerifyAll()
+        mock_parse_nested.assert_called_once_with(name, 'foo', {})
 
     def test_validate_assertion_exception_rethrow(self):
         expected_message = 'Expected Assertion Error'
         self.parent_resource.child_template = mock.Mock(return_value='foo')
         self.parent_resource.child_params = mock.Mock(return_value={})
-        self.m.StubOutWithMock(stack_resource.StackResource,
-                               '_parse_nested_stack')
+        mock_parse_nested = self.patchobject(
+            stack_resource.StackResource,
+            '_parse_nested_stack',
+            side_effect=AssertionError(expected_message))
         name = '%s-%s' % (self.parent_stack.name, self.parent_resource.name)
-        stack_resource.StackResource._parse_nested_stack(
-            name, 'foo', {}).AndRaise(AssertionError(expected_message))
-
-        self.m.ReplayAll()
         exc = self.assertRaises(AssertionError,
                                 self.parent_resource.validate_nested_stack)
-        self.assertEqual(expected_message, six.text_type(exc))
-        self.m.VerifyAll()
+        self.assertEqual(expected_message, str(exc))
+        mock_parse_nested.assert_called_once_with(name, 'foo', {})
 
 
 class StackResourceCheckCompleteTest(StackResourceBaseTest):
@@ -766,7 +820,7 @@ class StackResourceCheckCompleteTest(StackResourceBaseTest):
         complete = getattr(self.parent_resource,
                            'check_%s_complete' % self.action)
         exc = self.assertRaises(exception.ResourceFailure, complete, None)
-        self.assertEqual(exp, six.text_type(exc))
+        self.assertEqual(exp, str(exc))
         self.mock_status.assert_called_once_with(
             self.parent_resource.context, self.parent_resource.resource_id)
 
@@ -789,23 +843,6 @@ class StackResourceCheckCompleteTest(StackResourceBaseTest):
         complete = getattr(self.parent_resource,
                            'check_%s_complete' % self.action)
         self.assertFalse(complete(None))
-        self.mock_status.assert_called_once_with(
-            self.parent_resource.context, self.parent_resource.resource_id)
-
-    def test_update_not_started(self):
-        if self.action != 'update':
-            # only valid for updates at the moment.
-            return
-
-        self.status[1] = 'COMPLETE'
-        self.status[3] = 'test'
-        cookie = {'previous': {'state': ('UPDATE', 'COMPLETE'),
-                               'updated_at': 'test'}}
-
-        complete = getattr(self.parent_resource,
-                           'check_%s_complete' % self.action)
-
-        self.assertFalse(complete(cookie=cookie))
         self.mock_status.assert_called_once_with(
             self.parent_resource.context, self.parent_resource.resource_id)
 
@@ -833,7 +870,7 @@ class WithTemplateTest(StackResourceBaseTest):
         def __eq__(self, other):
             if getattr(self, 'match', None) is not None:
                 return other == self.match
-            if not isinstance(other, six.integer_types):
+            if not isinstance(other, int):
                 return False
 
             self.match = other
@@ -874,9 +911,9 @@ class WithTemplateTest(StackResourceBaseTest):
         rpcc.return_value._create_stack.assert_called_once_with(
             self.ctx,
             stack_name=res_name,
-            args={'disable_rollback': True,
-                  'adopt_stack_data': adopt_data_str,
-                  'timeout_mins': self.timeout_mins},
+            args={rpc_api.PARAM_DISABLE_ROLLBACK: True,
+                  rpc_api.PARAM_ADOPT_STACK_DATA: adopt_data_str,
+                  rpc_api.PARAM_TIMEOUT: self.timeout_mins},
             environment_files=None,
             stack_user_project_id='aprojectid',
             parent_resource_name='test',
@@ -923,9 +960,9 @@ class WithTemplateTest(StackResourceBaseTest):
         rpcc.return_value._create_stack.assert_called_once_with(
             self.ctx,
             stack_name=res_name,
-            args={'disable_rollback': True,
-                  'adopt_stack_data': adopt_data_str,
-                  'timeout_mins': self.timeout_mins},
+            args={rpc_api.PARAM_DISABLE_ROLLBACK: True,
+                  rpc_api.PARAM_ADOPT_STACK_DATA: adopt_data_str,
+                  rpc_api.PARAM_TIMEOUT: self.timeout_mins},
             environment_files=None,
             stack_user_project_id='aprojectid',
             parent_resource_name='test',
@@ -943,30 +980,33 @@ class WithTemplateTest(StackResourceBaseTest):
     def test_update_with_template(self):
         if self.adopt_data is not None:
             return
-        nested = mock.MagicMock()
-        nested.updated_time = 'now_time'
-        nested.state = ('CREATE', 'COMPLETE')
-        nested.identifier.return_value = {'stack_identifier':
-                                          'stack-identifier'}
-        self.parent_resource.nested = mock.MagicMock(return_value=nested)
-        self.parent_resource._nested = nested
+        ident = identifier.HeatIdentifier(self.ctx.project_id, 'fake_name',
+                                          'pancakes')
+        self.parent_resource.resource_id = ident.stack_id
+        self.parent_resource.nested_identifier = mock.Mock(return_value=ident)
 
         self.parent_resource.child_params = mock.Mock(
             return_value=self.params)
         rpcc = mock.Mock()
         self.parent_resource.rpc_client = rpcc
-        rpcc.return_value._update_stack.return_value = {'stack_id': 'pancakes'}
-        self.parent_resource.update_with_template(
-            self.empty_temp, user_params=self.params,
-            timeout_mins=self.timeout_mins)
+        rpcc.return_value._update_stack.return_value = dict(ident)
+
+        status = ('CREATE', 'COMPLETE', '', 'now_time')
+        with self.patchobject(stack_object.Stack, 'get_status',
+                              return_value=status):
+            self.parent_resource.update_with_template(
+                self.empty_temp, user_params=self.params,
+                timeout_mins=self.timeout_mins)
+
         rpcc.return_value._update_stack.assert_called_once_with(
             self.ctx,
-            stack_identity={'stack_identifier': 'stack-identifier'},
+            stack_identity=dict(ident),
             template_id=self.IntegerMatch(),
             template=None,
             params=None,
             files=None,
-            args={'timeout_mins': self.timeout_mins})
+            args={rpc_api.PARAM_TIMEOUT: self.timeout_mins,
+                  rpc_api.PARAM_CONVERGE: False})
 
     def test_update_with_template_failure(self):
         class StackValidationFailed_Remote(exception.StackValidationFailed):
@@ -974,13 +1014,10 @@ class WithTemplateTest(StackResourceBaseTest):
 
         if self.adopt_data is not None:
             return
-        nested = mock.MagicMock()
-        nested.updated_time = 'now_time'
-        nested.state = ('CREATE', 'COMPLETE')
-        nested.identifier.return_value = {'stack_identifier':
-                                          'stack-identifier'}
-        self.parent_resource.nested = mock.MagicMock(return_value=nested)
-        self.parent_resource._nested = nested
+        ident = identifier.HeatIdentifier(self.ctx.project_id, 'fake_name',
+                                          'pancakes')
+        self.parent_resource.resource_id = ident.stack_id
+        self.parent_resource.nested_identifier = mock.Mock(return_value=ident)
 
         self.parent_resource.child_params = mock.Mock(
             return_value=self.params)
@@ -988,19 +1025,25 @@ class WithTemplateTest(StackResourceBaseTest):
         self.parent_resource.rpc_client = rpcc
         remote_exc = StackValidationFailed_Remote(message='oops')
         rpcc.return_value._update_stack.side_effect = remote_exc
-        self.assertRaises(exception.ResourceFailure,
-                          self.parent_resource.update_with_template,
-                          self.empty_temp, user_params=self.params,
-                          timeout_mins=self.timeout_mins)
+
+        status = ('CREATE', 'COMPLETE', '', 'now_time')
+        with self.patchobject(stack_object.Stack, 'get_status',
+                              return_value=status):
+            self.assertRaises(exception.ResourceFailure,
+                              self.parent_resource.update_with_template,
+                              self.empty_temp, user_params=self.params,
+                              timeout_mins=self.timeout_mins)
+
         template_id = self.IntegerMatch()
         rpcc.return_value._update_stack.assert_called_once_with(
             self.ctx,
-            stack_identity={'stack_identifier': 'stack-identifier'},
+            stack_identity=dict(ident),
             template_id=template_id,
             template=None,
             params=None,
             files=None,
-            args={'timeout_mins': self.timeout_mins})
+            args={rpc_api.PARAM_TIMEOUT: self.timeout_mins,
+                  rpc_api.PARAM_CONVERGE: False})
         self.assertIsNotNone(template_id.match)
         self.assertRaises(exception.NotFound,
                           raw_template.RawTemplate.get_by_id,

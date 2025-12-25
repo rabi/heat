@@ -11,8 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
+
 import webob.exc
 
 import heat.api.middleware.fault as fault
@@ -78,29 +78,23 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         engine_resp = [
             {
-                u'stack_name': u'wordpress',
-                u'event_time': u'2012-07-23T13:05:39Z',
-                u'stack_identity': dict(stack_identity),
-                u'resource_name': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_identity': dict(ev_identity),
-                u'resource_action': u'CREATE',
-                u'resource_status': u'IN_PROGRESS',
-                u'physical_resource_id': None,
-                u'resource_properties': {u'UserData': u'blah'},
-                u'resource_type': u'AWS::EC2::Instance',
+                'stack_name': 'wordpress',
+                'event_time': '2012-07-23T13:05:39Z',
+                'stack_identity': dict(stack_identity),
+                'resource_name': res_name,
+                'resource_status_reason': 'state changed',
+                'event_identity': dict(ev_identity),
+                'resource_action': 'CREATE',
+                'resource_status': 'IN_PROGRESS',
+                'physical_resource_id': None,
+                'resource_type': 'AWS::EC2::Instance',
             }
         ]
         if nested_depth:
             engine_resp[0]['root_stack_id'] = dict(stack_identity)
 
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndReturn(engine_resp)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=engine_resp)
 
         result = self.controller.index(req, tenant_id=self.tenant,
                                        stack_name=stack_identity.stack_name,
@@ -116,12 +110,12 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                         {'href': self._url(res_identity), 'rel': 'resource'},
                         {'href': self._url(stack_identity), 'rel': 'stack'},
                     ],
-                    u'resource_name': res_name,
-                    u'logical_resource_id': res_name,
-                    u'resource_status_reason': u'state changed',
-                    u'event_time': u'2012-07-23T13:05:39Z',
-                    u'resource_status': u'CREATE_IN_PROGRESS',
-                    u'physical_resource_id': None,
+                    'resource_name': res_name,
+                    'logical_resource_id': res_name,
+                    'resource_status_reason': 'state changed',
+                    'event_time': '2012-07-23T13:05:39Z',
+                    'resource_status': 'CREATE_IN_PROGRESS',
+                    'physical_resource_id': None,
                 }
             ]
         }
@@ -131,7 +125,12 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
             )
 
         self.assertEqual(expected, result)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     @mock.patch.object(rpc_client.EngineClient, 'call')
     def test_index_multiple_resource_names(self, mock_call, mock_enforce):
@@ -152,17 +151,16 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         mock_call.return_value = [
             {
-                u'stack_name': u'wordpress',
-                u'event_time': u'2012-07-23T13:05:39Z',
-                u'stack_identity': dict(stack_identity),
-                u'resource_name': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_identity': dict(ev_identity),
-                u'resource_action': u'CREATE',
-                u'resource_status': u'IN_PROGRESS',
-                u'physical_resource_id': None,
-                u'resource_properties': {u'UserData': u'blah'},
-                u'resource_type': u'AWS::EC2::Instance',
+                'stack_name': 'wordpress',
+                'event_time': '2012-07-23T13:05:39Z',
+                'stack_identity': dict(stack_identity),
+                'resource_name': res_name,
+                'resource_status_reason': 'state changed',
+                'event_identity': dict(ev_identity),
+                'resource_action': 'CREATE',
+                'resource_status': 'IN_PROGRESS',
+                'physical_resource_id': None,
+                'resource_type': 'AWS::EC2::Instance',
             }
         ]
 
@@ -200,17 +198,16 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         mock_call.return_value = [
             {
-                u'stack_name': u'wordpress',
-                u'event_time': u'2012-07-23T13:05:39Z',
-                u'stack_identity': dict(stack_identity),
-                u'resource_name': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_identity': dict(ev_identity),
-                u'resource_action': u'CREATE',
-                u'resource_status': u'IN_PROGRESS',
-                u'physical_resource_id': None,
-                u'resource_properties': {u'UserData': u'blah'},
-                u'resource_type': u'AWS::EC2::Instance',
+                'stack_name': 'wordpress',
+                'event_time': '2012-07-23T13:05:39Z',
+                'stack_identity': dict(stack_identity),
+                'resource_name': res_name,
+                'resource_status_reason': 'state changed',
+                'event_identity': dict(ev_identity),
+                'resource_action': 'CREATE',
+                'resource_status': 'IN_PROGRESS',
+                'physical_resource_id': None,
+                'resource_type': 'AWS::EC2::Instance',
             }
         ]
 
@@ -251,26 +248,20 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         engine_resp = [
             {
-                u'stack_name': u'wordpress',
-                u'event_time': u'2012-07-23T13:05:39Z',
-                u'stack_identity': dict(stack_identity),
-                u'resource_name': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_identity': dict(ev_identity),
-                u'resource_action': u'CREATE',
-                u'resource_status': u'IN_PROGRESS',
-                u'physical_resource_id': None,
-                u'resource_properties': {u'UserData': u'blah'},
-                u'resource_type': u'AWS::EC2::Instance',
+                'stack_name': 'wordpress',
+                'event_time': '2012-07-23T13:05:39Z',
+                'stack_identity': dict(stack_identity),
+                'resource_name': res_name,
+                'resource_status_reason': 'state changed',
+                'event_identity': dict(ev_identity),
+                'resource_action': 'CREATE',
+                'resource_status': 'IN_PROGRESS',
+                'physical_resource_id': None,
+                'resource_type': 'AWS::EC2::Instance',
             }
         ]
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndReturn(engine_resp)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=engine_resp)
 
         result = self.controller.index(req, tenant_id=self.tenant,
                                        stack_name=stack_identity.stack_name,
@@ -286,18 +277,23 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                         {'href': self._url(res_identity), 'rel': 'resource'},
                         {'href': self._url(stack_identity), 'rel': 'stack'},
                     ],
-                    u'resource_name': res_name,
-                    u'logical_resource_id': res_name,
-                    u'resource_status_reason': u'state changed',
-                    u'event_time': u'2012-07-23T13:05:39Z',
-                    u'resource_status': u'CREATE_IN_PROGRESS',
-                    u'physical_resource_id': None,
+                    'resource_name': res_name,
+                    'logical_resource_id': res_name,
+                    'resource_status_reason': 'state changed',
+                    'event_time': '2012-07-23T13:05:39Z',
+                    'resource_status': 'CREATE_IN_PROGRESS',
+                    'physical_resource_id': None,
                 }
             ]
         }
 
         self.assertEqual(expected, result)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     def test_index_stack_nonexist(self, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'index', True)
@@ -311,13 +307,8 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                   'sort_dir': None, 'filters': None}
 
         error = heat_exc.EntityNotFound(entity='Stack', name='a')
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndRaise(tools.to_remote_error(error))
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     side_effect=tools.to_remote_error(error))
 
         resp = tools.request_with_middleware(
             fault.FaultWrapper,
@@ -328,7 +319,12 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         self.assertEqual(404, resp.json['code'])
         self.assertEqual('EntityNotFound', resp.json['error']['type'])
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     def test_index_err_denied_policy(self, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'index', False)
@@ -345,7 +341,7 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
             stack_id=stack_identity.stack_id)
 
         self.assertEqual(403, resp.status_int)
-        self.assertIn('403 Forbidden', six.text_type(resp))
+        self.assertIn('403 Forbidden', str(resp))
 
     def test_index_resource_nonexist(self, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'index', True)
@@ -361,13 +357,8 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                   'sort_dir': None, 'filters': {'resource_name': res_name}}
 
         engine_resp = []
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndReturn(engine_resp)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=engine_resp)
 
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.index,
@@ -375,10 +366,15 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                           stack_name=stack_identity.stack_name,
                           stack_id=stack_identity.stack_id,
                           resource_name=res_name)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     @mock.patch.object(rpc_client.EngineClient, 'call')
-    def test_index_whitelists_pagination_params(self, mock_call, mock_enforce):
+    def test_index_bogus_pagination_param(self, mock_call, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'index', True)
         params = {
             'limit': 10,
@@ -428,11 +424,11 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                                stack_name=sid.stack_name,
                                stack_id=sid.stack_id)
         self.assertEqual("Only integer is acceptable by 'limit'.",
-                         six.text_type(ex))
+                         str(ex))
         self.assertFalse(mock_call.called)
 
     @mock.patch.object(rpc_client.EngineClient, 'call')
-    def test_index_whitelist_filter_params(self, mock_call, mock_enforce):
+    def test_index_bogus_filter_param(self, mock_call, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'index', True)
         params = {
             'resource_status': 'COMPLETE',
@@ -495,27 +491,22 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         engine_resp = [
             {
-                u'stack_name': u'wordpress',
-                u'event_time': u'2012-07-23T13:06:00Z',
-                u'stack_identity': dict(stack_identity),
-                u'resource_name': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_identity': dict(ev_identity),
-                u'resource_action': u'CREATE',
-                u'resource_status': u'COMPLETE',
-                u'physical_resource_id':
-                u'a3455d8c-9f88-404d-a85b-5315293e67de',
-                u'resource_properties': {u'UserData': u'blah'},
-                u'resource_type': u'AWS::EC2::Instance',
+                'stack_name': 'wordpress',
+                'event_time': '2012-07-23T13:06:00Z',
+                'stack_identity': dict(stack_identity),
+                'resource_name': res_name,
+                'resource_status_reason': 'state changed',
+                'event_identity': dict(ev_identity),
+                'resource_action': 'CREATE',
+                'resource_status': 'COMPLETE',
+                'physical_resource_id':
+                'a3455d8c-9f88-404d-a85b-5315293e67de',
+                'resource_properties': {'UserData': 'blah'},
+                'resource_type': 'AWS::EC2::Instance',
             }
         ]
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndReturn(engine_resp)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=engine_resp)
 
         result = self.controller.show(req, tenant_id=self.tenant,
                                       stack_name=stack_identity.stack_name,
@@ -531,20 +522,25 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                     {'href': self._url(res_identity), 'rel': 'resource'},
                     {'href': self._url(stack_identity), 'rel': 'stack'},
                 ],
-                u'resource_name': res_name,
-                u'logical_resource_id': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_time': u'2012-07-23T13:06:00Z',
-                u'resource_status': u'CREATE_COMPLETE',
-                u'physical_resource_id':
-                u'a3455d8c-9f88-404d-a85b-5315293e67de',
-                u'resource_type': u'AWS::EC2::Instance',
-                u'resource_properties': {u'UserData': u'blah'},
+                'resource_name': res_name,
+                'logical_resource_id': res_name,
+                'resource_status_reason': 'state changed',
+                'event_time': '2012-07-23T13:06:00Z',
+                'resource_status': 'CREATE_COMPLETE',
+                'physical_resource_id':
+                'a3455d8c-9f88-404d-a85b-5315293e67de',
+                'resource_type': 'AWS::EC2::Instance',
+                'resource_properties': {'UserData': 'blah'},
             }
         }
 
         self.assertEqual(expected, result)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     def test_show_bad_resource(self, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'show', True)
@@ -562,13 +558,8 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                   'filters': {'resource_name': res_name, 'uuid': '42'}}
 
         engine_resp = []
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndReturn(engine_resp)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=engine_resp)
 
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show,
@@ -576,7 +567,12 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                           stack_name=stack_identity.stack_name,
                           stack_id=stack_identity.stack_id,
                           resource_name=res_name, event_id=event_id)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     def test_show_stack_nonexist(self, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'show', True)
@@ -594,13 +590,8 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
                   'filters': {'resource_name': res_name, 'uuid': '42'}}
 
         error = heat_exc.EntityNotFound(entity='Stack', name='a')
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('list_events', kwargs),
-            version='1.31'
-        ).AndRaise(tools.to_remote_error(error))
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     side_effect=tools.to_remote_error(error))
 
         resp = tools.request_with_middleware(
             fault.FaultWrapper,
@@ -613,7 +604,12 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         self.assertEqual(404, resp.json['code'])
         self.assertEqual('EntityNotFound', resp.json['error']['type'])
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('list_events', kwargs),
+            version='1.31'
+        )
 
     def test_show_err_denied_policy(self, mock_enforce):
         self._mock_enforce_setup(mock_enforce, 'show', False)
@@ -635,7 +631,7 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
             event_id=event_id)
 
         self.assertEqual(403, resp.status_int)
-        self.assertIn('403 Forbidden', six.text_type(resp))
+        self.assertIn('403 Forbidden', str(resp))
 
     @mock.patch.object(rpc_client.EngineClient, 'call')
     def test_show_multiple_resource_names(self, mock_call, mock_enforce):
@@ -653,17 +649,16 @@ class EventControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         mock_call.return_value = [
             {
-                u'stack_name': u'wordpress',
-                u'event_time': u'2012-07-23T13:05:39Z',
-                u'stack_identity': dict(stack_identity),
-                u'resource_name': res_name,
-                u'resource_status_reason': u'state changed',
-                u'event_identity': dict(ev_identity),
-                u'resource_action': u'CREATE',
-                u'resource_status': u'IN_PROGRESS',
-                u'physical_resource_id': None,
-                u'resource_properties': {u'UserData': u'blah'},
-                u'resource_type': u'AWS::EC2::Instance',
+                'stack_name': 'wordpress',
+                'event_time': '2012-07-23T13:05:39Z',
+                'stack_identity': dict(stack_identity),
+                'resource_name': res_name,
+                'resource_status_reason': 'state changed',
+                'event_identity': dict(ev_identity),
+                'resource_action': 'CREATE',
+                'resource_status': 'IN_PROGRESS',
+                'physical_resource_id': None,
+                'resource_type': 'AWS::EC2::Instance',
             }
         ]
 

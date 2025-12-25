@@ -137,45 +137,6 @@ port:
 
 Create and associate a floating IP to an instance
 -------------------------------------------------
-You can use two sets of resources to create and associate floating IPs to
-instances.
-
-OS::Nova resources
-++++++++++++++++++
-Use the :ref:`OS::Nova::FloatingIP` resource to create a floating IP, and
-the :ref:`OS::Nova::FloatingIPAssociation` resource to associate the
-floating IP to an instance.
-
-The following example creates an instance and a floating IP, and associate the
-floating IP to the instance:
-
-.. code-block:: yaml
-
-    resources:
-      floating_ip:
-        type: OS::Nova::FloatingIP
-        properties:
-          pool: public
-
-      inst1:
-        type: OS::Nova::Server
-        properties:
-          flavor: m1.small
-          image: ubuntu-trusty-x86_64
-          networks:
-            - network: private
-
-      association:
-        type: OS::Nova::FloatingIPAssociation
-        properties:
-          floating_ip: { get_resource: floating_ip }
-          server_id: { get_resource: inst1 }
-
-OS::Neutron resources
-+++++++++++++++++++++
-.. note::
-   The Networking service (neutron) must be enabled on your OpenStack
-   deployment to use these resources.
 
 Use the :ref:`OS::Neutron::FloatingIP` resource to create a floating IP, and
 the :ref:`OS::Neutron::FloatingIPAssociation` resource to associate the
@@ -250,8 +211,9 @@ the key pair to use to enable SSH remote access:
           key_name: my_key
 
 .. note::
-   For more information about key pairs, see
-   `Configure access and security for instances <http://docs.openstack.org/user-guide/configure_access_and_security_for_instances.html>`_.
+   For more information about key pairs, see `Configure access and security for
+   instances
+   <https://docs.openstack.org/ocata/user-guide/cli-nova-configure-access-security-for-instances.html>`_.
 
 Create a key pair
 -----------------

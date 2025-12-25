@@ -11,12 +11,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-import warnings
 
 from heat.common import exception
 from heat.common import template_format
 from heat.engine.cfn import functions as cfn_funcs
+from heat.engine import function
 from heat.engine.hot import functions as hot_funcs
 from heat.engine import properties
 from heat.engine import rsrc_defn
@@ -33,6 +32,16 @@ resources:
         value: {get_resource: test2}
   test2:
     type: OS::Heat::TestResource
+'''
+
+TEMPLATE_WITH_INVALID_EXPLICIT_DEPEND = '''
+heat_template_version: 2016-10-14
+resources:
+  test1:
+    type: OS::Heat::TestResource
+  test3:
+    type: OS::Heat::TestResource
+    depends_on: test2
 '''
 
 
@@ -78,16 +87,18 @@ class ResourceDefinitionTest(common.HeatTestCase):
         rd = self.make_me_one_with_everything()
         metadata = rd.metadata()
         self.assertEqual({'Baz': 'quux'}, metadata)
-        self.assertIsInstance(metadata['Baz'], six.string_types)
+        self.assertIsInstance(metadata['Baz'], str)
 
     def test_dependencies_default(self):
         rd = rsrc_defn.ResourceDefinition('rsrc', 'SomeType')
         stack = {'foo': 'FOO', 'bar': 'BAR'}
+        self.assertEqual(set(), rd.required_resource_names())
         self.assertEqual([], list(rd.dependencies(stack)))
 
     def test_dependencies_explicit(self):
         rd = rsrc_defn.ResourceDefinition('rsrc', 'SomeType', depends=['foo'])
         stack = {'foo': 'FOO', 'bar': 'BAR'}
+        self.assertEqual({'foo'}, rd.required_resource_names())
         self.assertEqual(['FOO'], list(rd.dependencies(stack)))
 
     def test_dependencies_explicit_ext(self):
@@ -105,8 +116,10 @@ class ResourceDefinitionTest(common.HeatTestCase):
         self.assertEqual([], list(rsrc.t.dependencies(stack)))
 
     def test_dependencies_explicit_invalid(self):
-        rd = rsrc_defn.ResourceDefinition('rsrc', 'SomeType', depends=['baz'])
-        stack = {'foo': 'FOO', 'bar': 'BAR'}
+        t = template_format.parse(TEMPLATE_WITH_INVALID_EXPLICIT_DEPEND)
+        stack = utils.parse_stack(t)
+        rd = stack.t.resource_definitions(stack)['test3']
+        self.assertEqual({'test2'}, rd.required_resource_names())
         self.assertRaises(exception.InvalidTemplateReference,
                           lambda: list(rd.dependencies(stack)))
 
@@ -156,6 +169,39 @@ class ResourceDefinitionTest(common.HeatTestCase):
         frozen = rd.freeze(metadata={'Baz': 'wibble'})
         self.assertEqual('bar', frozen._properties['Foo'])
         self.assertEqual('wibble', frozen._metadata['Baz'])
+
+    def test_freeze_nullable_top_level(self):
+        class NullFunction(function.Function):
+            def result(self):
+                return Ellipsis
+
+        null_func = NullFunction(None, 'null', [])
+
+        rd = rsrc_defn.ResourceDefinition(
+            'rsrc', 'SomeType',
+            properties=null_func,
+            metadata=null_func,
+            update_policy=null_func)
+
+        frozen = rd.freeze()
+        self.assertIsNone(frozen._properties)
+        self.assertIsNone(frozen._metadata)
+        self.assertIsNone(frozen._update_policy)
+
+        rd2 = rsrc_defn.ResourceDefinition(
+            'rsrc', 'SomeType',
+            properties={'Foo': null_func,
+                        'Blarg': 'wibble'},
+            metadata={'Bar': null_func,
+                      'Baz': 'quux'},
+            update_policy={'some_policy': null_func})
+
+        frozen2 = rd2.freeze()
+        self.assertNotIn('Foo', frozen2._properties)
+        self.assertEqual('wibble', frozen2._properties['Blarg'])
+        self.assertNotIn('Bar', frozen2._metadata)
+        self.assertEqual('quux', frozen2._metadata['Baz'])
+        self.assertEqual({}, frozen2._update_policy)
 
     def test_render_hot(self):
         rd = self.make_me_one_with_everything()
@@ -282,106 +328,3 @@ class ResourceDefinitionDiffTest(common.HeatTestCase):
         self.assertFalse(diff.update_policy_changed())
         self.assertFalse(diff.metadata_changed())
         self.assertFalse(diff)
-
-
-class ResourceDefinitionSnippetTest(common.HeatTestCase):
-    scenarios = [
-        ('type',
-            dict(
-                defn={},
-                expected={})),
-        ('metadata',
-            dict(
-                defn={'metadata': {'Foo': 'bar'}},
-                expected={'Metadata': {'Foo': 'bar'}})),
-        ('properties',
-            dict(
-                defn={'properties': {'Foo': 'bar'}},
-                expected={'Properties': {'Foo': 'bar'}})),
-        ('deletion_policy',
-            dict(
-                defn={'deletion_policy': rsrc_defn.ResourceDefinition.RETAIN},
-                expected={'DeletionPolicy': 'Retain'})),
-        ('update_policy',
-            dict(
-                defn={'update_policy': {'Foo': 'bar'}},
-                expected={'UpdatePolicy': {'Foo': 'bar'}}))
-    ]
-
-    def test_resource_snippet(self):
-        rd = rsrc_defn.ResourceDefinition('rsrc', 'SomeType', **self.defn)
-        with warnings.catch_warnings(record=True) as ws:
-            warnings.filterwarnings('always')
-
-            # Work around http://bugs.python.org/issue4180
-            getattr(rsrc_defn, '__warningregistry__', {}).clear()
-
-            exp_result = {'Type': 'SomeType'}
-            exp_result.update(self.expected)
-
-            self.assertEqual(exp_result, rd)
-
-            self.assertTrue(ws)
-            for warn in ws:
-                self.assertTrue(issubclass(warn.category, DeprecationWarning))
-
-
-class ResourceDefinitionDiffSnippetTest(common.HeatTestCase):
-    def test_properties_diff(self):
-        before = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                              properties={'Foo': 'blarg'},
-                                              update_policy={'baz': 'quux'},
-                                              metadata={'baz': 'quux'})
-        after = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                             properties={'Foo': 'wibble'},
-                                             update_policy={'baz': 'quux'},
-                                             metadata={'baz': 'quux'})
-
-        diff = after - before
-        self.assertEqual({'Properties': after['Properties']}, dict(diff))
-
-    def test_update_policy_diff(self):
-        before = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                              properties={'baz': 'quux'},
-                                              update_policy={'Foo': 'blarg'},
-                                              metadata={'baz': 'quux'})
-        after = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                             properties={'baz': 'quux'},
-                                             update_policy={'Foo': 'wibble'},
-                                             metadata={'baz': 'quux'})
-
-        diff = after - before
-        self.assertEqual({'UpdatePolicy': after['UpdatePolicy']}, dict(diff))
-
-    def test_metadata_diff(self):
-        before = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                              properties={'baz': 'quux'},
-                                              update_policy={'baz': 'quux'},
-                                              metadata={'Foo': 'blarg'})
-        after = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                             properties={'baz': 'quux'},
-                                             update_policy={'baz': 'quux'},
-                                             metadata={'Foo': 'wibble'})
-
-        diff = after - before
-        self.assertEqual({'Metadata': after['Metadata']}, dict(diff))
-
-    def test_all_diff(self):
-        before = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                              properties={'Foo': 'blarg'},
-                                              update_policy={'bar': 'quux'},
-                                              metadata={'baz': 'wibble'},
-                                              depends=['other_resource'],
-                                              deletion_policy='Delete')
-        after = rsrc_defn.ResourceDefinition('rsrc', 'SomeType',
-                                             properties={'Foo': 'wibble'},
-                                             update_policy={'bar': 'blarg'},
-                                             metadata={'baz': 'quux'},
-                                             depends=['other_other_resource'],
-                                             deletion_policy='Retain')
-
-        diff = after - before
-        self.assertEqual({'Properties': after['Properties'],
-                          'UpdatePolicy': after['UpdatePolicy'],
-                          'Metadata': after['Metadata']},
-                         dict(diff))

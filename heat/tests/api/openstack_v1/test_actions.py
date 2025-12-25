@@ -12,9 +12,8 @@
 #    under the License.
 
 import json
+from unittest import mock
 
-import mock
-import six
 import webob.exc
 
 import heat.api.middleware.fault as fault
@@ -45,139 +44,149 @@ class ActionControllerTest(tools.ControllerTest, common.HeatTestCase):
         self.controller = actions.ActionController(options=cfgopts)
 
     def test_action_suspend(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
+        self._mock_enforce_setup(mock_enforce, 'suspend', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'suspend': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('stack_suspend', {'stack_identity': stack_identity})
-        ).AndReturn(None)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=None)
 
         result = self.controller.action(req, tenant_id=self.tenant,
                                         stack_name=stack_identity.stack_name,
                                         stack_id=stack_identity.stack_id,
                                         body=body)
         self.assertIsNone(result)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('stack_suspend', {'stack_identity': stack_identity})
+        )
 
     def test_action_resume(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
+        self._mock_enforce_setup(mock_enforce, 'resume', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'resume': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('stack_resume', {'stack_identity': stack_identity})
-        ).AndReturn(None)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=None)
 
         result = self.controller.action(req, tenant_id=self.tenant,
                                         stack_name=stack_identity.stack_name,
                                         stack_id=stack_identity.stack_id,
                                         body=body)
         self.assertIsNone(result)
-        self.m.VerifyAll()
 
-    def test_action_cancel_update(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
+        mock_call.assert_called_once_with(
+            req.context,
+            ('stack_resume', {'stack_identity': stack_identity})
+        )
+
+    def test_action_check(self, mock_enforce):
+        self._mock_enforce_setup(mock_enforce, 'check', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
-        body = {'cancel_update': None}
+        body = {'check': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('stack_cancel_update',
-             {'stack_identity': stack_identity,
-              'cancel_with_rollback': True}),
-            version='1.14'
-        ).AndReturn(None)
-        self.m.ReplayAll()
+        mock_call = self.patchobject(rpc_client.EngineClient, 'call',
+                                     return_value=None)
 
         result = self.controller.action(req, tenant_id=self.tenant,
                                         stack_name=stack_identity.stack_name,
                                         stack_id=stack_identity.stack_id,
                                         body=body)
         self.assertIsNone(result)
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('stack_check', {'stack_identity': stack_identity})
+        )
+
+    def _test_action_cancel_update(self, mock_enforce, with_rollback=True):
+        act = 'cancel_update' if with_rollback else 'cancel_without_rollback'
+        self._mock_enforce_setup(mock_enforce, act, True)
+        stack_identity = identifier.HeatIdentifier(self.tenant,
+                                                   'wordpress', '1')
+        body = {act: None}
+        req = self._post(stack_identity._tenant_path() + '/actions',
+                         data=json.dumps(body))
+
+        client = self.patchobject(rpc_client.EngineClient, 'call')
+        result = self.controller.action(req, tenant_id=self.tenant,
+                                        stack_name=stack_identity.stack_name,
+                                        stack_id=stack_identity.stack_id,
+                                        body=body)
+        self.assertIsNone(result)
+        client.assert_called_with(
+            req.context,
+            ('stack_cancel_update',
+             {'stack_identity': stack_identity,
+              'cancel_with_rollback': with_rollback}),
+            version='1.14')
+
+    def test_action_cancel_update(self, mock_enforce):
+        self._test_action_cancel_update(mock_enforce)
+
+    def test_action_cancel_without_rollback(self, mock_enforce):
+        self._test_action_cancel_update(mock_enforce, False)
 
     def test_action_badaction(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'notallowed': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.ReplayAll()
-
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.action,
                           req, tenant_id=self.tenant,
                           stack_name=stack_identity.stack_name,
                           stack_id=stack_identity.stack_id,
                           body=body)
-        self.m.VerifyAll()
 
     def test_action_badaction_empty(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.ReplayAll()
-
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.action,
                           req, tenant_id=self.tenant,
                           stack_name=stack_identity.stack_name,
                           stack_id=stack_identity.stack_id,
                           body=body)
-        self.m.VerifyAll()
 
     def test_action_badaction_multiple(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'one': None, 'two': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.ReplayAll()
-
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.action,
                           req, tenant_id=self.tenant,
                           stack_name=stack_identity.stack_name,
                           stack_id=stack_identity.stack_id,
                           body=body)
-        self.m.VerifyAll()
 
     def test_action_rmt_aterr(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
+        self._mock_enforce_setup(mock_enforce, 'suspend', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'suspend': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
 
-        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
-        rpc_client.EngineClient.call(
-            req.context,
-            ('stack_suspend', {'stack_identity': stack_identity})
-        ).AndRaise(tools.to_remote_error(AttributeError()))
-        self.m.ReplayAll()
+        mock_call = self.patchobject(
+            rpc_client.EngineClient, 'call',
+            side_effect=tools.to_remote_error(AttributeError()))
 
         resp = tools.request_with_middleware(
             fault.FaultWrapper,
@@ -189,10 +198,14 @@ class ActionControllerTest(tools.ControllerTest, common.HeatTestCase):
 
         self.assertEqual(400, resp.json['code'])
         self.assertEqual('AttributeError', resp.json['error']['type'])
-        self.m.VerifyAll()
+
+        mock_call.assert_called_once_with(
+            req.context,
+            ('stack_suspend', {'stack_identity': stack_identity})
+        )
 
     def test_action_err_denied_policy(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', False)
+        self._mock_enforce_setup(mock_enforce, 'suspend', False)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'suspend': None}
@@ -207,17 +220,14 @@ class ActionControllerTest(tools.ControllerTest, common.HeatTestCase):
             stack_id=stack_identity.stack_id,
             body=body)
         self.assertEqual(403, resp.status_int)
-        self.assertIn('403 Forbidden', six.text_type(resp))
+        self.assertIn('403 Forbidden', str(resp))
 
     def test_action_badaction_ise(self, mock_enforce):
-        self._mock_enforce_setup(mock_enforce, 'action', True)
         stack_identity = identifier.HeatIdentifier(self.tenant,
                                                    'wordpress', '1')
         body = {'oops': None}
         req = self._post(stack_identity._tenant_path() + '/actions',
                          data=json.dumps(body))
-
-        self.m.ReplayAll()
 
         self.controller.ACTIONS = (SUSPEND, NEW) = ('suspend', 'oops')
 
@@ -227,4 +237,3 @@ class ActionControllerTest(tools.ControllerTest, common.HeatTestCase):
                           stack_name=stack_identity.stack_name,
                           stack_id=stack_identity.stack_id,
                           body=body)
-        self.m.VerifyAll()

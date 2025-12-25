@@ -16,9 +16,9 @@
 """Sample plugin for Heat.
 
 For more Heat related benchmarks take a look here:
-https://git.openstack.org/cgit/openstack/rally/tree/rally/plugins/openstack/scenarios/heat
+https://opendev.org/openstack/heat/src/branch/master/rally-scenarios
 
-About plugins: https://rally.readthedocs.org/en/latest/plugins.html
+About plugins: https://rally.readthedocs.io/en/latest/plugins/#rally-plugins
 
 Rally concepts https://wiki.openstack.org/wiki/Rally/Concepts
 """
@@ -31,6 +31,6 @@ class HeatPlugin(scenario.OpenStackScenario):
 
     @scenario.configure(context={"cleanup": ["heat"]})
     def list_benchmark(self, container_format,
-                            image_location, disk_format, **kwargs):
+                       image_location, disk_format, **kwargs):
         """Get heatclient and do whatever."""
-        stacks = list(self.clients("heat").stacks.list())
+        list(self.clients("heat").stacks.list())

@@ -24,7 +24,6 @@ import traceback
 
 from oslo_config import cfg
 from oslo_utils import reflection
-import six
 import webob
 
 from heat.common import exception
@@ -63,6 +62,7 @@ class FaultWrapper(wsgi.Middleware):
         'InvalidGlobalResource': webob.exc.HTTPInternalServerError,
         'ResourceNotAvailable': webob.exc.HTTPNotFound,
         'PhysicalResourceNameAmbiguity': webob.exc.HTTPBadRequest,
+        'PhysicalResourceIDAmbiguity': webob.exc.HTTPBadRequest,
         'InvalidTenant': webob.exc.HTTPForbidden,
         'Forbidden': webob.exc.HTTPForbidden,
         'StackExists': webob.exc.HTTPConflict,
@@ -76,10 +76,12 @@ class FaultWrapper(wsgi.Middleware):
         'StopActionFailed': webob.exc.HTTPInternalServerError,
         'EventSendFailed': webob.exc.HTTPInternalServerError,
         'ServerBuildFailed': webob.exc.HTTPInternalServerError,
+        'InvalidEncryptionKey': webob.exc.HTTPInternalServerError,
         'NotSupported': webob.exc.HTTPBadRequest,
         'MissingCredentialError': webob.exc.HTTPBadRequest,
         'UserParameterMissing': webob.exc.HTTPBadRequest,
         'RequestLimitExceeded': webob.exc.HTTPBadRequest,
+        'DownloadLimitExceeded': webob.exc.HTTPBadRequest,
         'Invalid': webob.exc.HTTPBadRequest,
         'ResourcePropertyConflict': webob.exc.HTTPBadRequest,
         'PropertyUnspecifiedError': webob.exc.HTTPBadRequest,
@@ -91,7 +93,8 @@ class FaultWrapper(wsgi.Middleware):
         'UnsupportedObjectError': webob.exc.HTTPBadRequest,
         'ResourceTypeUnavailable': webob.exc.HTTPBadRequest,
         'InvalidBreakPointHook': webob.exc.HTTPBadRequest,
-        'ImmutableParameterModified': webob.exc.HTTPBadRequest
+        'ImmutableParameterModified': webob.exc.HTTPBadRequest,
+        'CircularDependencyException': webob.exc.HTTPBadRequest
     }
 
     def _map_exception_to_error(self, class_exception):
@@ -108,6 +111,8 @@ class FaultWrapper(wsgi.Middleware):
         trace = None
         traceback_marker = 'Traceback (most recent call last)'
         webob_exc = None
+        safe = getattr(ex, 'safe', False)
+
         if isinstance(ex, exception.HTTPExceptionDisguise):
             # An HTTP exception was disguised so it could make it here
             # let's remove the disguise and set the original HTTP exception
@@ -122,7 +127,7 @@ class FaultWrapper(wsgi.Middleware):
         if is_remote:
             ex_type = ex_type[:-len('_Remote')]
 
-        full_message = six.text_type(ex)
+        full_message = str(ex)
         if '\n' in full_message and is_remote:
             message, msg_trace = full_message.split('\n', 1)
         elif traceback_marker in full_message:
@@ -149,11 +154,12 @@ class FaultWrapper(wsgi.Middleware):
             'title': webob_exc.title,
             'explanation': webob_exc.explanation,
             'error': {
-                'message': message,
                 'type': ex_type,
                 'traceback': trace,
             }
         }
+        if safe:
+            error['error']['message'] = message
 
         return error
 

@@ -20,6 +20,7 @@ from keystoneclient.v3 import client
 from oslo_config import cfg
 from oslo_log import log as logging
 
+from heat.common.i18n import _
 from heat import version
 
 logger = logging.getLogger(__name__)
@@ -28,30 +29,32 @@ DEBUG = False
 USERNAME = os.environ.get('OS_USERNAME')
 PASSWORD = os.environ.get('OS_PASSWORD')
 AUTH_URL = os.environ.get('OS_AUTH_URL', '').replace('v2.0', 'v3')
-TENANT_NAME = os.environ.get('OS_TENANT_NAME')
+PROJECT_NAME = os.environ.get('OS_PROJECT_NAME')
+USER_DOMAIN_NAME = os.environ.get('OS_USER_DOMAIN_NAME')
+PROJECT_DOMAIN_NAME = os.environ.get('OS_PROJECT_DOMAIN_NAME')
 
 opts = [
     cfg.StrOpt('stack-user-domain-name',
                default="heat",
-               help="Name of domain to create for stack users."),
+               help=_("Name of domain to create for stack users.")),
     cfg.StrOpt('stack-domain-admin',
                default="heat_stack_admin",
-               help="Keystone username with roles sufficient to manage users"
-                    " and projects in the stack-user-domain"),
+               help=_("Keystone username with roles sufficient to manage users"
+                      " and projects in the stack-user-domain")),
     cfg.StrOpt('stack-domain-admin-password',
                secret=True,
-               help="Password to set for stack-domain-admin"),
+               help=_("Password to set for stack-domain-admin")),
     cfg.BoolOpt('insecure',
                 default=False,
-                help="If set, then the server's certificate will not "
-                     "be verified."),
+                help=_("If set, then the server's certificate will not "
+                       "be verified.")),
     cfg.StrOpt('os-cacert',
-               help='Optional CA cert file to use in SSL connections.'),
+               help=_('Optional CA cert file to use in SSL connections.')),
     cfg.StrOpt('os-cert',
-               help='Optional PEM-formatted certificate chain file.'),
+               help=_('Optional PEM-formatted certificate chain file.')),
     cfg.StrOpt('os-key',
-               help='Optional PEM-formatted file that contains the '
-                    'private key.'),
+               help=_('Optional PEM-formatted file that contains the '
+                      'private key.')),
 
 ]
 
@@ -62,7 +65,8 @@ logging.set_defaults(
     logging_context_format_string="%(levelname)s (%(module)s:"
                                   "%(lineno)d) %(message)s",
     default_log_levels=(logging.get_default_log_levels() +
-                       extra_log_level_defaults))
+                        extra_log_level_defaults)
+)
 logging.setup(cfg.CONF, 'heat-keystone-setup-domain',
               version.version_info.version_string())
 
@@ -81,9 +85,6 @@ HEAT_DOMAIN_PASSWORD = os.environ.get('HEAT_DOMAIN_PASSWORD',
                                       cfg.CONF.stack_domain_admin_password)
 HEAT_DOMAIN_DESCRIPTION = 'Contains users and projects created by heat'
 
-logger.debug("USERNAME=%s" % USERNAME)
-logger.debug("AUTH_URL=%s" % AUTH_URL)
-
 CACERT = os.environ.get('OS_CACERT', cfg.CONF.os_cacert)
 CERT = os.environ.get('OS_CERT', cfg.CONF.os_cert)
 KEY = os.environ.get('OS_KEY', cfg.CONF.os_key)
@@ -97,7 +98,9 @@ def main():
         'password': PASSWORD,
         'auth_url': AUTH_URL,
         'endpoint': AUTH_URL,
-        'tenant_name': TENANT_NAME
+        'project_name': PROJECT_NAME,
+        'user_domain_name': USER_DOMAIN_NAME,
+        'project_domain_name': PROJECT_DOMAIN_NAME
     }
 
     if insecure:

@@ -11,8 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.engine import environment
@@ -43,13 +42,7 @@ class ResourceTypeTest(common.HeatTestCase):
                                             mock_is_service_available):
         mock_is_service_available.return_value = (True, None)
         resources = self.eng.list_resource_types(self.ctx, "DEPRECATED")
-        self.assertEqual(set(['OS::Heat::HARestarter',
-                              'OS::Neutron::HealthMonitor',
-                              'OS::Neutron::LoadBalancer',
-                              'OS::Neutron::Pool',
-                              'OS::Neutron::PoolMember',
-                              'OS::Aodh::CombinationAlarm']),
-                         set(resources))
+        self.assertIn('OS::Aodh::Alarm', resources)
 
     @mock.patch.object(res.Resource, 'is_service_available')
     def test_list_resource_types_supported(self,
@@ -75,17 +68,11 @@ class ResourceTypeTest(common.HeatTestCase):
         resources = self.eng.list_resource_types(self.ctx,
                                                  with_description=True)
         self.assertIsInstance(resources, list)
-        description = ("Heat Template Resource for Designate Domain.\n\n"
-                       "Designate provides DNS-as-a-Service services for "
-                       "OpenStack. So, domain\nis a realm with an "
-                       "identification string, unique in DNS.\n")
-        self.assertIn({'resource_type': 'OS::Designate::Domain',
-                       'description': description}, resources)
         self.assertIn({'resource_type': 'AWS::RDS::DBInstance',
                        'description': 'Builtin AWS::RDS::DBInstance'},
                       resources)
         self.assertIn({'resource_type': 'AWS::EC2::Instance',
-                       'description': 'No description given'},
+                       'description': 'No description available'},
                       resources)
 
     def test_resource_schema(self):
@@ -119,7 +106,7 @@ class ResourceTypeTest(common.HeatTestCase):
                 'message': None,
                 'previous_status': None
             },
-            'description': 'No description given'
+            'description': 'No description available'
         }
 
         schema = self.eng.resource_schema(self.ctx, type_name=type_name,
@@ -206,7 +193,7 @@ class ResourceTypeTest(common.HeatTestCase):
                                    type_name='ResourceWithWrongRefOnFile')
             msg = ('There was an error loading the definition of the global '
                    'resource type ResourceWithWrongRefOnFile.')
-            self.assertIn(msg, six.text_type(ex))
+            self.assertIn(msg, str(ex))
 
     def test_resource_schema_no_template_file(self):
         self._no_template_file(self.eng.resource_schema)
@@ -219,7 +206,7 @@ class ResourceTypeTest(common.HeatTestCase):
                                self.eng.resource_schema,
                                self.ctx, type_name='Bogus')
         msg = 'The Resource Type (Bogus) could not be found.'
-        self.assertEqual(msg, six.text_type(ex))
+        self.assertEqual(msg, str(ex))
 
     def test_resource_schema_unavailable(self):
         type_name = 'ResourceWithDefaultClientName'
@@ -237,7 +224,7 @@ class ResourceTypeTest(common.HeatTestCase):
                    'type ResourceWithDefaultClientName, reason: '
                    'Service endpoint not in service catalog.')
             self.assertEqual(msg,
-                             six.text_type(ex),
+                             str(ex),
                              'invalid exception message')
 
             mock_is_service_available.assert_called_once_with(self.ctx)

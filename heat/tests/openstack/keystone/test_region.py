@@ -11,15 +11,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-from six.moves.urllib import parse
+from unittest import mock
+from urllib import parse
 
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.engine import resource
 from heat.engine.resources.openstack.keystone import region
 from heat.engine import stack
 from heat.engine import template
 from heat.tests import common
-from heat.tests import fakes
 from heat.tests import utils
 
 KEYSTONE_REGION_TEMPLATE = {
@@ -36,8 +36,6 @@ KEYSTONE_REGION_TEMPLATE = {
         }
     }
 }
-
-RESOURCE_TYPE = 'OS::Keystone::Region'
 
 
 class KeystoneRegionTest(common.HeatTestCase):
@@ -56,7 +54,7 @@ class KeystoneRegionTest(common.HeatTestCase):
         # Mock client
         self.keystoneclient = mock.Mock()
         self.patchobject(resource.Resource, 'client',
-                         return_value=fakes.FakeKeystoneClient(
+                         return_value=fake_ks.FakeKeystoneClient(
                              client=self.keystoneclient))
         self.regions = self.keystoneclient.regions
 
@@ -145,3 +143,23 @@ class KeystoneRegionTest(common.HeatTestCase):
             enabled=prop_diff[region.KeystoneRegion.ENABLED],
             parent_region='test_parent_region'
         )
+
+    def test_region_get_live_state(self):
+        self.test_region.resource_id = '477e8273-60a7-4c41-b683-fdb0bc7cd151'
+        mock_dict = mock.MagicMock()
+        mock_dict.to_dict.return_value = {
+            "parent_region_id": None,
+            "enabled": True,
+            "id": "79e4d02f8b454a7885c413d5d4297813",
+            "links": {"self": "link"},
+            "description": ""
+        }
+        self.regions.get.return_value = mock_dict
+
+        reality = self.test_region.get_live_state(self.test_region.properties)
+        expected = {
+            "parent_region": None,
+            "enabled": True,
+            "description": ""
+        }
+        self.assertEqual(expected, reality)

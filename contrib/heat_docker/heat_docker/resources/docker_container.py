@@ -14,14 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import distutils
-
 from oslo_log import log as logging
-import six
+import packaging.version
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -333,15 +330,15 @@ class DockerContainer(resource.Resource):
         if DOCKER_INSTALLED:
             endpoint = self.properties.get(self.DOCKER_ENDPOINT)
             if endpoint:
-                client = docker.Client(endpoint)
+                client = docker.APIClient(endpoint)
             else:
-                client = docker.Client()
+                client = docker.APIClient()
         return client
 
     def _parse_networkinfo_ports(self, networkinfo):
         tcp = []
         udp = []
-        for port, info in six.iteritems(networkinfo['Ports']):
+        for port, info in networkinfo['Ports'].items():
             p = port.split('/')
             if not info or len(p) != 2 or 'HostPort' not in info[0]:
                 continue
@@ -554,14 +551,14 @@ def available_resource_mapping():
     if DOCKER_INSTALLED:
         return resource_mapping()
     else:
-        LOG.warning(_LW("Docker plug-in loaded, but docker lib "
-                        "not installed."))
+        LOG.warning("Docker plug-in loaded, but docker lib "
+                    "not installed.")
         return {}
 
 
 def compare_version(v1, v2):
-    s1 = distutils.version.StrictVersion(v1)
-    s2 = distutils.version.StrictVersion(v2)
+    s1 = packaging.version.Version(v1)
+    s2 = packaging.version.Version(v2)
     if s1 == s2:
         return 0
     elif s1 > s2:

@@ -31,7 +31,7 @@ The localrc looked like this::
 
   HEAT_STANDALONE=True
   KEYSTONE_AUTH_HOST=192.168.1.88
-  KEYSTONE_AUTH_PORT=35357
+  KEYSTONE_AUTH_PORT=5000
   KEYSTONE_AUTH_PROTOCOL=http
   KEYSTONE_SERVICE_HOST=$KEYSTONE_AUTH_HOST
   KEYSTONE_SERVICE_PORT=$KEYSTONE_AUTH_PORT
@@ -42,9 +42,8 @@ The localrc looked like this::
   RABBIT_PASSWORD=$MY_PASSWORD
 
   disable_all_services
-  # Alternative RPC backends are zeromq and rabbit
-  ENABLED_SERVICES=qpid
-  enable_service mysql heat h-api h-api-cfn h-api-cw h-eng
+  ENABLED_SERVICES=rabbit
+  enable_service mysql heat h-api h-api-cfn h-eng
 
 Then run your ./stack.sh as normal.
 
@@ -72,7 +71,7 @@ Now make a file to store your new environment (heat.env).
   export OS_USERNAME=admin
   export OS_TENANT_NAME=demo
   export OS_PASSWORD=abetterpasswordthanthis
-  export OS_AUTH_URL=http://192.168.1.88:35357/v2.0/
+  export OS_AUTH_URL=http://192.168.1.88:5000/v3/
 
 Now you use this like::
 

@@ -2,6 +2,10 @@
 Heat
 ====
 
+.. image:: https://governance.openstack.org/tc/badges/heat.svg
+
+.. Change things from this point on
+
 Heat is a service to orchestrate multiple composite cloud applications using
 templates, through both an OpenStack-native REST API and a
 CloudFormation-compatible Query API.
@@ -13,41 +17,55 @@ Getting Started
 
 If you'd like to run from the master branch, you can clone the git repo:
 
-    git clone https://git.openstack.org/openstack/heat
+    git clone https://opendev.org/openstack/heat
 
 
-* Wiki: http://wiki.openstack.org/Heat
-* Developer docs: http://docs.openstack.org/developer/heat
-* Template samples: https://git.openstack.org/cgit/openstack/heat-templates
+* Documentation: https://docs.openstack.org/heat/latest
+* Template samples: https://opendev.org/openstack/heat-templates
+* Agents: https://opendev.org/openstack/heat-agents
+* Release Notes: https://docs.openstack.org/releasenotes/heat/
 
 Python client
 -------------
-https://git.openstack.org/cgit/openstack/python-heatclient
+
+* Documentation: https://docs.openstack.org/python-heatclient/latest
+* Source: https://opendev.org/openstack/python-heatclient
+
+Report a Story (a bug/blueprint)
+--------------------------------
+
+If you'd like to report a Story (we used to call a bug/blueprint), you can
+report it under Report a story in
+`Heat's StoryBoard <https://storyboard.openstack.org/#!/project/989>`_.
+If you must report the story under other sub-project of heat, you can find
+them all in `Heat StoryBoard Group <https://storyboard.openstack.org/#!/project_group/82>`_.
+if you encounter any issue.
 
 References
 ----------
-* http://docs.amazonwebservices.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html
-* http://docs.amazonwebservices.com/AWSCloudFormation/latest/UserGuide/create-stack.html
-* http://docs.amazonwebservices.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html
-* http://www.oasis-open.org/committees/tc_home.php?wg_abbrev=tosca
+* https://docs.amazonwebservices.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html
+* https://docs.amazonwebservices.com/AWSCloudFormation/latest/UserGuide/create-stack.html
+* https://docs.amazonwebservices.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html
+* https://www.oasis-open.org/committees/tc_home.php?wg_abbrev=tosca
 
 We have integration with
 ------------------------
-* https://git.openstack.org/cgit/openstack/python-novaclient (instance)
-* https://git.openstack.org/cgit/openstack/python-keystoneclient (auth)
-* https://git.openstack.org/cgit/openstack/python-swiftclient (s3)
-* https://git.openstack.org/cgit/openstack/python-neutronclient (networking)
-* https://git.openstack.org/cgit/openstack/python-ceilometerclient (metering)
-* https://git.openstack.org/cgit/openstack/python-aodhclient (alarming service)
-* https://git.openstack.org/cgit/openstack/python-cinderclient (storage service)
-* https://git.openstack.org/cgit/openstack/python-glanceclient (image service)
-* https://git.openstack.org/cgit/openstack/python-troveclient (database as a Service)
-* https://git.openstack.org/cgit/openstack/python-saharaclient (hadoop cluster)
-* https://git.openstack.org/cgit/openstack/python-barbicanclient (key management service)
-* https://git.openstack.org/cgit/openstack/python-designateclient (DNS service)
-* https://git.openstack.org/cgit/openstack/python-magnumclient (container service)
-* https://git.openstack.org/cgit/openstack/python-manilaclient (shared file system service)
-* https://git.openstack.org/cgit/openstack/python-mistralclient (workflow service)
-* https://git.openstack.org/cgit/openstack/python-zaqarclient (messaging service)
-* https://git.openstack.org/cgit/openstack/python-monascaclient (monitoring service)
-* https://git.openstack.org/cgit/openstack/python-senlinclient (clustering service)
+* https://opendev.org/openstack/python-novaclient (instance)
+* https://opendev.org/openstack/python-keystoneclient (auth)
+* https://opendev.org/openstack/python-swiftclient (object storage)
+* https://opendev.org/openstack/python-neutronclient (networking)
+* https://opendev.org/openstack/python-aodhclient (alarming service)
+* https://opendev.org/openstack/python-cinderclient (block storage)
+* https://opendev.org/openstack/python-glanceclient (image service)
+* https://opendev.org/openstack/python-troveclient (database as a Service)
+* https://opendev.org/openstack/python-barbicanclient (key management service)
+* https://opendev.org/openstack/python-designateclient (DNS service)
+* https://opendev.org/openstack/python-magnumclient (container service)
+* https://opendev.org/openstack/python-manilaclient (shared file system service)
+* https://opendev.org/openstack/python-mistralclient (workflow service)
+* https://opendev.org/openstack/python-zaqarclient (messaging service)
+* https://opendev.org/openstack/python-zunclient (container management service)
+* https://opendev.org/openstack/python-blazarclient (reservation service)
+* https://opendev.org/openstack/python-octaviaclient (Load-balancer service)
+* https://opendev.org/openstack/python-vitrageclient (RCA service)
+* https://opendev.org/openstack/python-ironicclient (baremetal provisioning service)

@@ -17,7 +17,6 @@ import re
 from oslo_config import cfg
 from oslo_log import log
 from oslo_messaging._drivers import common as rpc_common
-import six
 import webob
 
 import heat.api.middleware.fault as fault
@@ -95,8 +94,8 @@ class FaultMiddlewareTest(common.HeatTestCase):
 
     def test_exception_with_non_ascii_chars(self):
         # We set debug to true to test the code path for serializing traces too
-        cfg.CONF.set_override('debug', True, enforce_type=True)
-        msg = u'Error with non-ascii chars \x80'
+        cfg.CONF.set_override('debug', True)
+        msg = 'Error with non-ascii chars \x80'
 
         class TestException(heat_exc.HeatException):
             msg_fmt = msg
@@ -104,7 +103,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
         wrapper = fault.FaultWrapper(None)
         msg = wrapper._error(TestException())
         expected = {'code': 500,
-                    'error': {'message': u'Error with non-ascii chars \x80',
+                    'error': {'message': 'Error with non-ascii chars \x80',
                               'traceback': 'None\n',
                               'type': 'TestException'},
                     'explanation': ('The server has either erred or is '
@@ -115,7 +114,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
 
     def test_remote_exception(self):
         # We want tracebacks
-        cfg.CONF.set_override('debug', True, enforce_type=True)
+        cfg.CONF.set_override('debug', True)
         error = heat_exc.EntityNotFound(entity='Stack', name='a')
         exc_info = (type(error), error, None)
         serialized = rpc_common.serialize_remote_exception(exc_info)
@@ -123,7 +122,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
             serialized, ["heat.common.exception"])
         wrapper = fault.FaultWrapper(None)
         msg = wrapper._error(remote_error)
-        expected_message, expected_traceback = six.text_type(
+        expected_message, expected_traceback = str(
             remote_error).split('\n', 1)
         expected = {'code': 404,
                     'error': {'message': expected_message,
@@ -134,8 +133,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
         self.assertEqual(expected, msg)
 
     def remote_exception_helper(self, name, error):
-        if six.PY3:
-            error.args = ()
+        error.args = ()
         exc_info = (type(error), error, None)
 
         serialized = rpc_common.serialize_remote_exception(exc_info)
@@ -144,8 +142,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
         wrapper = fault.FaultWrapper(None)
         msg = wrapper._error(remote_error)
         expected = {'code': 500,
-                    'error': {'message': msg['error']['message'],
-                              'traceback': None,
+                    'error': {'traceback': None,
                               'type': 'RemoteError'},
                     'explanation': msg['explanation'],
                     'title': 'Internal Server Error'}
@@ -175,7 +172,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
 
             if hasattr(obj, 'msg_fmt'):
                 kwargs = {}
-                spec_names = re.findall('%\((\w+)\)([cdeEfFgGinorsxX])',
+                spec_names = re.findall(r'%\((\w+)\)([cdeEfFgGinorsxX])',
                                         obj.msg_fmt)
 
                 for key, convtype in spec_names:
@@ -211,8 +208,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
 
         msg = wrapper._error(NotMappedException('A message'))
         expected = {'code': 500,
-                    'error': {'message': u'A message',
-                              'traceback': None,
+                    'error': {'traceback': None,
                               'type': 'NotMappedException'},
                     'explanation': ('The server has either erred or is '
                                     'incapable of performing the requested '
@@ -222,7 +218,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
 
     def test_should_not_ignore_parent_classes_even_for_remote_ones(self):
         # We want tracebacks
-        cfg.CONF.set_override('debug', True, enforce_type=True)
+        cfg.CONF.set_override('debug', True)
 
         error = StackNotFoundChild(entity='Stack', name='a')
         exc_info = (type(error), error, None)
@@ -232,7 +228,7 @@ class FaultMiddlewareTest(common.HeatTestCase):
 
         wrapper = fault.FaultWrapper(None)
         msg = wrapper._error(remote_error)
-        expected_message, expected_traceback = six.text_type(
+        expected_message, expected_traceback = str(
             remote_error).split('\n', 1)
         expected = {'code': 404,
                     'error': {'message': expected_message,

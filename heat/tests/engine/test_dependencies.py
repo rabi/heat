@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
+from heat.common import exception
 from heat.engine import dependencies
 from heat.tests import common
 
@@ -30,8 +30,8 @@ class dependenciesTest(common.HeatTestCase):
 
         self.assertEqual(len(nodes), len(order))
 
-        for l, f in deps:
-            checkorder(order.index(f), order.index(l))
+        for lr, fr in deps:
+            checkorder(order.index(fr), order.index(lr))
 
     def _dep_test_fwd(self, *deps):
         def assertLess(a, b):
@@ -57,16 +57,16 @@ class dependenciesTest(common.HeatTestCase):
 
     def test_single_node(self):
         d = dependencies.Dependencies([('only', None)])
-        l = list(iter(d))
-        self.assertEqual(1, len(l))
-        self.assertEqual('only', l[0])
+        li = list(iter(d))
+        self.assertEqual(1, len(li))
+        self.assertEqual('only', li[0])
 
     def test_disjoint(self):
         d = dependencies.Dependencies([('1', None), ('2', None)])
-        l = list(iter(d))
-        self.assertEqual(2, len(l))
-        self.assertIn('1', l)
-        self.assertIn('2', l)
+        li = list(iter(d))
+        self.assertEqual(2, len(li))
+        self.assertIn('1', li)
+        self.assertIn('2', li)
 
     def test_single_fwd(self):
         self._dep_test_fwd(('second', 'first'))
@@ -124,7 +124,7 @@ class dependenciesTest(common.HeatTestCase):
         d = dependencies.Dependencies([('first', 'second'),
                                        ('second', 'third'),
                                        ('third', 'first')])
-        self.assertRaises(dependencies.CircularDependencyException,
+        self.assertRaises(exception.CircularDependencyException,
                           list,
                           iter(d))
 
@@ -132,13 +132,13 @@ class dependenciesTest(common.HeatTestCase):
         d = dependencies.Dependencies([('first', 'second'),
                                        ('second', 'third'),
                                        ('third', 'first')])
-        self.assertRaises(dependencies.CircularDependencyException,
+        self.assertRaises(exception.CircularDependencyException,
                           list,
                           reversed(d))
 
     def test_self_ref(self):
         d = dependencies.Dependencies([('node', 'node')])
-        self.assertRaises(dependencies.CircularDependencyException,
+        self.assertRaises(exception.CircularDependencyException,
                           list,
                           iter(d))
 
@@ -147,7 +147,7 @@ class dependenciesTest(common.HeatTestCase):
                                        ('last', 'mid2'), ('mid1', 'e2'),
                                        ('mid1', 'mid3'), ('mid2', 'mid3'),
                                        ('mid3', 'e3'), ('e3', 'mid1')])
-        self.assertRaises(dependencies.CircularDependencyException,
+        self.assertRaises(exception.CircularDependencyException,
                           list,
                           iter(d))
 
@@ -156,7 +156,7 @@ class dependenciesTest(common.HeatTestCase):
                                        ('last', 'mid2'), ('mid1', 'e2'),
                                        ('mid1', 'mid3'), ('mid2', 'mid3'),
                                        ('mid3', 'e3'), ('e3', 'mid1')])
-        self.assertRaises(dependencies.CircularDependencyException,
+        self.assertRaises(exception.CircularDependencyException,
                           list,
                           reversed(d))
 
@@ -170,9 +170,9 @@ class dependenciesTest(common.HeatTestCase):
     def test_single_partial(self):
         d = dependencies.Dependencies([('last', 'first')])
         p = d['last']
-        l = list(iter(p))
-        self.assertEqual(1, len(l))
-        self.assertEqual('last', l[0])
+        li = list(iter(p))
+        self.assertEqual(1, len(li))
+        self.assertEqual('last', li[0])
 
     def test_simple_partial(self):
         d = dependencies.Dependencies([('last', 'middle'),
@@ -183,7 +183,7 @@ class dependenciesTest(common.HeatTestCase):
         for n in ('last', 'middle'):
             self.assertIn(n, order,
                           "'%s' not found in dependency order" % n)
-        self.assertTrue(order.index('last') > order.index('middle'))
+        self.assertGreater(order.index('last'), order.index('middle'))
 
     def test_simple_multilevel_partial(self):
         d = dependencies.Dependencies([('last', 'middle'),

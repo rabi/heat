@@ -11,40 +11,44 @@
       License for the specific language governing permissions and limitations
       under the License.
 
+========================
 Hello World HOT Template
-------------------------
-https://git.openstack.org/cgit/openstack/heat-templates/tree/hot/hello_world.yaml
+========================
+
+https://opendev.org/openstack/heat-templates/src/branch/master/hot/hello_world.yaml
 
 Description
 -----------
+
 Hello world HOT template that just defines a single compute instance. Contains
 just base features to verify base HOT support.
 
 
 Parameters
 ----------
+
 *key_name* :mod:`(required)`
-	*type*
-		*string*
-	*description*
-		Name of an existing key pair to use for the instance
+    *type*
+        *string*
+    *description*
+        Name of an existing key pair to use for the instance
 *flavor* :mod:`(optional)`
-	*type*
-		*string*
-	*description*
-		Flavor for the instance to be created
+    *type*
+        *string*
+    *description*
+        Flavor for the instance to be created
 *image* :mod:`(required)`
-	*type*
-		*string*
-	*description*
-		Image *ID* or image name to use for the instance
+    *type*
+        *string*
+    *description*
+        Image *ID* or image name to use for the instance
 *admin_pass* :mod:`(required)`
-	*type*
-		*string*
-	*description*
-		The admin password for the instance
+    *type*
+        *string*
+    *description*
+        The admin password for the instance
 *db_port* :mod:`(optional)`
-	*type*
-		*number*
-	*description*
-		The database port number
+    *type*
+        *number*
+    *description*
+        The database port number

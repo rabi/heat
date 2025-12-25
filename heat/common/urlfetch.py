@@ -13,15 +13,18 @@
 
 """Utility for fetching a resource (e.g. a template) from a URL."""
 
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+
 from oslo_config import cfg
 from oslo_log import log as logging
 import requests
 from requests import exceptions
-from six.moves import urllib
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 
 cfg.CONF.import_opt('max_template_size', 'heat.common.config')
 
@@ -40,12 +43,12 @@ def get(url, allowed_schemes=('http', 'https')):
     the allowed_schemes argument.
     Raise an IOError if getting the data fails.
     """
-    LOG.info(_LI('Fetching data from %s'), url)
-
     components = urllib.parse.urlparse(url)
 
     if components.scheme not in allowed_schemes:
         raise URLFetchError(_('Invalid URL scheme %s') % components.scheme)
+
+    LOG.info('Fetching data from %s', url)
 
     if components.scheme == 'file':
         try:
@@ -54,7 +57,8 @@ def get(url, allowed_schemes=('http', 'https')):
             raise URLFetchError(_('Failed to retrieve template: %s') % uex)
 
     try:
-        resp = requests.get(url, stream=True)
+        resp = requests.get(url, stream=True,
+                            timeout=cfg.CONF.template_fetch_timeout)
         resp.raise_for_status()
 
         # We cannot use resp.text here because it would download the
@@ -70,9 +74,11 @@ def get(url, allowed_schemes=('http', 'https')):
         for chunk in reader:
             result += chunk
             if len(result) > cfg.CONF.max_template_size:
-                raise URLFetchError("Template exceeds maximum allowed size (%s"
-                                    " bytes)" % cfg.CONF.max_template_size)
+                raise URLFetchError(_("Template exceeds maximum allowed size "
+                                      "(%s bytes)") %
+                                    cfg.CONF.max_template_size)
         return result
 
-    except exceptions.RequestException as ex:
-        raise URLFetchError(_('Failed to retrieve template: %s') % ex)
+    except (exceptions.RequestException, socket.timeout) as ex:
+        LOG.info('Failed to retrieve template: %s', ex)
+        raise URLFetchError(_('Failed to retrieve template from %s') % url)

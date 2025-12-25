@@ -12,11 +12,12 @@
 #    under the License.
 """Tests for :module:'heat.engine.clients.os.cinder'."""
 
+from unittest import mock
 import uuid
 
+from cinderclient import api_versions as cinder_api_versions
 from cinderclient import exceptions as cinder_exc
 from keystoneauth1 import exceptions as ks_exceptions
-import mock
 
 from heat.common import exception
 from heat.engine.clients.os import cinder
@@ -160,16 +161,10 @@ class CinderClientAPIVersionTest(common.HeatTestCase):
     def test_cinder_api_v3(self):
         ctx = utils.dummy_context()
         self.patchobject(ctx.keystone_session, 'get_endpoint')
+        ctx.clients.client_plugin(
+            'cinder').max_microversion = cinder_api_versions.MAX_VERSION
         client = ctx.clients.client('cinder')
         self.assertEqual('3.0', client.version)
-
-    def test_cinder_api_v2(self):
-        ctx = utils.dummy_context()
-        self.patchobject(ctx.keystone_session, 'get_endpoint',
-                         side_effect=[ks_exceptions.EndpointNotFound,
-                                      None])
-        client = ctx.clients.client('cinder')
-        self.assertEqual('2.0', client.version)
 
     def test_cinder_api_not_supported(self):
         ctx = utils.dummy_context()

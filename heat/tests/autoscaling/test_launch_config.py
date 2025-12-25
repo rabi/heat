@@ -11,13 +11,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import short_id
 from heat.common import template_format
 from heat.engine.clients.os import nova
+from heat.engine import node_data
 from heat.engine import scheduler
 from heat.tests.autoscaling import inline_templates
 from heat.tests import common
@@ -25,9 +25,6 @@ from heat.tests import utils
 
 
 class LaunchConfigurationTest(common.HeatTestCase):
-    def setUp(self):
-        super(LaunchConfigurationTest, self).setUp()
-
     def validate_launch_config(self, stack, lc_name='LaunchConfig'):
         # create the launch configuration resource
         conf = stack[lc_name]
@@ -63,16 +60,16 @@ class LaunchConfigurationTest(common.HeatTestCase):
 
     def test_launch_config_refid_convergence_cache_data(self):
         t = template_format.parse(inline_templates.as_template)
-        cache_data = {'LaunchConfig': {
+        cache_data = {'LaunchConfig': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'reference_id': 'convg_xyz'
-        }}
+        })}
         stack = utils.parse_stack(t, params=inline_templates.as_params,
                                   cache_data=cache_data)
-        rsrc = stack['LaunchConfig']
+        rsrc = stack.defn['LaunchConfig']
         self.assertEqual('convg_xyz', rsrc.FnGetRefId())
 
     def test_launch_config_create_with_instanceid(self):
@@ -113,7 +110,7 @@ class LaunchConfigurationTest(common.HeatTestCase):
                               rsrc.validate)
         ex_msg = ('If without InstanceId, '
                   'ImageId and InstanceType are required.')
-        self.assertIn(ex_msg, six.text_type(e))
+        self.assertIn(ex_msg, str(e))
 
     def test_lc_validate_without_InstanceId_and_InstanceType(self):
         t = template_format.parse(inline_templates.as_template)
@@ -128,7 +125,7 @@ class LaunchConfigurationTest(common.HeatTestCase):
                               rsrc.validate)
         ex_msg = ('If without InstanceId, '
                   'ImageId and InstanceType are required.')
-        self.assertIn(ex_msg, six.text_type(e))
+        self.assertIn(ex_msg, str(e))
 
     def test_launch_config_create_with_instanceid_not_found(self):
         t = template_format.parse(inline_templates.as_template)
@@ -150,7 +147,7 @@ class LaunchConfigurationTest(common.HeatTestCase):
 
         exc = self.assertRaises(exception.StackValidationFailed,
                                 rsrc.validate)
-        self.assertIn(msg, six.text_type(exc))
+        self.assertIn(msg, str(exc))
 
     def test_validate_BlockDeviceMappings_without_Ebs_property(self):
         t = template_format.parse(inline_templates.as_template)
@@ -166,7 +163,7 @@ class LaunchConfigurationTest(common.HeatTestCase):
                               self.validate_launch_config, stack)
 
         self.assertIn("Ebs is missing, this is required",
-                      six.text_type(e))
+                      str(e))
 
     def test_validate_BlockDeviceMappings_without_SnapshotId_property(self):
         t = template_format.parse(inline_templates.as_template)
@@ -183,7 +180,7 @@ class LaunchConfigurationTest(common.HeatTestCase):
                               self.validate_launch_config, stack)
 
         self.assertIn("SnapshotId is missing, this is required",
-                      six.text_type(e))
+                      str(e))
 
     def test_validate_BlockDeviceMappings_without_DeviceName_property(self):
         t = template_format.parse(inline_templates.as_template)
@@ -203,4 +200,4 @@ class LaunchConfigurationTest(common.HeatTestCase):
             'Property error: '
             'Resources.LaunchConfig.Properties.BlockDeviceMappings[0]: '
             'Property DeviceName not assigned')
-        self.assertIn(excepted_error, six.text_type(e))
+        self.assertIn(excepted_error, str(e))

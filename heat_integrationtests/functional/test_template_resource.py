@@ -13,10 +13,8 @@
 import json
 
 from heatclient import exc as heat_exceptions
-import six
 import yaml
 
-from heat_integrationtests.common import test
 from heat_integrationtests.functional import functional_base
 
 
@@ -46,9 +44,6 @@ outputs:
 resource_registry:
   "OS::Heat::RandomString": nested.yaml
 '''
-
-    def setUp(self):
-        super(TemplateResourceTest, self).setUp()
 
     def test_nested_env(self):
         main_templ = '''
@@ -171,9 +166,6 @@ outputs:
 resource_registry:
   "My::NestedSecret": nested.yaml
 '''
-
-    def setUp(self):
-        super(NestedAttributesTest, self).setUp()
 
     def test_stack_ref(self):
         nested_templ = '''
@@ -496,9 +488,6 @@ Outputs:
                                       expect=NOCHANGE)),
     ]
 
-    def setUp(self):
-        super(TemplateResourceUpdateTest, self).setUp()
-
     def test_template_resource_update_template_schema(self):
         stack_identifier = self.stack_create(
             template=self.main_template,
@@ -527,14 +516,13 @@ class TemplateResourceUpdateFailedTest(functional_base.FunctionalTestsBase):
     main_template = '''
 HeatTemplateFormatVersion: '2012-12-12'
 Resources:
-  keypair:
-    Type: OS::Nova::KeyPair
+  test:
+    Type: OS::Heat::TestResource
     Properties:
-      name: replace-this
-      save_private_key: false
+      fail: replace-this
   server:
     Type: server_fail.yaml
-    DependsOn: keypair
+    DependsOn: test
 '''
     nested_templ = '''
 HeatTemplateFormatVersion: '2012-12-12'
@@ -545,21 +533,18 @@ Resources:
 
     def setUp(self):
         super(TemplateResourceUpdateFailedTest, self).setUp()
-        self.assign_keypair()
 
     def test_update_on_failed_create(self):
-        # create a stack with "server" dependent on "keypair", but
-        # keypair fails, so "server" is not created properly.
+        # create a stack with "server" dependent on "test", but
+        # "test" fails, so "server" is not created properly.
         # We then fix the template and it should succeed.
-        broken_templ = self.main_template.replace('replace-this',
-                                                  self.keypair_name)
+        broken_templ = self.main_template.replace('replace-this', 'true')
         stack_identifier = self.stack_create(
             template=broken_templ,
             files={'server_fail.yaml': self.nested_templ},
             expected_status='CREATE_FAILED')
 
-        fixed_templ = self.main_template.replace('replace-this',
-                                                 test.rand_name())
+        fixed_templ = self.main_template.replace('replace-this', 'false')
         self.update_stack(stack_identifier,
                           fixed_templ,
                           files={'server_fail.yaml': self.nested_templ})
@@ -597,9 +582,6 @@ Outputs:
   the_str:
     Value: {'Fn::GetAtt': [RealRandom, value]}
 '''
-
-    def setUp(self):
-        super(TemplateResourceAdoptTest, self).setUp()
 
     def _yaml_to_json(self, yaml_templ):
         return yaml.safe_load(yaml_templ)
@@ -680,9 +662,6 @@ Outputs:
     Value: {'Fn::GetAtt': [RealRandom, value]}
 '''
 
-    def setUp(self):
-        super(TemplateResourceCheckTest, self).setUp()
-
     def test_check(self):
         stack_identifier = self.stack_create(
             template=self.main_template,
@@ -711,9 +690,6 @@ Resources:
       fail: true
       wait_secs: 2
 '''
-
-    def setUp(self):
-        super(TemplateResourceErrorMessageTest, self).setUp()
 
     def test_fail(self):
         stack_identifier = self.stack_create(
@@ -747,9 +723,6 @@ resources:
     type: OS::Heat::RandomString
 '''
 
-    def setUp(self):
-        super(TemplateResourceSuspendResumeTest, self).setUp()
-
     def test_suspend_resume(self):
         """Basic test for template resource suspend resume."""
         stack_identifier = self.stack_create(
@@ -761,7 +734,7 @@ resources:
         self.stack_resume(stack_identifier=stack_identifier)
 
 
-class ValidateFacadeTest(test.HeatIntegrationTest):
+class ValidateFacadeTest(functional_base.FunctionalTestsBase):
     """Prove that nested stack errors don't suck."""
 
     template = '''
@@ -813,9 +786,11 @@ outputs:
     value:
       not-important
 '''
+        template = yaml.safe_load(self.template)
+        del template['resources']['thisone']['properties']['two']
         try:
             self.stack_create(
-                template=self.template,
+                template=yaml.safe_dump(template),
                 environment=self.env,
                 files={'facade.yaml': self.templ_facade,
                        'concrete.yaml': templ_missing_parameter},
@@ -823,7 +798,7 @@ outputs:
         except heat_exceptions.HTTPBadRequest as exc:
             exp = ('ERROR: Required property two for facade '
                    'OS::Thingy missing in provider')
-            self.assertEqual(exp, six.text_type(exc))
+            self.assertEqual(exp, str(exc))
 
     def test_missing_output(self):
         templ_missing_output = '''
@@ -847,7 +822,7 @@ resources:
         except heat_exceptions.HTTPBadRequest as exc:
             exp = ('ERROR: Attribute here-it-is for facade '
                    'OS::Thingy missing in provider')
-            self.assertEqual(exp, six.text_type(exc))
+            self.assertEqual(exp, str(exc))
 
 
 class TemplateResourceNewParamTest(functional_base.FunctionalTestsBase):

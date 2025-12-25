@@ -11,8 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import template_format
@@ -170,9 +169,9 @@ class TestContainer(common.HeatTestCase):
         defn = rsrc_defn.ResourceDefinition(
             'failed_container', 'OS::Barbican::GenericContainer', props)
         res = container.GenericContainer('foo', defn, stack)
-        self.assertRaisesRegexp(exception.StackValidationFailed,
-                                'Duplicate refs are not allowed',
-                                res.validate)
+        self.assertRaisesRegex(exception.StackValidationFailed,
+                               'Duplicate refs are not allowed',
+                               res.validate)
 
     def test_attributes(self):
         mock_container = mock.Mock()
@@ -205,5 +204,5 @@ class TestContainer(common.HeatTestCase):
         self.client.containers.get.return_value = mock_not_active
         exc = self.assertRaises(exception.ResourceInError,
                                 res.check_create_complete, 'foo')
-        self.assertIn('foo', six.text_type(exc))
-        self.assertIn('500', six.text_type(exc))
+        self.assertIn('foo', str(exc))
+        self.assertIn('500', str(exc))

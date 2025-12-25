@@ -11,14 +11,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+# flake8: noqa: E402
+
 import os
 import sys
 
 import fixtures
-import mox
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslotest import mockpatch
+from oslo_service import backend
+backend.init_backend(backend.BackendType.THREADING)
+
 import testscenarios
 import testtools
 
@@ -29,10 +32,10 @@ from heat.engine.clients.os import barbican
 from heat.engine.clients.os import cinder
 from heat.engine.clients.os import glance
 from heat.engine.clients.os import keystone
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.engine.clients.os.keystone import keystone_constraints as ks_constr
 from heat.engine.clients.os.neutron import neutron_constraints as neutron
 from heat.engine.clients.os import nova
-from heat.engine.clients.os import sahara
 from heat.engine.clients.os import trove
 from heat.engine import environment
 from heat.engine import resource
@@ -82,12 +85,12 @@ class HeatTestCase(testscenarios.WithScenarios,
                    testtools.TestCase, FakeLogMixin):
 
     def setUp(self, mock_keystone=True, mock_resource_policy=True,
-              quieten_logging=True):
-        super(HeatTestCase, self).setUp()
-        self.m = mox.Mox()
-        self.addCleanup(self.m.UnsetStubs)
+              quieten_logging=True, mock_find_file=True):
+        super().setUp()
         self.setup_logging(quieten=quieten_logging)
-        self.warnings = self.useFixture(fixtures.WarningsCapture())
+
+        self.useFixture(utils.WarningsFixture())
+
         scheduler.ENABLE_SLEEP = False
         self.useFixture(fixtures.MonkeyPatch(
             'heat.common.exception._FATAL_EXCEPTION_FORMAT_ERRORS',
@@ -106,7 +109,7 @@ class HeatTestCase(testscenarios.WithScenarios,
                                     'templates')
 
         cfg.CONF.set_default('environment_dir', env_dir)
-        cfg.CONF.set_override('error_wait_time', None, enforce_type=True)
+        cfg.CONF.set_override('error_wait_time', None)
         cfg.CONF.set_default('template_dir', template_dir)
         self.addCleanup(cfg.CONF.reset)
 
@@ -129,6 +132,9 @@ class HeatTestCase(testscenarios.WithScenarios,
                         '/etc/heat/templates',
                         templ_path)
 
+        if mock_find_file:
+            self.mock_find_file = self.patchobject(
+                cfg.ConfigOpts, 'find_file')
         if mock_keystone:
             self.stub_keystoneclient()
         if mock_resource_policy:
@@ -190,8 +196,6 @@ class HeatTestCase(testscenarios.WithScenarios,
                                  generic_rsrc.StackResourceType)
         resource._register_class('ResourceWithRestoreType',
                                  generic_rsrc.ResourceWithRestoreType)
-        resource._register_class('DynamicSchemaResource',
-                                 generic_rsrc.DynamicSchemaResource)
         resource._register_class('ResourceTypeUnSupportedLiberty',
                                  generic_rsrc.ResourceTypeUnSupportedLiberty)
         resource._register_class('ResourceTypeSupportedKilo',
@@ -203,14 +207,15 @@ class HeatTestCase(testscenarios.WithScenarios,
             generic_rsrc.ResourceWithHiddenPropertyAndAttribute)
 
     def patchobject(self, obj, attr, **kwargs):
-        mockfixture = self.useFixture(mockpatch.PatchObject(obj, attr,
-                                                            **kwargs))
+        mockfixture = self.useFixture(fixtures.MockPatchObject(obj, attr,
+                                                               **kwargs))
         return mockfixture.mock
 
     # NOTE(pshchelo): this overrides the testtools.TestCase.patch method
     # that does simple monkey-patching in favor of mock's patching
     def patch(self, target, **kwargs):
-        mockfixture = self.useFixture(mockpatch.Patch(target, **kwargs))
+        mockfixture = self.useFixture(fixtures.MockPatch(target,
+                                                         **kwargs))
         return mockfixture.mock
 
     def stub_auth(self, ctx=None, **kwargs):
@@ -222,7 +227,7 @@ class HeatTestCase(testscenarios.WithScenarios,
 
     def stub_keystoneclient(self, fake_client=None, **kwargs):
         client = self.patchobject(keystone.KeystoneClientPlugin, "_create")
-        fkc = fake_client or fakes.FakeKeystoneClient(**kwargs)
+        fkc = fake_client or fake_ks.FakeKeystoneClient(**kwargs)
         client.return_value = fkc
         return fkc
 
@@ -243,6 +248,10 @@ class HeatTestCase(testscenarios.WithScenarios,
 
     def stub_VolumeConstraint_validate(self):
         validate = self.patchobject(cinder.VolumeConstraint, 'validate')
+        validate.return_value = True
+
+    def stub_QoSSpecsConstraint_validate(self):
+        validate = self.patchobject(cinder.QoSSpecsConstraint, 'validate')
         validate.return_value = True
 
     def stub_SnapshotConstraint_validate(self):
@@ -294,17 +303,9 @@ class HeatTestCase(testscenarios.WithScenarios,
         validate = self.patchobject(neutron.QoSPolicyConstraint, 'validate')
         validate.return_value = True
 
-    def stub_NovaNetworkConstraint(self):
-        validate = self.patchobject(nova.NetworkConstraint, 'validate')
-        validate.return_value = True
-
     def stub_KeystoneProjectConstraint(self):
         validate = self.patchobject(ks_constr.KeystoneProjectConstraint,
                                     'validate')
-        validate.return_value = True
-
-    def stub_SaharaPluginConstraint(self):
-        validate = self.patchobject(sahara.PluginConstraint, 'validate')
         validate.return_value = True
 
     def stub_ProviderConstraint_validate(self):

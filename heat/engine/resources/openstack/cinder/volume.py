@@ -13,11 +13,9 @@
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.engine import attributes
 from heat.engine.clients import progress
 from heat.engine import constraints
@@ -28,6 +26,8 @@ from heat.engine import support
 from heat.engine import translation
 
 LOG = logging.getLogger(__name__)
+
+CINDER_MICROVERSIONS = (MICROVERSION_EXTEND_INUSE,) = ('3.42',)
 
 
 class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
@@ -52,12 +52,12 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
         AVAILABILITY_ZONE_ATTR, SIZE_ATTR, SNAPSHOT_ID_ATTR, DISPLAY_NAME_ATTR,
         DISPLAY_DESCRIPTION_ATTR, VOLUME_TYPE_ATTR, METADATA_ATTR,
         SOURCE_VOLID_ATTR, STATUS, CREATED_AT, BOOTABLE, METADATA_VALUES_ATTR,
-        ENCRYPTED_ATTR, ATTACHMENTS, MULTI_ATTACH_ATTR,
+        ENCRYPTED_ATTR, ATTACHMENTS, ATTACHMENTS_LIST, MULTI_ATTACH_ATTR,
     ) = (
         'availability_zone', 'size', 'snapshot_id', 'display_name',
         'display_description', 'volume_type', 'metadata',
         'source_volid', 'status', 'created_at', 'bootable', 'metadata_values',
-        'encrypted', 'attachments', 'multiattach',
+        'encrypted', 'attachments', 'attachments_list', 'multiattach',
     )
 
     properties_schema = {
@@ -117,6 +117,7 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             properties.Schema.MAP,
             _('Key/value pairs to associate with the volume.'),
             update_allowed=True,
+            default={}
         ),
         IMAGE_REF: properties.Schema(
             properties.Schema.STRING,
@@ -161,8 +162,13 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
         MULTI_ATTACH: properties.Schema(
             properties.Schema.BOOLEAN,
             _('Whether allow the volume to be attached more than once.'),
-            support_status=support.SupportStatus(version='6.0.0'),
-            default=False
+            default=False,
+            support_status=support.SupportStatus(
+                status=support.HIDDEN,
+                version='13.0.0',
+                previous_status=support.SupportStatus(
+                    status=support.SUPPORTED,
+                    version='6.0.0'))
         ),
     }
 
@@ -201,7 +207,8 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
         ),
         STATUS: attributes.Schema(
             _('The current status of the volume.'),
-            type=attributes.Schema.STRING
+            type=attributes.Schema.STRING,
+            cache_mode=attributes.Schema.CACHE_NONE
         ),
         CREATED_AT: attributes.Schema(
             _('The timestamp indicating volume creation.'),
@@ -220,8 +227,25 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             type=attributes.Schema.STRING
         ),
         ATTACHMENTS: attributes.Schema(
+            _('A string representation of the list of attachments of the '
+              'volume.'),
+            type=attributes.Schema.STRING,
+            cache_mode=attributes.Schema.CACHE_NONE,
+            support_status=support.SupportStatus(
+                status=support.DEPRECATED,
+                message=_('Use property %s.') % ATTACHMENTS_LIST,
+                version='9.0.0',
+                previous_status=support.SupportStatus(
+                    status=support.SUPPORTED,
+                    version='2015.1'
+                )
+            )
+        ),
+        ATTACHMENTS_LIST: attributes.Schema(
             _('The list of attachments of the volume.'),
-            type=attributes.Schema.STRING
+            type=attributes.Schema.LIST,
+            cache_mode=attributes.Schema.CACHE_NONE,
+            support_status=support.SupportStatus(version='9.0.0'),
         ),
         MULTI_ATTACH_ATTR: attributes.Schema(
             _('Boolean indicating whether allow the volume to be attached '
@@ -257,7 +281,8 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
     def _create_arguments(self):
         arguments = {
             'size': self.properties[self.SIZE],
-            'availability_zone': self.properties[self.AVAILABILITY_ZONE],
+            'availability_zone': (self.properties[self.AVAILABILITY_ZONE] or
+                                  None),
         }
 
         scheduler_hints = self._scheduler_hints(
@@ -273,7 +298,7 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             arguments['imageRef'] = self.properties[self.IMAGE_REF]
 
         optionals = (self.SNAPSHOT_ID, self.VOLUME_TYPE, self.SOURCE_VOLID,
-                     self.METADATA, self.MULTI_ATTACH)
+                     self.METADATA)
 
         arguments.update((prop, self.properties[prop]) for prop in optionals
                          if self.properties[prop] is not None)
@@ -281,17 +306,21 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
         return arguments
 
     def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
         cinder = self.client()
         vol = cinder.volumes.get(self.resource_id)
         if name == self.METADATA_ATTR:
-            return six.text_type(jsonutils.dumps(vol.metadata))
+            return str(jsonutils.dumps(vol.metadata))
         elif name == self.METADATA_VALUES_ATTR:
             return vol.metadata
         if name == self.DISPLAY_NAME_ATTR:
             return vol.name
         elif name == self.DISPLAY_DESCRIPTION_ATTR:
             return vol.description
-        return six.text_type(getattr(vol, name))
+        elif name == self.ATTACHMENTS_LIST:
+            return vol.attachments
+        return str(getattr(vol, name))
 
     def check_create_complete(self, vol_id):
         complete = super(CinderVolume, self).check_create_complete(vol_id)
@@ -327,7 +356,7 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             if self.client_plugin().is_client_exception(ex):
                 raise exception.Error(_(
                     "Failed to extend volume %(vol)s - %(err)s") % {
-                        'vol': self.resource_id, 'err': six.text_type(ex)})
+                        'vol': self.resource_id, 'err': str(ex)})
             else:
                 raise
         return True
@@ -339,21 +368,36 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
 
         return True
 
+    def _ready_to_extend_volume(self):
+        vol = self.client().volumes.get(self.resource_id)
+        expected_status = ('available',)
+        if self.client_plugin().is_version_supported(
+                MICROVERSION_EXTEND_INUSE):
+            expected_status = ('available', 'in-use')
+        if vol.status in expected_status:
+            LOG.debug("Volume %s is ready to extend.", vol.id)
+            return True
+        return False
+
     def _check_extend_volume_complete(self):
         vol = self.client().volumes.get(self.resource_id)
         if vol.status == 'extending':
-            LOG.debug("Volume %s is being extended" % vol.id)
+            LOG.debug("Volume %s is being extended", vol.id)
             return False
 
-        if vol.status != 'available':
-            LOG.info(_LI("Resize failed: Volume %(vol)s "
-                         "is in %(status)s state."),
+        expected_status = ('available',)
+        if self.client_plugin().is_version_supported(
+                MICROVERSION_EXTEND_INUSE):
+            expected_status = ('available', 'in-use')
+        if vol.status not in expected_status:
+            LOG.info("Resize failed: Volume %(vol)s "
+                     "is in %(status)s state.",
                      {'vol': vol.id, 'status': vol.status})
             raise exception.ResourceUnknownStatus(
                 resource_status=vol.status,
                 result=_('Volume resize failed'))
 
-        LOG.info(_LI('Volume %(id)s resize complete'), {'id': vol.id})
+        LOG.info('Volume %(id)s resize complete', {'id': vol.id})
         return True
 
     def _backup_restore(self, vol_id, backup_id):
@@ -373,17 +417,27 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
     def _check_backup_restore_complete(self):
         vol = self.client().volumes.get(self.resource_id)
         if vol.status == 'restoring-backup':
-            LOG.debug("Volume %s is being restoring from backup" % vol.id)
+            LOG.debug("Volume %s is being restoring from backup", vol.id)
             return False
 
         if vol.status != 'available':
-            LOG.info(_LI("Restore failed: Volume %(vol)s is in %(status)s "
-                         "state."), {'vol': vol.id, 'status': vol.status})
+            LOG.info("Restore failed: Volume %(vol)s is in %(status)s "
+                     "state.", {'vol': vol.id, 'status': vol.status})
             raise exception.ResourceUnknownStatus(
                 resource_status=vol.status,
                 result=_('Volume backup restore failed'))
 
-        LOG.info(_LI('Volume %(id)s backup restore complete'), {'id': vol.id})
+        LOG.info('Volume %s backup restore complete', vol.id)
+        return True
+
+    def needs_replace_failed(self):
+        if not self.resource_id:
+            return True
+
+        with self.client_plugin().ignore_not_found:
+            vol = self.client().volumes.get(self.resource_id)
+            return vol.status in ('error', 'deleting')
+
         return True
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
@@ -427,9 +481,12 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             prg_detach, prg_attach = self._detach_attach_progress(vol)
         # restore the volume from backup
         if self.BACKUP_ID in prop_diff:
+            if not vol:
+                vol = cinder.volumes.get(self.resource_id)
             prg_restore = progress.VolumeBackupRestoreProgress(
                 vol_id=self.resource_id,
                 backup_id=prop_diff.get(self.BACKUP_ID))
+            prg_detach, prg_attach = self._detach_attach_progress(vol)
         # extend volume size
         if self.SIZE in prop_diff:
             if not vol:
@@ -441,7 +498,9 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
 
             elif new_size > vol.size:
                 prg_resize = progress.VolumeResizeProgress(size=new_size)
-                prg_detach, prg_attach = self._detach_attach_progress(vol)
+                if not self.client_plugin().is_version_supported(
+                        MICROVERSION_EXTEND_INUSE):
+                    prg_detach, prg_attach = self._detach_attach_progress(vol)
 
         return prg_restore, prg_detach, prg_resize, prg_access, prg_attach
 
@@ -468,14 +527,14 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
 
     def _detach_volume_to_complete(self, prg_detach):
         if not prg_detach.called:
-            self.client_plugin('nova').detach_volume(prg_detach.srv_id,
-                                                     prg_detach.attach_id)
-            prg_detach.called = True
+            prg_detach.called = self.client_plugin(
+                'nova').detach_volume(prg_detach.srv_id,
+                                      prg_detach.attach_id)
             return False
         if not prg_detach.cinder_complete:
-            cinder_complete_res = self.client_plugin(
-            ).check_detach_volume_complete(prg_detach.vol_id)
-            prg_detach.cinder_complete = cinder_complete_res
+            prg_detach.cinder_complete = self.client_plugin(
+            ).check_detach_volume_complete(prg_detach.vol_id,
+                                           prg_detach.srv_id)
             return False
         if not prg_detach.nova_complete:
             prg_detach.nova_complete = self.client_plugin(
@@ -495,6 +554,11 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
 
     def check_update_complete(self, checkers):
         prg_restore, prg_detach, prg_resize, prg_access, prg_attach = checkers
+        # detach volume
+        if prg_detach:
+            if not prg_detach.nova_complete:
+                self._detach_volume_to_complete(prg_detach)
+                return False
         if prg_restore:
             if not prg_restore.called:
                 prg_restore.called = self._backup_restore(
@@ -504,15 +568,15 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             if not prg_restore.complete:
                 prg_restore.complete = self._check_backup_restore_complete()
                 return prg_restore.complete and not prg_resize
-        if not prg_resize and not prg_access:
-            return True
-        # detach volume
-        if prg_detach:
-            if not prg_detach.nova_complete:
-                self._detach_volume_to_complete(prg_detach)
-                return False
         # resize volume
         if prg_resize:
+            # Make sure volume status ready for resize.
+            if not prg_resize.pre_check:
+                prg_resize.pre_check = self._ready_to_extend_volume()
+                # allow directly extend volume if it's ready
+                if not prg_resize.pre_check:
+                    return False
+
             if not prg_resize.called:
                 prg_resize.called = self._extend_volume(prg_resize.size)
                 return False
@@ -531,7 +595,7 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
         return True
 
     def handle_snapshot(self):
-        backup = self.client().backups.create(self.resource_id)
+        backup = self.client().backups.create(self.resource_id, force=True)
         self.data_set('backup_id', backup.id)
         return backup.id
 
@@ -634,7 +698,7 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
             self.IMAGE_REF, self.IMAGE, self.SOURCE_VOLID)
         props = dict(
             (key, value) for (key, value) in
-            six.iteritems(defn.properties(self.properties_schema))
+            self.properties.data.items()
             if key not in ignore_props and value is not None)
         props[self.BACKUP_ID] = backup_id
         return defn.freeze(properties=props)
@@ -644,8 +708,8 @@ class CinderVolume(vb.BaseVolume, sh.SchedulerHintsMixin):
 
         if (resource_data.get(self.METADATA) and
                 resource_data.get(self.METADATA).get(
-                    self.READ_ONLY) is not None):
-            read_only = resource_data.get(self.METADATA).pop(self.READ_ONLY)
+                    'readonly') is not None):
+            read_only = resource_data.get(self.METADATA).pop('readonly')
             volume_reality.update({self.READ_ONLY: read_only})
 
         old_vt = self.data().get(self.VOLUME_TYPE)
@@ -710,11 +774,12 @@ class CinderVolumeAttachment(vb.BaseVolumeAttachment):
             # self.resource_id is not replaced prematurely
             volume_id = self.properties[self.VOLUME_ID]
             server_id = self.properties[self.INSTANCE_ID]
-            self.client_plugin('nova').detach_volume(server_id,
-                                                     self.resource_id)
+
             prg_detach = progress.VolumeDetachProgress(
                 server_id, volume_id, self.resource_id)
-            prg_detach.called = True
+
+            prg_detach.called = self.client_plugin(
+                'nova').detach_volume(server_id, self.resource_id)
 
             if self.VOLUME_ID in prop_diff:
                 volume_id = prop_diff.get(self.VOLUME_ID)
@@ -738,7 +803,8 @@ class CinderVolumeAttachment(vb.BaseVolumeAttachment):
             return True
         if not prg_detach.cinder_complete:
             prg_detach.cinder_complete = self.client_plugin(
-            ).check_detach_volume_complete(prg_detach.vol_id)
+            ).check_detach_volume_complete(prg_detach.vol_id,
+                                           prg_detach.srv_id)
             return False
         if not prg_detach.nova_complete:
             prg_detach.nova_complete = self.client_plugin(

@@ -11,18 +11,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 from oslo_serialization import jsonutils
-import six
 
 from heat.common import exception
 from heat.engine import constraints
+from heat.engine import function
 from heat.engine.hot import functions as hot_funcs
 from heat.engine.hot import parameters as hot_param
 from heat.engine import parameters
 from heat.engine import plugin_manager
 from heat.engine import properties
 from heat.engine import resources
+from heat.engine import rsrc_defn
 from heat.engine import support
+from heat.engine import translation
 from heat.tests import common
 
 
@@ -68,8 +72,8 @@ class PropertySchemaTest(common.HeatTestCase):
         s = properties.Schema(properties.Schema.STRING, 'A string',
                               default='wibble',
                               constraints=[constraints.Length(4, 8)])
-        l = properties.Schema(properties.Schema.LIST, 'A list', schema=s)
-        self.assertEqual(d, dict(l))
+        ls = properties.Schema(properties.Schema.LIST, 'A list', schema=s)
+        self.assertEqual(d, dict(ls))
 
     def test_schema_map_schema(self):
         d = {
@@ -134,14 +138,14 @@ class PropertySchemaTest(common.HeatTestCase):
                               constraints=[constraints.Length(4, 8)])
         m = properties.Schema(properties.Schema.MAP, 'A map',
                               schema={'Foo': s})
-        l = properties.Schema(properties.Schema.LIST, 'A list', schema=m)
-        self.assertEqual(d, dict(l))
+        ls = properties.Schema(properties.Schema.LIST, 'A list', schema=m)
+        self.assertEqual(d, dict(ls))
 
     def test_all_resource_schemata(self):
         for resource_type in resources.global_env().get_types():
-            for schema in six.itervalues(getattr(resource_type,
-                                                 'properties_schema',
-                                                 {})):
+            for schema in getattr(resource_type,
+                                  'properties_schema',
+                                  {}).values():
                 properties.Schema.from_legacy(schema)
 
     def test_from_legacy_idempotency(self):
@@ -289,7 +293,7 @@ class PropertySchemaTest(common.HeatTestCase):
         self.assertEqual('[a-z]*', c.pattern)
 
     def test_from_legacy_list(self):
-        l = properties.Schema.from_legacy({
+        ls = properties.Schema.from_legacy({
             'Type': 'List',
             'Default': ['wibble'],
             'Schema': {
@@ -298,15 +302,15 @@ class PropertySchemaTest(common.HeatTestCase):
                 'MaxLength': 8,
             }
         })
-        self.assertEqual(properties.Schema.LIST, l.type)
-        self.assertEqual(['wibble'], l.default)
+        self.assertEqual(properties.Schema.LIST, ls.type)
+        self.assertEqual(['wibble'], ls.default)
 
-        ss = l.schema[0]
+        ss = ls.schema[0]
         self.assertEqual(properties.Schema.STRING, ss.type)
         self.assertEqual('wibble', ss.default)
 
     def test_from_legacy_map(self):
-        l = properties.Schema.from_legacy({
+        ls = properties.Schema.from_legacy({
             'Type': 'Map',
             'Schema': {
                 'foo': {
@@ -315,9 +319,9 @@ class PropertySchemaTest(common.HeatTestCase):
                 }
             }
         })
-        self.assertEqual(properties.Schema.MAP, l.type)
+        self.assertEqual(properties.Schema.MAP, ls.type)
 
-        ss = l.schema['foo']
+        ss = ls.schema['foo']
         self.assertEqual(properties.Schema.STRING, ss.type)
         self.assertEqual('wibble', ss.default)
 
@@ -633,7 +637,7 @@ class PropertySchemaTest(common.HeatTestCase):
                 update = True
             sub_schema = prop.schema
             if sub_schema:
-                for sub_prop_key, sub_prop in six.iteritems(sub_schema):
+                for sub_prop_key, sub_prop in sub_schema.items():
                     if not update:
                         self.assertEqual(update, sub_prop.update_allowed,
                                          "Mismatch in update policies: "
@@ -642,18 +646,18 @@ class PropertySchemaTest(common.HeatTestCase):
                                          {'res': resource_type,
                                           'prop': prop_key,
                                           'nested_prop': sub_prop_key})
-                    if sub_prop_key is '*':
+                    if sub_prop_key == '*':
                         check_update_policy(resource_type, prop_key,
                                             sub_prop, update)
                     else:
                         check_update_policy(resource_type, sub_prop_key,
                                             sub_prop, update)
 
-        for resource_type, resource_class in six.iteritems(all_resources):
+        for resource_type, resource_class in all_resources.items():
             props_schemata = properties.schemata(
                 resource_class.properties_schema)
 
-            for prop_key, prop in six.iteritems(props_schemata):
+            for prop_key, prop in props_schemata.items():
                 check_update_policy(resource_type, prop_key, prop)
 
 
@@ -779,11 +783,12 @@ class PropertyTest(common.HeatTestCase):
     def test_int_bad(self):
         schema = {'Type': 'Integer'}
         p = properties.Property(schema)
-        # python 3.4.3 returns another error message
+        # python 3.4.3 and python3.10 return slightly different error messages
         # try to handle this by regexp
-        self.assertRaisesRegexp(
-            TypeError, "int\(\) argument must be a string(, a bytes-like "
-                       "object)? or a number, not 'list'", p.get_value, [1])
+        self.assertRaisesRegex(
+            TypeError, r"int\(\) argument must be a string"
+                       "(, a bytes-like object)?"
+                       " or a (real )?number, not 'list'", p.get_value, [1])
 
     def test_str_from_int(self):
         schema = {'Type': 'String'}
@@ -804,7 +809,7 @@ class PropertyTest(common.HeatTestCase):
         schema = {'Type': 'Integer'}
         p = properties.Property(schema)
         ex = self.assertRaises(TypeError, p.get_value, '3a')
-        self.assertEqual("Value '3a' is not an integer", six.text_type(ex))
+        self.assertEqual("Value '3a' is not an integer", str(ex))
 
     def test_integer_low(self):
         schema = {'Type': 'Integer',
@@ -887,9 +892,13 @@ class PropertyTest(common.HeatTestCase):
         self.assertIs(False, p.get_value('false'))
         self.assertIs(False, p.get_value(False))
 
-    def test_boolean_invalid(self):
+    def test_boolean_invalid_string(self):
         p = properties.Property({'Type': 'Boolean'})
         self.assertRaises(ValueError, p.get_value, 'fish')
+
+    def test_boolean_invalid_int(self):
+        p = properties.Property({'Type': 'Boolean'})
+        self.assertRaises(TypeError, p.get_value, 5)
 
     def test_list_string(self):
         p = properties.Property({'Type': 'List'})
@@ -909,6 +918,14 @@ class PropertyTest(common.HeatTestCase):
         p.schema.allow_conversion = True
         self.assertEqual(['foo', 'bar'], p.get_value('foo,bar'))
         self.assertEqual(['foo'], p.get_value('foo'))
+
+    def test_map_path(self):
+        p = properties.Property({'Type': 'Map'}, name='test', path='parent')
+        self.assertEqual('parent.test', p.path)
+
+    def test_list_path(self):
+        p = properties.Property({'Type': 'List'}, name='0', path='parent')
+        self.assertEqual('parent.0', p.path)
 
     def test_list_maxlength_good(self):
         schema = {'Type': 'List',
@@ -989,7 +1006,7 @@ class PropertyTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                p.get_value, {'valid': 'fish'}, True)
         self.assertEqual('Property error: valid: "fish" is not a '
-                         'valid boolean', six.text_type(ex))
+                         'valid boolean', str(ex))
 
     def test_map_schema_missing_data(self):
         map_schema = {'valid': {'Type': 'Boolean'}}
@@ -1002,7 +1019,7 @@ class PropertyTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                p.get_value, {}, True)
         self.assertEqual('Property error: Property valid not assigned',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_list_schema_good(self):
         map_schema = {'valid': {'Type': 'Boolean'}}
@@ -1021,7 +1038,7 @@ class PropertyTest(common.HeatTestCase):
                                p.get_value,
                                [{'valid': 'True'}, {'valid': 'fish'}], True)
         self.assertEqual('Property error: [1].valid: "fish" is not '
-                         'a valid boolean', six.text_type(ex))
+                         'a valid boolean', str(ex))
 
     def test_list_schema_int_good(self):
         list_schema = {'Type': 'Integer'}
@@ -1034,7 +1051,7 @@ class PropertyTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                p.get_value, [42, 'fish'], True)
         self.assertEqual("Property error: [1]: Value 'fish' is not "
-                         "an integer", six.text_type(ex))
+                         "an integer", str(ex))
 
 
 class PropertiesTest(common.HeatTestCase):
@@ -1057,7 +1074,7 @@ class PropertiesTest(common.HeatTestCase):
             'default_override': 21,
         }
 
-        def double(d):
+        def double(d, nullable=False):
             return d * 2
 
         self.props = properties.Properties(schema, data, double, 'wibble')
@@ -1072,6 +1089,14 @@ class PropertiesTest(common.HeatTestCase):
         self.assertFalse(self.props['default_bool'])
 
     def test_missing_required(self):
+        self.assertRaises(ValueError, self.props.get, 'required_int')
+
+    @mock.patch.object(translation.Translation, 'has_translation')
+    @mock.patch.object(translation.Translation, 'translate')
+    def test_required_with_translate_no_value(self, m_t, m_ht):
+        m_t.return_value = None
+        m_ht.return_value = True
+
         self.assertRaises(ValueError, self.props.get, 'required_int')
 
     def test_integer_bad(self):
@@ -1094,7 +1119,7 @@ class PropertiesTest(common.HeatTestCase):
         ex = self.assertRaises(KeyError, self.props.get_user_value, 'foo')
         # Note we have to use args here: https://bugs.python.org/issue2651
         self.assertEqual('Invalid Property foo',
-                         six.text_type(ex.args[0]))
+                         str(ex.args[0]))
 
     def test_bad_key(self):
         self.assertEqual('wibble', self.props.get('foo', 'wibble'))
@@ -1103,7 +1128,7 @@ class PropertiesTest(common.HeatTestCase):
         ex = self.assertRaises(KeyError, self.props.__getitem__, 'foo')
         # Note we have to use args here: https://bugs.python.org/issue2651
         self.assertEqual('Invalid Property foo',
-                         six.text_type(ex.args[0]))
+                         str(ex.args[0]))
 
     def test_none_string(self):
         schema = {'foo': {'Type': 'String'}}
@@ -1184,7 +1209,7 @@ class PropertiesTest(common.HeatTestCase):
     def test_resolve_returns_none(self):
         schema = {'foo': {'Type': 'String', "MinLength": "5"}}
 
-        def test_resolver(prop):
+        def test_resolver(prop, nullable=False):
             return None
 
         self.patchobject(properties.Properties,
@@ -1221,7 +1246,7 @@ class PropertiesTest(common.HeatTestCase):
         }
 
         # define parameters for function
-        def test_resolver(prop):
+        def test_resolver(prop, nullable=False):
             return 'None'
 
         class rsrc(object):
@@ -1620,13 +1645,57 @@ class PropertiesTest(common.HeatTestCase):
         schema = {'foo': {'Type': 'Integer'}}
         props_a = properties.Properties(schema, {'foo': 1})
         props_b = properties.Properties(schema, {'foo': 1})
-        self.assertFalse(props_a != props_b)
+        self.assertFalse(props_a != props_b)  # noqa: H204
 
     def test_compare_different(self):
         schema = {'foo': {'Type': 'Integer'}}
         props_a = properties.Properties(schema, {'foo': 0})
         props_b = properties.Properties(schema, {'foo': 1})
-        self.assertTrue(props_a != props_b)
+        self.assertTrue(props_a != props_b)  # noqa: H204
+
+    def test_description_substitution(self):
+        schema = {
+            'description': properties.Schema('String',
+                                             update_allowed=True),
+            'not_description': properties.Schema('String',
+                                                 update_allowed=True),
+        }
+        blank_rsrc = rsrc_defn.ResourceDefinition('foo', 'FooResource', {},
+                                                  description='Foo resource')
+        bar_rsrc = rsrc_defn.ResourceDefinition('foo', 'FooResource',
+                                                {'description': 'bar'},
+                                                description='Foo resource')
+
+        blank_props = blank_rsrc.properties(schema)
+        self.assertEqual('Foo resource', blank_props['description'])
+        self.assertIsNone(blank_props['not_description'])
+
+        replace_schema = {'description': properties.Schema('String')}
+        empty_props = blank_rsrc.properties(replace_schema)
+        self.assertIsNone(empty_props['description'])
+
+        bar_props = bar_rsrc.properties(schema)
+        self.assertEqual('bar', bar_props['description'])
+
+    def test_null_property_value(self):
+        class NullFunction(function.Function):
+            def result(self):
+                return Ellipsis
+
+        schema = {
+            'Foo': properties.Schema('String', required=False),
+            'Bar': properties.Schema('String', required=False),
+            'Baz': properties.Schema('String', required=False),
+        }
+        user_props = {'Foo': NullFunction(None, 'null', []), 'Baz': None}
+        props = properties.Properties(schema, user_props, function.resolve)
+
+        self.assertIsNone(props['Foo'])
+        self.assertIsNone(props.get_user_value('Foo'))
+        self.assertIsNone(props['Bar'])
+        self.assertIsNone(props.get_user_value('Bar'))
+        self.assertEqual('', props['Baz'])
+        self.assertEqual('', props.get_user_value('Baz'))
 
 
 class PropertiesValidationTest(common.HeatTestCase):
@@ -1664,15 +1733,15 @@ class PropertiesValidationTest(common.HeatTestCase):
         schema = {'foo': {'Type': 'String'}}
         props = properties.Properties(schema, {'foo': ['foo', 'bar']})
         ex = self.assertRaises(exception.StackValidationFailed, props.validate)
-        self.assertEqual('Property error: foo: Value must be a string',
-                         six.text_type(ex))
+        self.assertIn('Property error: foo: Value must be a string',
+                      str(ex))
 
     def test_dict_instead_string(self):
         schema = {'foo': {'Type': 'String'}}
         props = properties.Properties(schema, {'foo': {'foo': 'bar'}})
         ex = self.assertRaises(exception.StackValidationFailed, props.validate)
-        self.assertEqual('Property error: foo: Value must be a string',
-                         six.text_type(ex))
+        self.assertIn('Property error: foo: Value must be a string',
+                      str(ex))
 
     def test_none_string(self):
         schema = {'foo': {'Type': 'String'}}
@@ -1839,7 +1908,7 @@ class PropertiesValidationTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                props.validate)
         self.assertEqual('Property error: foo[0]: Unknown Property bar',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_nested_properties_schema_invalid_property_in_map(self):
         child_schema = {'Key': {'Type': 'String',
@@ -1858,7 +1927,7 @@ class PropertiesValidationTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                props.validate)
         self.assertEqual('Property error: foo.boo: Unknown Property bar',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_more_nested_properties_schema_invalid_property_in_list(self):
         nested_child_schema = {'Key': {'Type': 'String',
@@ -1876,7 +1945,7 @@ class PropertiesValidationTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                props.validate)
         self.assertEqual('Property error: foo[0].doo: Unknown Property bar',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_more_nested_properties_schema_invalid_property_in_map(self):
         nested_child_schema = {'Key': {'Type': 'String',
@@ -1894,7 +1963,7 @@ class PropertiesValidationTest(common.HeatTestCase):
         ex = self.assertRaises(exception.StackValidationFailed,
                                props.validate)
         self.assertEqual('Property error: foo.boo.doo: Unknown Property bar',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_schema_to_template_empty_schema(self):
         schema = {}

@@ -15,21 +15,19 @@ import random
 import re
 import subprocess
 import time
+import urllib
 
 import fixtures
 from heatclient import exc as heat_exceptions
-from neutronclient.common import exceptions as network_exceptions
+from keystoneauth1 import exceptions as kc_exceptions
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import six
-from six.moves import urllib
+from tempest import config
 import testscenarios
 import testtools
 
 from heat_integrationtests.common import clients
-from heat_integrationtests.common import config
 from heat_integrationtests.common import exceptions
-from heat_integrationtests.common import remote_client
 
 LOG = logging.getLogger(__name__)
 _LOG_FORMAT = "%(levelname)8s [%(name)s] %(message)s"
@@ -67,6 +65,17 @@ def rand_name(name=''):
         return randbits
 
 
+def requires_convergence(test_method):
+    '''Decorator for convergence-only tests.
+
+    The decorated test will be skipped when convergence is disabled.
+    '''
+    convergence_enabled = config.CONF.heat_plugin.convergence_engine_enabled
+    skipper = testtools.skipUnless(convergence_enabled,
+                                   "Convergence-only tests are disabled")
+    return skipper(test_method)
+
+
 class HeatIntegrationTest(testscenarios.WithScenarios,
                           testtools.TestCase):
 
@@ -83,7 +92,6 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
                              'No password configured')
         self.setup_clients(self.conf)
         self.useFixture(fixtures.FakeLogger(format=_LOG_FORMAT))
-        self.updated_time = {}
         if self.conf.disable_ssl_certificate_validation:
             self.verify_cert = False
         else:
@@ -92,36 +100,15 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
     def setup_clients(self, conf, admin_credentials=False):
         self.manager = clients.ClientManager(conf, admin_credentials)
         self.identity_client = self.manager.identity_client
+        self.keystone_client = self.manager.keystone_client
         self.orchestration_client = self.manager.orchestration_client
         self.compute_client = self.manager.compute_client
-        self.network_client = self.manager.network_client
-        self.volume_client = self.manager.volume_client
         self.object_client = self.manager.object_client
-        self.metering_client = self.manager.metering_client
 
         self.client = self.orchestration_client
 
     def setup_clients_for_admin(self):
         self.setup_clients(self.conf, True)
-
-    def get_remote_client(self, server_or_ip, username, private_key=None):
-        if isinstance(server_or_ip, six.string_types):
-            ip = server_or_ip
-        else:
-            network_name_for_ssh = self.conf.network_for_ssh
-            ip = server_or_ip.networks[network_name_for_ssh][0]
-        if private_key is None:
-            private_key = self.keypair.private_key
-        linux_client = remote_client.RemoteClient(ip, username,
-                                                  pkey=private_key,
-                                                  conf=self.conf)
-        try:
-            linux_client.validate_authentication()
-        except exceptions.SSHTimeout:
-            LOG.exception('ssh connection to %s failed' % ip)
-            raise
-
-        return linux_client
 
     def check_connectivity(self, check_ip):
         def try_connect(ip):
@@ -175,24 +162,24 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
             self.keypair = self.create_keypair()
             self.keypair_name = self.keypair.id
 
-    @classmethod
-    def _stack_rand_name(cls):
-        return rand_name(cls.__name__)
+    def _stack_rand_name(self):
+        test_name = self.id()
+        if test_name and '.' in test_name:
+            name = '-'.join(test_name.split('.')[-2:])
+            # remove 'testname(...)' cases
+            name = name.split('(')[0]
+        else:
+            name = self.__name__
+        return rand_name(name)
 
-    def _get_network(self, net_name=None):
-        if net_name is None:
-            net_name = self.conf.fixed_network_name
-        networks = self.network_client.list_networks()
-        for net in networks['networks']:
-            if net['name'] == net_name:
-                return net
-
-    def is_network_extension_supported(self, extension_alias):
+    def is_service_available(self, service_type):
         try:
-            self.network_client.show_extension(extension_alias)
-        except network_exceptions.NeutronClientException:
+            self.identity_client.get_endpoint_url(
+                service_type, self.conf.region)
+        except kc_exceptions.EndpointNotFound:
             return False
-        return True
+        else:
+            return True
 
     @staticmethod
     def _stack_output(stack, output_key, validate_errors=True):
@@ -237,7 +224,7 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
         fail_regexp = re.compile(failure_pattern)
         build_timeout = self.conf.build_timeout
         build_interval = self.conf.build_interval
-
+        res = None
         start = timeutils.utcnow()
         while timeutils.delta_seconds(start,
                                       timeutils.utcnow()) < build_timeout:
@@ -263,9 +250,11 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
                         resource_status_reason=res.resource_status_reason)
             time.sleep(build_interval)
 
-        message = ('Resource %s failed to reach %s status within '
-                   'the required time (%s s).' %
-                   (resource_name, status, build_timeout))
+        message = ('Resource %s from stack %s failed to reach %s status '
+                   'within the required time (%s s). Current resource '
+                   'status: %s.' %
+                   (resource_name, stack_identifier, status, build_timeout,
+                    res.resource_status))
         raise exceptions.TimeoutException(message)
 
     def verify_resource_status(self, stack_identifier, resource_name,
@@ -276,41 +265,32 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
             return False
         return res.resource_status == status
 
-    def _verify_status(self, stack, stack_identifier, status, fail_regexp):
+    def _verify_status(self, stack, stack_identifier, status,
+                       fail_regexp, is_action_cancelled=False):
         if stack.stack_status == status:
-            # Handle UPDATE_COMPLETE/FAILED case: Make sure we don't
-            # wait for a stale UPDATE_COMPLETE/FAILED status.
-            if status in ('UPDATE_FAILED', 'UPDATE_COMPLETE'):
-                if self.updated_time.get(
-                        stack_identifier) != stack.updated_time:
-                    self.updated_time[stack_identifier] = stack.updated_time
-                    return True
+            if status == 'DELETE_COMPLETE' and stack.deletion_time is None:
+                # Wait for deleted_time to be filled, so that we have more
+                # confidence the operation is finished.
+                return False
             else:
                 return True
 
         wait_for_action = status.split('_')[0]
         if (stack.action == wait_for_action and
                 fail_regexp.search(stack.stack_status)):
-            # Handle UPDATE_COMPLETE/UPDATE_FAILED case.
-            if status in ('UPDATE_FAILED', 'UPDATE_COMPLETE'):
-                if self.updated_time.get(
-                        stack_identifier) != stack.updated_time:
-                    self.updated_time[stack_identifier] = stack.updated_time
-                    raise exceptions.StackBuildErrorException(
-                        stack_identifier=stack_identifier,
-                        stack_status=stack.stack_status,
-                        stack_status_reason=stack.stack_status_reason)
-            else:
-                raise exceptions.StackBuildErrorException(
-                    stack_identifier=stack_identifier,
-                    stack_status=stack.stack_status,
-                    stack_status_reason=stack.stack_status_reason)
+            raise exceptions.StackBuildErrorException(
+                stack_identifier=stack_identifier,
+                stack_status=stack.stack_status,
+                stack_status_reason=stack.stack_status_reason)
+
+        return False
 
     def _wait_for_stack_status(self, stack_identifier, status,
                                failure_pattern=None,
                                success_on_not_found=False,
                                signal_required=False,
-                               resources_to_signal=None):
+                               resources_to_signal=None,
+                               is_action_cancelled=False):
         """Waits for a Stack to reach a given status.
 
         Note this compares the full $action_$status, e.g
@@ -336,19 +316,25 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
             except heat_exceptions.HTTPNotFound:
                 if success_on_not_found:
                     return
+                elif not any(s in status for s in ['CREATE', 'ADOPT']):
+                    # raise exception when stack not found, if it's not
+                    # in create or adopt (which should be the only two possible
+                    # reason that stack may not have been created yet)
+                    raise
                 # ignore this, as the resource may not have
                 # been created yet
             else:
                 if self._verify_status(stack, stack_identifier, status,
-                                       fail_regexp):
+                                       fail_regexp, is_action_cancelled):
                     return
             if signal_required:
                 self.signal_resources(resources_to_signal)
             time.sleep(build_interval)
 
         message = ('Stack %s failed to reach %s status within '
-                   'the required time (%s s).' %
-                   (stack_identifier, status, build_timeout))
+                   'the required time (%s s). Current stack state: %s.' %
+                   (stack_identifier, status, build_timeout,
+                    stack.stack_status))
         raise exceptions.TimeoutException(message)
 
     def _stack_delete(self, stack_identifier):
@@ -388,9 +374,6 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
         env_files = files or {}
         parameters = parameters or {}
 
-        self.updated_time[stack_identifier] = self.client.stacks.get(
-            stack_identifier, resolve_outputs=False).updated_time
-
         self._handle_in_progress(
             self.client.stacks.update,
             stack_id=stack_identifier,
@@ -404,6 +387,28 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
 
         kwargs = {'stack_identifier': stack_identifier,
                   'status': expected_status}
+        if expected_status in ['ROLLBACK_COMPLETE']:
+            # To trigger rollback you would intentionally fail the stack
+            # Hence check for rollback failures
+            kwargs['failure_pattern'] = '^ROLLBACK_FAILED$'
+
+        self._wait_for_stack_status(**kwargs)
+
+    def cancel_update_stack(self, stack_identifier, rollback=True,
+                            expected_status='ROLLBACK_COMPLETE'):
+
+        stack_name = stack_identifier.split('/')[0]
+
+        if rollback:
+            self.client.actions.cancel_update(stack_name)
+        else:
+            self.client.actions.cancel_without_rollback(stack_name)
+
+        kwargs = {'stack_identifier': stack_identifier,
+                  'status': expected_status}
+        if expected_status == 'UPDATE_FAILED':
+            kwargs['is_action_cancelled'] = True
+
         if expected_status in ['ROLLBACK_COMPLETE']:
             # To trigger rollback you would intentionally fail the stack
             # Hence check for rollback failures
@@ -452,7 +457,7 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
 
     def _get_nested_identifier(self, stack_identifier, res_name):
         rsrc = self.client.resources.get(stack_identifier, res_name)
-        nested_link = [l for l in rsrc.links if l['rel'] == 'nested']
+        nested_link = [lk for lk in rsrc.links if lk['rel'] == 'nested']
         nested_href = nested_link[0]['href']
         nested_id = nested_href.split('/')[-1]
         nested_identifier = '/'.join(nested_href.split('/')[-2:])
@@ -488,13 +493,28 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
             return self.list_resources(nested_identifier)
         return self.client.resources.list(nested_identifier)
 
-    def list_resources(self, stack_identifier):
+    def list_resources(self, stack_identifier, filter_func=None):
         resources = self.client.resources.list(stack_identifier)
-        return dict((r.resource_name, r.resource_type) for r in resources)
+        return dict((r.resource_name, r.resource_type) for r in resources
+                    if (filter_func(r) if callable(filter_func) else True))
 
     def get_resource_stack_id(self, r):
-        stack_link = [l for l in r.links if l.get('rel') == 'stack'][0]
+        stack_link = [lk for lk in r.links if lk.get('rel') == 'stack'][0]
         return stack_link['href'].split("/")[-1]
+
+    def get_physical_resource_id(self, stack_identifier, resource_name):
+        try:
+            resource = self.client.resources.get(
+                stack_identifier, resource_name)
+            return resource.physical_resource_id
+        except Exception:
+            raise Exception('Resource (%s) not found in stack (%s)!' %
+                            (stack_identifier, resource_name))
+
+    def get_stack_output(self, stack_identifier, output_key,
+                         validate_errors=True):
+        stack = self.client.stacks.get(stack_identifier)
+        return self._stack_output(stack, output_key, validate_errors)
 
     def check_input_values(self, group_resources, key, value):
         # Check inputs for deployment and derived config
@@ -518,12 +538,13 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
                      parameters=None, environment=None, tags=None,
                      expected_status='CREATE_COMPLETE',
                      disable_rollback=True, enable_cleanup=True,
-                     environment_files=None):
+                     environment_files=None, timeout=None):
         name = stack_name or self._stack_rand_name()
         templ = template or self.template
         templ_files = files or {}
         params = parameters or {}
         env = environment or {}
+        timeout_mins = timeout or self.conf.build_timeout
         self.client.stacks.create(
             stack_name=name,
             template=templ,
@@ -532,9 +553,10 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
             parameters=params,
             environment=env,
             tags=tags,
-            environment_files=environment_files
+            environment_files=environment_files,
+            timeout_mins=timeout_mins
         )
-        if expected_status not in ['ROLLBACK_COMPLETE'] and enable_cleanup:
+        if enable_cleanup:
             self.addCleanup(self._stack_delete, name)
 
         stack = self.client.stacks.get(name, resolve_outputs=False)
@@ -581,6 +603,17 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
         info = self.client.stacks.abandon(stack_id=stack_id)
         return info
 
+    def stack_snapshot(self, stack_id,
+                       wait_for_status='SNAPSHOT_COMPLETE'):
+        snapshot = self.client.stacks.snapshot(stack_id=stack_id)
+        self._wait_for_stack_status(stack_id, wait_for_status)
+        return snapshot['id']
+
+    def stack_restore(self, stack_id, snapshot_id,
+                      wait_for_status='RESTORE_COMPLETE'):
+        self.client.stacks.restore(stack_id, snapshot_id)
+        self._wait_for_stack_status(stack_id, wait_for_status)
+
     def stack_suspend(self, stack_identifier):
         if (self.conf.skip_test_stack_action_list and
                 'SUSPEND' in self.conf.skip_test_stack_action_list):
@@ -614,7 +647,7 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
                 rsrc_events = self.client.events.list(stack_identifier,
                                                       resource_name=rsrc_name)
             except heat_exceptions.HTTPNotFound:
-                LOG.debug("No events yet found for %s" % rsrc_name)
+                LOG.debug("No events yet found for %s", rsrc_name)
             else:
                 matched = [e for e in rsrc_events
                            if e.resource_status_reason == reason]
@@ -622,10 +655,14 @@ class HeatIntegrationTest(testscenarios.WithScenarios,
                     return matched
             time.sleep(build_interval)
 
-    def check_autoscale_complete(self, stack_id, expected_num):
+    def check_autoscale_complete(self, stack_id, expected_num, parent_stack,
+                                 group_name):
         res_list = self.client.resources.list(stack_id)
         all_res_complete = all(res.resource_status in ('UPDATE_COMPLETE',
                                                        'CREATE_COMPLETE')
                                for res in res_list)
         all_res = len(res_list) == expected_num
-        return all_res and all_res_complete
+        if all_res and all_res_complete:
+            metadata = self.client.resources.metadata(parent_stack, group_name)
+            return not metadata.get('scaling_in_progress')
+        return False

@@ -74,13 +74,10 @@ class WaitCondition(heat_wc.HeatWaitCondition):
         ),
     }
 
-    def __init__(self, name, json_snippet, stack):
-        super(WaitCondition, self).__init__(name, json_snippet, stack)
-
     def _validate_handle_url(self):
         handle_url = self.properties[self.HANDLE]
         handle_id = identifier.ResourceIdentifier.from_arn_url(handle_url)
-        if handle_id.tenant != self.stack.context.tenant_id:
+        if handle_id.tenant != self.stack.context.project_id:
             raise ValueError(_("WaitCondition invalid Handle tenant %s") %
                              handle_id.tenant)
         if handle_id.stack_name != self.stack.name:
@@ -96,11 +93,6 @@ class WaitCondition(heat_wc.HeatWaitCondition):
                           aws_wch.WaitConditionHandle):
             raise ValueError(_("WaitCondition invalid Handle %s") %
                              handle_id.resource_name)
-
-    def _get_handle_resource(self):
-        handle_url = self.properties[self.HANDLE]
-        handle_id = identifier.ResourceIdentifier.from_arn_url(handle_url)
-        return self.stack[handle_id.resource_name]
 
     def handle_create(self):
         self._validate_handle_url()

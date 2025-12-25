@@ -1,14 +1,17 @@
-Heat style commandments
+Heat Style Commandments
 =======================
 
 - Step 1: Read the OpenStack style commandments
-  http://docs.openstack.org/developer/hacking/
+  https://docs.openstack.org/hacking/
 - Step 2: Read on
 
-Heat specific commandments
+Heat Specific Commandments
 --------------------------
 
-None so far
+- [HE301] Use LOG.warning() rather than LOG.warn().
+- [HE302] Python 3: do not use dict.iteritems.
+- [HE303] Python 3: do not use dict.iterkeys.
+- [HE304] Python 3: do not use dict.itervalues.
 
 Creating unit tests
 -------------------
@@ -21,32 +24,27 @@ without the patch and passes with the patch.
 For more information on creating unit tests and utilizing the testing
 infrastructure in OpenStack Heat, please read heat/tests/testing-overview.txt.
 
-
 Running tests
 -------------
-The testing system is based on a combination of tox and testr. The canonical
-approach to running tests is to simply run the command `tox`. This will
+The testing system is based on a combination of tox and stestr. The canonical
+approach to running tests is to simply run the command ``tox``. This will
 create virtual environments, populate them with dependencies and run all of
 the tests that OpenStack CI systems run. Behind the scenes, tox is running
-`testr run --parallel`, but is set up such that you can supply any additional
-testr arguments that are needed to tox. For example, you can run:
-`tox -- --analyze-isolation` to cause tox to tell testr to add
---analyze-isolation to its argument list.
+``stestr run``, but is set up such that you can supply any additional
+stestr arguments that are needed to tox. For example, you can run:
+``tox -- --analyze-isolation`` to cause tox to tell stestr to add
+``--analyze-isolation`` to its argument list.
 
 It is also possible to run the tests inside of a virtual environment
 you have created, or it is possible that you have all of the dependencies
-installed locally already. In this case, you can interact with the testr
-command directly. Running `testr run` will run the entire test suite. `testr
-run --parallel` will run it in parallel (this is the default incantation tox
-uses.) More information about testr can be found at:
-http://wiki.openstack.org/testr
+installed locally already. In this case, you can interact with the ``stestr``
+command directly. Running ``stestr run`` will run the entire test suite in
+as many threads as you have CPU cores (this is the default incantation tox
+uses), number of threads can be adjusted with ``--concurrency N`` argument.
+``testr run --serial`` will run tests in serial process.
+More information about stestr can be found at:
+http://stestr.readthedocs.io
 
-
-Heat Specific Commandments
---------------------------
-
-- [Heat301] Use LOG.warning() rather than LOG.warn().
-- [Heat302] Python 3: do not use dict.iteritems.
-- [Heat303] Python 3: do not use dict.iterkeys.
-- [Heat304] Python 3: do not use dict.itervalues.
-
+Note that unit tests use a database if available. See
+``tools/test-setup.sh`` on how to set up the databases the same way as
+done in the OpenStack CI systems.

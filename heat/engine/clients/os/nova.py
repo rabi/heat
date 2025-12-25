@@ -18,35 +18,36 @@ from email.mime import text
 import os
 import pkgutil
 import string
+from urllib import parse as urlparse
 
+from neutronclient.common import exceptions as q_exceptions
+from novaclient import api_versions
 from novaclient import client as nc
 from novaclient import exceptions
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-from oslo_utils import uuidutils
-from retrying import retry
-import six
-from six.moves.urllib import parse as urlparse
+from oslo_utils import netutils
+import tenacity
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
-from heat.common.i18n import _LW
+from heat.engine.clients import client_exception
 from heat.engine.clients import client_plugin
+from heat.engine.clients import microversion_mixin
 from heat.engine.clients import os as os_client
 from heat.engine import constraints
 
 LOG = logging.getLogger(__name__)
 
 
-NOVA_API_VERSION = "2.1"
 CLIENT_NAME = 'nova'
 
 
-class NovaClientPlugin(client_plugin.ClientPlugin):
+class NovaClientPlugin(microversion_mixin.MicroversionMixin,
+                       client_plugin.ClientPlugin):
 
-    deferred_server_statuses = ['BUILD',
+    deferred_server_statuses = {'BUILD',
                                 'HARD_REBOOT',
                                 'PASSWORD',
                                 'REBOOT',
@@ -55,30 +56,57 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
                                 'REVERT_RESIZE',
                                 'SHUTOFF',
                                 'SUSPENDED',
-                                'VERIFY_RESIZE']
+                                'VERIFY_RESIZE'}
 
     exceptions_module = exceptions
 
+    NOVA_API_VERSION = '2.1'
+
+    max_microversion = cfg.CONF.max_nova_api_microversion
+
     service_types = [COMPUTE] = ['compute']
 
-    def _create(self):
-        endpoint_type = self._get_client_option(CLIENT_NAME, 'endpoint_type')
-        extensions = nc.discover_extensions(NOVA_API_VERSION)
+    def _get_service_name(self):
+        return self.COMPUTE
 
-        args = {
-            'session': self.context.keystone_session,
-            'extensions': extensions,
-            'interface': endpoint_type,
-            'service_type': self.COMPUTE,
-            'http_log_debug': self._get_client_option(CLIENT_NAME,
-                                                      'http_log_debug')
-        }
+    def _create(self, version=None):
+        if not version:
+            # TODO(prazumovsky): remove all unexpected calls from tests and
+            # add default_version after that.
+            version = self.NOVA_API_VERSION
+        args = self._get_args(version)
 
-        client = nc.Client(NOVA_API_VERSION, **args)
+        client = nc.Client(version, **args)
         return client
 
+    def _get_args(self, version):
+        endpoint_type = self._get_client_option(CLIENT_NAME, 'endpoint_type')
+
+        return {
+            'session': self.context.keystone_session,
+            'endpoint_type': endpoint_type,
+            'service_type': self.COMPUTE,
+            'region_name': self._get_region_name(),
+            'connect_retries': cfg.CONF.client_retry_limit,
+            'http_log_debug': self._get_client_option(CLIENT_NAME,
+                                                      'http_log_debug')
+            }
+
+    def get_max_microversion(self):
+        if not self.max_microversion:
+            client = self._create()
+            self.max_microversion = client.versions.get_current().version
+        return self.max_microversion
+
+    def is_version_supported(self, version):
+        api_ver = api_versions.get_api_version(version)
+        max_api_ver = api_versions.get_api_version(
+            self.get_max_microversion())
+        return max_api_ver >= api_ver
+
     def is_not_found(self, ex):
-        return isinstance(ex, exceptions.NotFound)
+        return isinstance(ex, (exceptions.NotFound,
+                               q_exceptions.NotFound))
 
     def is_over_limit(self, ex):
         return isinstance(ex, exceptions.OverLimit)
@@ -95,8 +123,12 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
         return (isinstance(ex, exceptions.ClientException) and
                 http_status == 422)
 
-    @retry(stop_max_attempt_number=max(cfg.CONF.client_retry_limit + 1, 0),
-           retry_on_exception=client_plugin.retry_if_connection_err)
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(
+            max(cfg.CONF.client_retry_limit + 1, 0)),
+        retry=tenacity.retry_if_exception(
+            client_plugin.retry_if_connection_err),
+        reraise=True)
     def get_server(self, server):
         """Return fresh server object.
 
@@ -119,20 +151,25 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
         try:
             server = self.client().servers.get(server_id)
         except exceptions.OverLimit as exc:
-            LOG.warning(_LW("Received an OverLimit response when "
-                            "fetching server (%(id)s) : %(exception)s"),
+            LOG.warning("Received an OverLimit response when "
+                        "fetching server (%(id)s) : %(exception)s",
                         {'id': server_id,
                          'exception': exc})
         except exceptions.ClientException as exc:
             if ((getattr(exc, 'http_status', getattr(exc, 'code', None)) in
                  (500, 503))):
-                LOG.warning(_LW("Received the following exception when "
-                            "fetching server (%(id)s) : %(exception)s"),
+                LOG.warning("Received the following exception when "
+                            "fetching server (%(id)s) : %(exception)s",
                             {'id': server_id,
                              'exception': exc})
             else:
                 raise
         return server
+
+    def fetch_server_attr(self, server_id, attr):
+        server = self.fetch_server(server_id)
+        fetched_attr = getattr(server, attr, None)
+        return fetched_attr
 
     def refresh_server(self, server):
         """Refresh server's attributes.
@@ -142,17 +179,17 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
         try:
             server.get()
         except exceptions.OverLimit as exc:
-            LOG.warning(_LW("Server %(name)s (%(id)s) received an OverLimit "
-                            "response during server.get(): %(exception)s"),
+            LOG.warning("Server %(name)s (%(id)s) received an OverLimit "
+                        "response during server.get(): %(exception)s",
                         {'name': server.name,
                          'id': server.id,
                          'exception': exc})
         except exceptions.ClientException as exc:
             if ((getattr(exc, 'http_status', getattr(exc, 'code', None)) in
                  (500, 503))):
-                LOG.warning(_LW('Server "%(name)s" (%(id)s) received the '
-                                'following exception during server.get(): '
-                                '%(exception)s'),
+                LOG.warning('Server "%(name)s" (%(id)s) received the '
+                            'following exception during server.get(): '
+                            '%(exception)s',
                             {'name': server.name,
                              'id': server.id,
                              'exception': exc})
@@ -187,7 +224,7 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
 
         """
         # not checking with is_uuid_like as most tests use strings e.g. '1234'
-        if isinstance(server, six.string_types):
+        if isinstance(server, str):
             server = self.fetch_server(server)
             if server is None:
                 return False
@@ -222,7 +259,7 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
         :param flavor: the name of the flavor to find
         :returns: the id of :flavor:
         """
-        return self._find_flavor_id(self.context.tenant_id,
+        return self._find_flavor_id(self.context.project_id,
                                     flavor)
 
     @os_client.MEMOIZE_FINDER
@@ -244,27 +281,22 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
 
         return flavor
 
-    def get_host(self, host_name):
-        """Get the host id specified by name.
+    def get_host(self, hypervisor_hostname):
+        """Gets list of matching hypervisors by specified name.
 
-        :param host_name: the name of host to find
-        :returns: the list of match hosts
-        :raises: exception.EntityNotFound
+        :param hypervisor_hostname: the name of host to find
+        :returns: list of matching hypervisor hosts
+        :raises nova client exceptions.NotFound:
         """
 
-        host_list = self.client().hosts.list()
-        for host in host_list:
-            if host.host_name == host_name and host.service == self.COMPUTE:
-                return host
-
-        raise exception.EntityNotFound(entity='Host', name=host_name)
+        return self.client().hypervisors.search(hypervisor_hostname)
 
     def get_keypair(self, key_name):
         """Get the public key specified by :key_name:
 
         :param key_name: the name of the key to look for
         :returns: the keypair (name, public_key) for :key_name:
-        :raises: exception.EntityNotFound
+        :raises exception.EntityNotFound:
         """
         try:
             return self.client().keypairs.get(key_name)
@@ -273,7 +305,7 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
 
     def build_userdata(self, metadata, userdata=None, instance_user=None,
                        user_data_format='HEAT_CFNTOOLS'):
-        """Build multipart data blob for CloudInit.
+        """Build multipart data blob for CloudInit and Ignition.
 
         Data blob includes user-supplied Metadata, user data, and the required
         Heat in-instance configuration.
@@ -295,12 +327,23 @@ class NovaClientPlugin(client_plugin.ClientPlugin):
         is_cfntools = user_data_format == 'HEAT_CFNTOOLS'
         is_software_config = user_data_format == 'SOFTWARE_CONFIG'
 
+        if (is_software_config and
+                NovaClientPlugin.is_ignition_format(userdata)):
+            return NovaClientPlugin.build_ignition_data(metadata, userdata)
+
         def make_subpart(content, filename, subtype=None):
             if subtype is None:
                 subtype = os.path.splitext(filename)[0]
             if content is None:
                 content = ''
-            msg = text.MIMEText(content, _subtype=subtype)
+            try:
+                content.encode('us-ascii')
+                charset = 'us-ascii'
+            except UnicodeEncodeError:
+                charset = 'utf-8'
+            msg = (text.MIMEText(content, _subtype=subtype, _charset=charset)
+                   if subtype else text.MIMEText(content, _charset=charset))
+
             msg.add_header('Content-Disposition', 'attachment',
                            filename=filename)
             return msg
@@ -334,7 +377,6 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
                        (cloudinit_boothook, 'boothook.sh', 'cloud-boothook'),
                        (read_cloudinit_file('part_handler.py'),
                         'part-handler.py')]
-
         if is_cfntools:
             attachments.append((userdata, 'cfn-userdata', 'x-cfninitdata'))
         elif is_software_config:
@@ -351,7 +393,7 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
                                         part.get_filename(),
                                         part.get_content_subtype()))
             else:
-                attachments.append((userdata, 'userdata', 'x-shellscript'))
+                attachments.append((userdata, ''))
 
         if is_cfntools:
             attachments.append((read_cloudinit_file('loguserdata.py'),
@@ -361,22 +403,15 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
             attachments.append((jsonutils.dumps(metadata),
                                 'cfn-init-data', 'x-cfninitdata'))
 
-        heat_client_plugin = self.context.clients.client_plugin('heat')
-        watch_url = cfg.CONF.heat_watch_server_url
-        if not watch_url:
-            watch_url = heat_client_plugin.get_watch_server_url()
-
-        attachments.append((watch_url, 'cfn-watch-server', 'x-cfninitdata'))
-
         if is_cfntools:
+            heat_client_plugin = self.context.clients.client_plugin('heat')
             cfn_md_url = heat_client_plugin.get_cfn_metadata_server_url()
             attachments.append((cfn_md_url,
                                 'cfn-metadata-server', 'x-cfninitdata'))
 
             # Create a boto config which the cfntools on the host use to know
-            # where the cfn and cw API's are to be accessed
+            # where the cfn API is to be accessed
             cfn_url = urlparse.urlparse(cfn_md_url)
-            cw_url = urlparse.urlparse(watch_url)
             is_secure = cfg.CONF.instance_connection_is_secure
             vcerts = cfg.CONF.instance_connection_https_validate_certificates
             boto_cfg = "\n".join(["[Boto]",
@@ -385,10 +420,7 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
                                   "https_validate_certificates = %s" % vcerts,
                                   "cfn_region_name = heat",
                                   "cfn_region_endpoint = %s" %
-                                  cfn_url.hostname,
-                                  "cloudwatch_region_name = heat",
-                                  "cloudwatch_region_endpoint = %s" %
-                                  cw_url.hostname])
+                                  cfn_url.hostname])
             attachments.append((boto_cfg,
                                 'cfn-boto-cfg', 'x-cfninitdata'))
 
@@ -396,6 +428,51 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
         mime_blob = multipart.MIMEMultipart(_subparts=subparts)
 
         return mime_blob.as_string()
+
+    @staticmethod
+    def is_ignition_format(userdata):
+        try:
+            payload = jsonutils.loads(userdata)
+            ig = payload.get("ignition")
+            return True if ig and ig.get("version") else False
+        except Exception:
+            return False
+
+    @staticmethod
+    def build_ignition_data(metadata, userdata):
+        if not metadata:
+            return userdata
+
+        payload = jsonutils.loads(userdata)
+        encoded_metadata = urlparse.quote(jsonutils.dumps(metadata))
+        path_list = ["/var/lib/heat-cfntools/cfn-init-data",
+                     "/var/lib/cloud/data/cfn-init-data"]
+        ignition_format_metadata = {
+            "filesystem": "root",
+            "group": {"name": "root"},
+            "path": "",
+            "user": {"name": "root"},
+            "contents": {
+                "source": "data:," + encoded_metadata,
+                "verification": {}},
+            "mode": 0o640
+        }
+
+        for path in path_list:
+            storage = payload.setdefault('storage', {})
+            try:
+                files = storage.setdefault('files', [])
+            except AttributeError:
+                raise ValueError('Ignition "storage" section must be a map')
+            else:
+                try:
+                    data = ignition_format_metadata.copy()
+                    data["path"] = path
+                    files.append(data)
+                except AttributeError:
+                    raise ValueError('Ignition "files" section must be a list')
+
+        return jsonutils.dumps(payload)
 
     def check_delete_server_complete(self, server_id):
         """Wait for server to disappear from Nova."""
@@ -412,9 +489,12 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
             return False
 
         status = self.get_status(server)
-        if status in ("DELETED", "SOFT_DELETED"):
+        if status == 'DELETED':
             return True
-        if status == 'ERROR':
+
+        if status == 'SOFT_DELETED':
+            self.client().servers.force_delete(server_id)
+        elif status == 'ERROR':
             fault = getattr(server, 'fault', {})
             message = fault.get('message', 'Unknown')
             code = fault.get('code')
@@ -479,18 +559,23 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
             return True
         if status == 'VERIFY_RESIZE':
             return False
+        task_state_in_nova = getattr(server, 'OS-EXT-STS:task_state', None)
+        # Wait till move out from any resize steps (including resize_finish).
+        if task_state_in_nova is not None and 'resize' in task_state_in_nova:
+            return False
         else:
             msg = _("Confirm resize for server %s failed") % server_id
             raise exception.ResourceUnknownStatus(
                 result=msg, resource_status=status)
 
     def rebuild(self, server_id, image_id, password=None,
-                preserve_ephemeral=False):
+                preserve_ephemeral=False, meta=None, files=None):
         """Rebuild the server and call check_rebuild to verify."""
         server = self.fetch_server(server_id)
         if server:
             server.rebuild(image_id, password=password,
-                           preserve_ephemeral=preserve_ephemeral)
+                           preserve_ephemeral=preserve_ephemeral,
+                           meta=meta, files=files)
             return True
         else:
             return False
@@ -511,12 +596,12 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
 
     def meta_serialize(self, metadata):
         """Serialize non-string metadata values before sending them to Nova."""
-        if not isinstance(metadata, collections.Mapping):
+        if not isinstance(metadata, collections.abc.Mapping):
             raise exception.StackValidationFailed(message=_(
                 "nova server metadata needs to be a Map."))
 
         return dict((key, (value if isinstance(value,
-                                               six.string_types)
+                                               str)
                            else jsonutils.dumps(value))
                      ) for (key, value) in metadata.items())
 
@@ -536,15 +621,19 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
         try:
             server = self.client().servers.get(server)
         except exceptions.NotFound as ex:
-            LOG.warning(_LW('Instance (%(server)s) not found: %(ex)s'),
+            LOG.warning('Instance (%(server)s) not found: %(ex)s',
                         {'server': server, 'ex': ex})
         else:
             for n in sorted(server.networks, reverse=True):
                 if len(server.networks[n]) > 0:
                     return server.networks[n][0]
 
-    @retry(stop_max_attempt_number=max(cfg.CONF.client_retry_limit + 1, 0),
-           retry_on_exception=client_plugin.retry_if_connection_err)
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(
+            max(cfg.CONF.client_retry_limit + 1, 0)),
+        retry=tenacity.retry_if_exception(
+            client_plugin.retry_if_connection_err),
+        reraise=True)
     def absolute_limits(self):
         """Return the absolute limits as a dictionary."""
         limits = self.client().limits.get()
@@ -556,59 +645,41 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
 
         The actual console url is lazily resolved on access.
         """
+        nc = self.client
 
-        class ConsoleUrls(collections.Mapping):
+        class ConsoleUrls(collections.abc.Mapping):
             def __init__(self, server):
-                self.console_methods = {
-                    'novnc': server.get_vnc_console,
-                    'xvpvnc': server.get_vnc_console,
-                    'spice-html5': server.get_spice_console,
-                    'rdp-html5': server.get_rdp_console,
-                    'serial': server.get_serial_console
-                }
+                self.console_method = server.get_console_url
+                self.support_console_types = ['novnc', 'xvpvnc',
+                                              'spice-html5', 'rdp-html5',
+                                              'serial', 'webmks']
 
             def __getitem__(self, key):
                 try:
-                    url = self.console_methods[key](key)['console']['url']
-                except exceptions.BadRequest as e:
-                    unavailable = 'Unavailable console type'
-                    if unavailable in e.message:
-                        url = e.message
+                    if key not in self.support_console_types:
+                        raise exceptions.UnsupportedConsoleType(key)
+                    if key == 'webmks':
+                        data = nc().servers.get_console_url(
+                            server, key)
                     else:
-                        raise
+                        data = self.console_method(key)
+                    console_data = data.get(
+                        'remote_console', data.get('console'))
+                    url = console_data['url']
+                except exceptions.UnsupportedConsoleType as ex:
+                    url = ex.message
+                except Exception as e:
+                    url = _('Cannot get console url: %s') % str(e)
+
                 return url
 
             def __len__(self):
-                return len(self.console_methods)
+                return len(self.support_console_types)
 
             def __iter__(self):
-                return (key for key in self.console_methods)
+                return (key for key in self.support_console_types)
 
         return ConsoleUrls(server)
-
-    def get_net_id_by_label(self, label):
-        try:
-            net_id = self.client().networks.find(label=label).id
-        except exceptions.NotFound as ex:
-            LOG.debug('Nova network (%(net)s) not found: %(ex)s',
-                      {'net': label, 'ex': ex})
-            raise exception.EntityNotFound(entity='Nova network', name=label)
-        except exceptions.NoUniqueMatch as exc:
-            LOG.debug('Nova network (%(net)s) is not unique matched: %(exc)s',
-                      {'net': label, 'exc': exc})
-            raise exception.PhysicalResourceNameAmbiguity(name=label)
-        return net_id
-
-    def get_nova_network_id(self, net_identifier):
-        if uuidutils.is_uuid_like(net_identifier):
-            try:
-                net_id = self.client().networks.get(net_identifier).id
-            except exceptions.NotFound:
-                net_id = self.get_net_id_by_label(net_identifier)
-        else:
-            net_id = self.get_net_id_by_label(net_identifier)
-
-        return net_id
 
     def attach_volume(self, server_id, volume_id, device):
         try:
@@ -617,7 +688,9 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
                 volume_id=volume_id,
                 device=device)
         except Exception as ex:
-            if self.is_client_exception(ex):
+            if self.is_conflict(ex):
+                return False
+            elif self.is_client_exception(ex):
                 raise exception.Error(_(
                     "Failed to attach volume %(vol)s to server %(srv)s "
                     "- %(err)s") % {'vol': volume_id,
@@ -632,12 +705,15 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
         try:
             self.client().volumes.delete_server_volume(server_id, attach_id)
         except Exception as ex:
-            if not (self.is_not_found(ex)
-                    or self.is_bad_request(ex)):
+            if self.is_conflict(ex):
+                return False
+            elif not (self.is_not_found(ex)
+                      or self.is_bad_request(ex)):
                 raise exception.Error(
                     _("Could not detach attachment %(att)s "
                       "from server %(srv)s.") % {'srv': server_id,
                                                  'att': attach_id})
+        return True
 
     def check_detach_volume_complete(self, server_id, attach_id):
         """Check that nova server lost attachment.
@@ -651,46 +727,118 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
             self.client().volumes.get_server_volume(server_id, attach_id)
         except Exception as ex:
             self.ignore_not_found(ex)
-            LOG.info(_LI("Volume %(vol)s is detached from server %(srv)s"),
+            LOG.info("Volume %(vol)s is detached from server %(srv)s",
                      {'vol': attach_id, 'srv': server_id})
             return True
         else:
-            LOG.debug("Server %(srv)s still has attachment %(att)s." % {
-                'att': attach_id, 'srv': server_id})
+            LOG.debug("Server %(srv)s still has attachment %(att)s.",
+                      {'att': attach_id, 'srv': server_id})
             return False
+
+    def associate_floatingip(self, server_id, floatingip_id):
+        iface_list = self.fetch_server(server_id).interface_list()
+        if len(iface_list) == 0:
+            raise client_exception.InterfaceNotFound(id=server_id)
+        if len(iface_list) > 1:
+            LOG.warning("Multiple interfaces found for server %s, "
+                        "using the first one.", server_id)
+
+        port_id = iface_list[0].port_id
+        fixed_ips = iface_list[0].fixed_ips
+        fixed_address = next(ip['ip_address'] for ip in fixed_ips
+                             if netutils.is_valid_ipv4(ip['ip_address']))
+        request_body = {
+            'floatingip': {
+                'port_id': port_id,
+                'fixed_ip_address': fixed_address}}
+
+        self.clients.client('neutron').update_floatingip(floatingip_id,
+                                                         request_body)
+
+    def dissociate_floatingip(self, floatingip_id):
+        request_body = {
+            'floatingip': {
+                'port_id': None,
+                'fixed_ip_address': None}}
+        self.clients.client('neutron').update_floatingip(floatingip_id,
+                                                         request_body)
+
+    def associate_floatingip_address(self, server_id, fip_address):
+        fips = self.clients.client(
+            'neutron').list_floatingips(
+                floating_ip_address=fip_address)['floatingips']
+        if len(fips) == 0:
+            args = {'ip_address': fip_address}
+            raise client_exception.EntityMatchNotFound(entity='floatingip',
+                                                       args=args)
+        self.associate_floatingip(server_id, fips[0]['id'])
+
+    def dissociate_floatingip_address(self, fip_address):
+        fips = self.clients.client(
+            'neutron').list_floatingips(
+                floating_ip_address=fip_address)['floatingips']
+        if len(fips) == 0:
+            args = {'ip_address': fip_address}
+            raise client_exception.EntityMatchNotFound(entity='floatingip',
+                                                       args=args)
+        self.dissociate_floatingip(fips[0]['id'])
 
     def interface_detach(self, server_id, port_id):
-        server = self.fetch_server(server_id)
-        if server:
-            server.interface_detach(port_id)
-            return True
-        else:
-            return False
-
-    def interface_attach(self, server_id, port_id=None, net_id=None, fip=None):
-        server = self.fetch_server(server_id)
-        if server:
-            server.interface_attach(port_id, net_id, fip)
-            return True
-        else:
-            return False
-
-    @retry(stop_max_attempt_number=cfg.CONF.max_interface_check_attempts,
-           wait_fixed=500,
-           retry_on_result=client_plugin.retry_if_result_is_false)
-    def check_interface_detach(self, server_id, port_id):
-        server = self.fetch_server(server_id)
-        if server:
-            interfaces = server.interface_list()
-            for iface in interfaces:
-                if iface.port_id == port_id:
-                    return False
+        with self.ignore_not_found:
+            server = self.fetch_server(server_id)
+            if server:
+                server.interface_detach(port_id)
         return True
 
-    @retry(stop_max_attempt_number=cfg.CONF.max_interface_check_attempts,
-           wait_fixed=500,
-           retry_on_result=client_plugin.retry_if_result_is_false)
+    def interface_attach(self, server_id, port_id=None, net_id=None, fip=None,
+                         security_groups=None):
+        server = self.fetch_server(server_id)
+        if server:
+            attachment = server.interface_attach(port_id, net_id, fip)
+            if not port_id and security_groups:
+                props = {'security_groups': security_groups}
+                self.clients.client('neutron').update_port(
+                    attachment.port_id, {'port': props})
+            return True
+        else:
+            return False
+
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(
+            cfg.CONF.max_interface_check_attempts),
+        wait=tenacity.wait_exponential(multiplier=0.5, max=12.0),
+        retry=tenacity.retry_if_result(client_plugin.retry_if_result_is_false))
+    def check_interface_detach(self, server_id, port_id):
+        with self.ignore_not_found:
+            # os-interface API returns the ports according to the device_id
+            # in neutron api, and it does not return a port in case the port
+            # is already unbound in neutron but is not in nova. So we use
+            # addresses field in servers API, which unfortunately does not
+            # return the full information to strictly identify the port.
+            # So make the best "guess" according to mac addr.
+            # TODO(tkajinam): Consider using instance-action record once
+            # https://review.opendev.org/c/openstack/nova/+/928933 is merged.
+            port = self.clients.client('neutron').show_port(port_id)['port']
+            if 'device_id' in port and port['device_id'] == server_id:
+                return False
+            mac_address = port['mac_address']
+            addresses = self.fetch_server_attr(server_id, 'addresses')
+            for net_addrs in addresses.values():
+                for addr in net_addrs:
+                    if (addr['OS-EXT-IPS:type'] == 'fixed' and
+                            mac_address == addr['OS-EXT-IPS-MAC:mac_addr']):
+                        return False
+        return True
+
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(
+            cfg.CONF.max_interface_check_attempts),
+        wait=tenacity.wait_fixed(0.5),
+        retry=tenacity.retry_if_result(client_plugin.retry_if_result_is_false))
     def check_interface_attach(self, server_id, port_id):
+        if not port_id:
+            return True
+
         server = self.fetch_server(server_id)
         if server:
             interfaces = server.interface_list()
@@ -698,15 +846,6 @@ echo -e '%s\tALL=(ALL)\tNOPASSWD: ALL' >> /etc/sudoers
                 if iface.port_id == port_id:
                     return True
         return False
-
-    @os_client.MEMOIZE_EXTENSIONS
-    def _list_extensions(self):
-        extensions = self.client().list_extensions.show_all()
-        return set(extension.alias for extension in extensions)
-
-    def has_extension(self, alias):
-        """Check if specific extension is present."""
-        return alias in self._list_extensions()
 
 
 class NovaBaseConstraint(constraints.BaseCustomConstraint):
@@ -738,14 +877,8 @@ class FlavorConstraint(NovaBaseConstraint):
     resource_getter_name = 'find_flavor_by_name_or_id'
 
 
-class NetworkConstraint(NovaBaseConstraint):
-
-    expected_exceptions = (exception.EntityNotFound,
-                           exception.PhysicalResourceNameAmbiguity)
-
-    resource_getter_name = 'get_nova_network_id'
-
-
 class HostConstraint(NovaBaseConstraint):
+
+    expected_exceptions = (exceptions.NotFound,)
 
     resource_getter_name = 'get_host'

@@ -14,7 +14,6 @@
 import collections
 
 from oslo_serialization import jsonutils
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -24,6 +23,7 @@ from heat.engine import function
 from heat.engine.hot import parameters as hot_param
 from heat.engine import parameters
 from heat.engine import support
+from heat.engine import translation as trans
 
 SCHEMA_KEYS = (
     REQUIRED, IMPLEMENTED, DEFAULT, TYPE, SCHEMA,
@@ -213,10 +213,11 @@ def schemata(schema_dicts):
 
 class Property(object):
 
-    def __init__(self, schema, name=None, context=None):
+    def __init__(self, schema, name=None, context=None, path=None):
         self.schema = Schema.from_legacy(schema)
         self.name = name
         self.context = context
+        self.path = self.make_path(name, path)
 
     def required(self):
         return self.schema.required
@@ -242,6 +243,18 @@ class Property(object):
     def support_status(self):
         return self.schema.support_status
 
+    def make_path(self, name, path=None):
+        if path is None:
+            path = ''
+        if name is None:
+            name = ''
+
+        if isinstance(name, int) or name.isdigit():
+            name = str(name)
+
+        delim = '' if not path or path.endswith('.') else '.'
+        return delim.join([path, name])
+
     def _get_integer(self, value):
         if value is None:
             value = self.has_default() and self.default() or 0
@@ -260,20 +273,23 @@ class Property(object):
     def _get_string(self, value):
         if value is None:
             value = self.has_default() and self.default() or ''
-        if not isinstance(value, six.string_types):
+        if not isinstance(value, str):
             if isinstance(value, (bool, int)):
-                value = six.text_type(value)
+                value = str(value)
             else:
-                raise ValueError(_('Value must be a string'))
+                raise ValueError(_('Value must be a string; got %r') % value)
         return value
 
-    def _get_children(self, child_values, keys=None, validate=False):
+    def _get_children(self, child_values, keys=None, validate=False,
+                      translation=None):
         if self.schema.schema is not None:
             if keys is None:
                 keys = list(self.schema.schema)
             schemata = dict((k, self.schema.schema[k]) for k in keys)
             properties = Properties(schemata, dict(child_values),
-                                    context=self.context)
+                                    context=self.context,
+                                    parent_name=self.path,
+                                    translation=translation)
             if validate:
                 properties.validate()
 
@@ -281,49 +297,57 @@ class Property(object):
         else:
             return child_values
 
-    def _get_map(self, value, validate=False):
+    def _get_map(self, value, validate=False, translation=None):
         if value is None:
             value = self.default() if self.has_default() else {}
-        if not isinstance(value, collections.Mapping):
+        if not isinstance(value, collections.abc.Mapping):
             # This is to handle passing Lists via Json parameters exposed
             # via a provider resource, in particular lists-of-dicts which
             # cannot be handled correctly via comma_delimited_list
             if self.schema.allow_conversion:
-                if isinstance(value, six.string_types):
+                if isinstance(value, str):
                     return value
-                elif isinstance(value, collections.Sequence):
+                elif isinstance(value, collections.abc.Sequence):
                     return jsonutils.dumps(value)
             raise TypeError(_('"%s" is not a map') % value)
 
-        return dict(self._get_children(six.iteritems(value),
-                                       validate=validate))
+        return dict(self._get_children(value.items(),
+                                       validate=validate,
+                                       translation=translation))
 
-    def _get_list(self, value, validate=False):
+    def _get_list(self, value, validate=False, translation=None):
         if value is None:
             value = self.has_default() and self.default() or []
-        if self.schema.allow_conversion and isinstance(value,
-                                                       six.string_types):
-                value = param_utils.delim_string_to_list(value)
-        if (not isinstance(value, collections.Sequence) or
-                isinstance(value, six.string_types)):
+        if self.schema.allow_conversion and isinstance(value, str):
+            value = param_utils.delim_string_to_list(value)
+        if (not isinstance(value, collections.abc.Sequence) or
+                isinstance(value, str)):
             raise TypeError(_('"%s" is not a list') % repr(value))
 
         return [v[1] for v in self._get_children(enumerate(value),
                                                  range(len(value)),
-                                                 validate)]
+                                                 validate=validate,
+                                                 translation=translation)]
 
     def _get_bool(self, value):
+        """Get value for boolean property.
+
+        Explicitly checking for bool, or string with lower value
+        "true" or "false", to avoid integer values.
+        """
         if value is None:
             value = self.has_default() and self.default() or False
         if isinstance(value, bool):
             return value
-        normalised = value.lower()
-        if normalised not in ['true', 'false']:
-            raise ValueError(_('"%s" is not a valid boolean') % normalised)
+        if isinstance(value, str):
+            normalised = value.lower()
+            if normalised not in ['true', 'false']:
+                raise ValueError(_('"%s" is not a valid boolean') % normalised)
+            return normalised == 'true'
 
-        return normalised == 'true'
+        raise TypeError(_('"%s" is not a valid boolean') % value)
 
-    def get_value(self, value, validate=False, template=None):
+    def get_value(self, value, validate=False, translation=None):
         """Get value from raw value and sanitize according to data type."""
 
         t = self.type()
@@ -334,35 +358,45 @@ class Property(object):
         elif t == Schema.NUMBER:
             _value = self._get_number(value)
         elif t == Schema.MAP:
-            _value = self._get_map(value, validate)
+            _value = self._get_map(value, validate, translation)
         elif t == Schema.LIST:
-            _value = self._get_list(value, validate)
+            _value = self._get_list(value, validate, translation)
         elif t == Schema.BOOLEAN:
             _value = self._get_bool(value)
         elif t == Schema.ANY:
             _value = value
 
         if validate:
-            self.schema.validate_constraints(_value, self.context,
-                                             template=template)
+            self.schema.validate_constraints(_value, self.context)
 
         return _value
 
 
-class Properties(collections.Mapping):
+def _default_resolver(d, nullable=False):
+    return d
 
-    def __init__(self, schema, data, resolver=lambda d: d, parent_name=None,
-                 context=None, section=None):
-        self.props = dict((k, Property(s, k, context))
+
+class Properties(collections.abc.Mapping):
+
+    def __init__(self, schema, data, resolver=_default_resolver,
+                 parent_name=None,
+                 context=None, section=None, translation=None,
+                 rsrc_description=None):
+        self.props = dict((k, Property(s, k, context, path=parent_name))
                           for k, s in schema.items())
         self.resolve = resolver
         self.data = data
-        self.error_prefix = []
-        if parent_name is not None:
-            self.error_prefix.append(parent_name)
-        if section is not None:
-            self.error_prefix.append(section)
+        self.error_prefix = [section] if section is not None else []
+        self.parent_name = parent_name
         self.context = context
+        self.translation = (trans.Translation(properties=self)
+                            if translation is None else translation)
+        self.rsrc_description = rsrc_description or None
+
+    def update_translation(self, rules, client_resolve=True,
+                           ignore_resolve_error=False):
+        self.translation.set_rules(rules, client_resolve=client_resolve,
+                                   ignore_resolve_error=ignore_resolve_error)
 
     @staticmethod
     def schema_from_params(params_snippet):
@@ -376,7 +410,7 @@ class Properties(collections.Mapping):
                         in params_snippet.items())
         return {}
 
-    def validate(self, with_value=True, template=None):
+    def validate(self, with_value=True):
         try:
             for key in self.data:
                 if key not in self.props:
@@ -384,11 +418,12 @@ class Properties(collections.Mapping):
                     raise exception.StackValidationFailed(message=msg)
 
             for (key, prop) in self.props.items():
+                if (self.translation.is_deleted(prop.path) or
+                        self.translation.is_replaced(prop.path)):
+                    continue
                 if with_value:
                     try:
-                        self._get_property_value(key,
-                                                 validate=True,
-                                                 template=template)
+                        self._get_property_value(key, validate=True)
                     except exception.StackValidationFailed as ex:
                         path = [key]
                         path.extend(ex.path)
@@ -400,7 +435,7 @@ class Properties(collections.Mapping):
                         else:
                             path = [key]
                         raise exception.StackValidationFailed(
-                            path=path, message=six.text_type(e))
+                            path=path, message=str(e))
 
                 # are there unimplemented Properties
                 if not prop.implemented() and key in self.data:
@@ -423,42 +458,82 @@ class Properties(collections.Mapping):
         if any(res.action == res.INIT for res in deps):
             return True
 
-    def get_user_value(self, key, validate=False, template=None):
+    def get_user_value(self, key):
         if key not in self:
             raise KeyError(_('Invalid Property %s') % key)
 
         prop = self.props[key]
-        if key in self.data:
-            try:
-                unresolved_value = self.data[key]
-                if validate:
-                    if self._find_deps_any_in_init(unresolved_value):
-                        validate = False
+        value, found = self._resolve_user_value(key, prop, validate=False)
+        return value
 
-                value = self.resolve(unresolved_value)
-                return prop.get_value(value, validate, template=template)
-            # Children can raise StackValidationFailed with unique path which
-            # is necessary for further use in StackValidationFailed exception.
-            # So we need to handle this exception in this method.
-            except exception.StackValidationFailed as e:
-                raise exception.StackValidationFailed(path=e.path,
-                                                      message=e.error_message)
-            # the resolver function could raise any number of exceptions,
-            # so handle this generically
-            except Exception as e:
-                raise ValueError(six.text_type(e))
+    def _resolve_user_value(self, key, prop, validate):
+        """Return the user-supplied value (or None), and whether it was found.
 
-    def _get_property_value(self, key, validate=False, template=None):
+        This allows us to distinguish between, on the one hand, either a
+        Function that returns None or an explicit null value passed and, on the
+        other hand, either no value passed or a Macro that returns Ellipsis,
+        meaning that the result should be treated the same as if no value were
+        passed.
+        """
+        if key not in self.data:
+            return None, False
+
+        if (self.translation.is_deleted(prop.path) or
+                self.translation.is_replaced(prop.path)):
+            return None, False
+
+        try:
+            unresolved_value = self.data[key]
+            if validate:
+                if self._find_deps_any_in_init(unresolved_value):
+                    validate = False
+
+            value = self.resolve(unresolved_value, nullable=True)
+            if value is Ellipsis:
+                # Treat as if the property value were not specified at all
+                return None, False
+
+            if self.translation.has_translation(prop.path):
+                value = self.translation.translate(prop.path,
+                                                   value,
+                                                   self.data)
+
+            return prop.get_value(value, validate,
+                                  translation=self.translation), True
+        # Children can raise StackValidationFailed with unique path which
+        # is necessary for further use in StackValidationFailed exception.
+        # So we need to handle this exception in this method.
+        except exception.StackValidationFailed as e:
+            raise exception.StackValidationFailed(path=e.path,
+                                                  message=e.error_message)
+        # the resolver function could raise any number of exceptions,
+        # so handle this generically
+        except Exception as e:
+            raise ValueError(str(e))
+
+    def _get_property_value(self, key, validate=False):
         if key not in self:
             raise KeyError(_('Invalid Property %s') % key)
 
         prop = self.props[key]
-        if key in self.data:
-            return self.get_user_value(key, validate, template=template)
-        elif prop.has_default():
-            return prop.get_value(None, validate, template=template)
+        value, found = self._resolve_user_value(key, prop, validate)
+        if found:
+            return value
+        if self.translation.has_translation(prop.path):
+            value = self.translation.translate(prop.path, prop_data=self.data,
+                                               validate=validate)
+            if value is not None or prop.has_default():
+                return prop.get_value(value)
+
+        if prop.has_default():
+            return prop.get_value(None, validate,
+                                  translation=self.translation)
         elif prop.required():
             raise ValueError(_('Property %s not assigned') % key)
+        elif key == 'description' and prop.schema.update_allowed:
+            return self.rsrc_description
+        else:
+            return None
 
     def __getitem__(self, key):
         return self._get_property_value(key)
@@ -604,7 +679,7 @@ class Properties(collections.Mapping):
             return {}, {}
 
         param_prop_defs = [param_prop_def_items(n, s, template_type)
-                           for n, s in six.iteritems(schemata(schema))
+                           for n, s in schemata(schema).items()
                            if s.implemented]
         param_items, prop_items = zip(*param_prop_defs)
         return dict(param_items), dict(prop_items)

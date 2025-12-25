@@ -11,16 +11,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_messaging.rpc import dispatcher
-import six
 import webob
 
 from heat.common import exception
 from heat.common.i18n import _
 from heat.common import template_format
+from heat.common import urlfetch
 from heat.engine.clients.os import glance
-from heat.engine.clients.os import nova
 from heat.engine import environment
 from heat.engine.hot import template as hot_tmpl
 from heat.engine import resources
@@ -204,6 +204,19 @@ test_template_findinmap_invalid = '''
     }
   }
 }
+'''
+
+test_template_bad_yaql_metadata = '''
+heat_template_version: 2016-10-14
+parameters:
+resources:
+  my_instance:
+    type: OS::Heat::TestResource
+    metadata:
+      test:
+        yaql:
+          expression: {'foo': 'bar'}
+          data: "$.data"
 '''
 
 test_template_invalid_resources = '''
@@ -879,6 +892,10 @@ parameters:
     type: string
     description: Name of private network to be created
 
+  merged_param:
+    type: comma_delimited_list
+    description: A merged list of values
+
 resources:
   private_net:
     type: OS::Neutron::Net
@@ -898,6 +915,71 @@ outputs:
     value: {get_attr: [[random_str, value]]}
 '''
 
+test_template_circular_reference = '''
+heat_template_version: 2013-05-23
+
+resources:
+  res1:
+    type: OS::Heat::None
+    depends_on: res3
+  res2:
+    type: OS::Heat::None
+    depends_on: res1
+  res3:
+    type: OS::Heat::None
+    depends_on: res2
+'''
+
+
+test_template_external_rsrc = '''
+heat_template_version: pike
+
+resources:
+  random_str:
+    type: OS::Nova::Server
+    external_id: foobar
+'''
+
+test_template_hot_parameter_tags_older = '''
+heat_template_version: 2013-05-23
+
+parameters:
+  KeyName:
+    type: string
+    description: Name of an existing key pair to use for the instance
+    label: Nova KeyPair Name
+    tags:
+      - feature1
+      - feature2
+
+'''
+
+test_template_hot_parameter_tags_pass = '''
+heat_template_version: 2018-03-02
+
+parameters:
+  KeyName:
+    type: string
+    description: Name of an existing key pair to use for the instance
+    label: Nova KeyPair Name
+    tags:
+      - feature1
+      - feature2
+
+'''
+
+test_template_hot_parameter_tags_fail = '''
+heat_template_version: 2018-03-02
+
+parameters:
+  KeyName:
+    type: string
+    description: Name of an existing key pair to use for the instance
+    label: Nova KeyPair Name
+    tags: feature
+
+'''
+
 
 class ValidateTest(common.HeatTestCase):
     def setUp(self):
@@ -913,18 +995,19 @@ class ValidateTest(common.HeatTestCase):
         self.mock_is_service_available = self.mock_isa.start()
         self.addCleanup(self.mock_isa.stop)
         self.engine = service.EngineService('a', 't')
+        self.empty_environment = {
+            'event_sinks': [],
+            'parameter_defaults': {},
+            'parameters': {},
+            'resource_registry': {'resources': {}}}
 
-    def _mock_get_image_id_success(self, imageId_input, imageId):
-        self.m.StubOutWithMock(glance.GlanceClientPlugin,
-                               'find_image_by_name_or_id')
-        glance.GlanceClientPlugin.find_image_by_name_or_id(
-            imageId_input).MultipleTimes().AndReturn(imageId)
+    def _mock_get_image_id_success(self, imageId):
+        self.patchobject(glance.GlanceClientPlugin, 'find_image_by_name_or_id',
+                         return_value=imageId)
 
-    def _mock_get_image_id_fail(self, image_id, exp):
-        self.m.StubOutWithMock(glance.GlanceClientPlugin,
-                               'find_image_by_name_or_id')
-        glance.GlanceClientPlugin.find_image_by_name_or_id(
-            image_id).AndRaise(exp)
+    def _mock_get_image_id_fail(self, exp):
+        self.patchobject(glance.GlanceClientPlugin, 'find_image_by_name_or_id',
+                         side_effect=exp)
 
     def test_validate_volumeattach_valid(self):
         t = template_format.parse(test_template_volumeattach % 'vdq')
@@ -983,6 +1066,12 @@ class ValidateTest(common.HeatTestCase):
         res = dict(self.engine.validate_template(self.ctx, t, {}))
         self.assertNotEqual(res['Description'], 'Successfully validated')
 
+    def test_validate_bad_yaql_metadata(self):
+        t = template_format.parse(test_template_bad_yaql_metadata)
+        res = dict(self.engine.validate_template(self.ctx, t, {}))
+        self.assertIn('Error', res)
+        self.assertIn('yaql', res['Error'])
+
     def test_validate_parameters(self):
         t = template_format.parse(test_template_ref % 'WikiDatabase')
         res = dict(self.engine.validate_template(self.ctx, t, {}))
@@ -1014,6 +1103,88 @@ class ValidateTest(common.HeatTestCase):
         self.assertEqual('betternetname',
                          res['Parameters']['net_name']['Value'])
         self.assertNotIn('Default', res['Parameters']['net_name'])
+
+    def test_validate_parameters_nested(self):
+        t = template_format.parse(test_template_allowed_integers)
+
+        other_template = test_template_no_default.replace(
+            'net_name', 'net_name2')
+
+        files = {'env1': 'parameter_defaults:'
+                         '\n  net_name: net1',
+                 'env2': 'parameter_defaults:'
+                         '\n  net_name: net2'
+                         '\n  net_name2: net3',
+                 'tmpl1.yaml': test_template_no_default,
+                 'tmpl2.yaml': other_template}
+        params = {'parameters': {}, 'parameter_defaults': {}}
+
+        ret = self.engine.validate_template(
+            self.ctx, t,
+            params=params,
+            files=files, environment_files=['env1', 'env2'])
+        self.assertEqual('net2', params['parameter_defaults']['net_name'])
+        self.assertEqual('net3', params['parameter_defaults']['net_name2'])
+        expected = {
+            'Description': 'No description',
+            'Parameters': {
+                'size': {'AllowedValues': [1, 4, 8],
+                         'Description': '',
+                         'Label': 'size',
+                         'NoEcho': 'false',
+                         'Type': 'Number'}},
+            'Environment': {
+                'event_sinks': [],
+                'parameter_defaults': {
+                    'net_name': 'net2',
+                    'net_name2': 'net3'},
+                'parameters': {},
+                'resource_registry': {'resources': {}}}}
+
+        self.assertEqual(expected, ret)
+
+    def test_validate_parameters_merged_env(self):
+        t = template_format.parse(test_template_allowed_integers)
+
+        other_template = test_template_no_default.replace(
+            'net_name', 'net_name2')
+
+        files = {'env1': 'parameter_defaults:'
+                         '\n  net_name: net1'
+                         '\n  merged_param: [net1, net2]'
+                         '\nparameter_merge_strategies:'
+                         '\n  merged_param: merge',
+                 'env2': 'parameter_defaults:'
+                         '\n  net_name: net2'
+                         '\n  net_name2: net3'
+                         '\n  merged_param: [net3, net4]'
+                         '\nparameter_merge_strategies:'
+                         '\n  merged_param: merge',
+                 'tmpl1.yaml': test_template_no_default,
+                 'tmpl2.yaml': other_template}
+        params = {'parameters': {}, 'parameter_defaults': {}}
+
+        expected = {
+            'Description': 'No description',
+            'Parameters': {
+                'size': {'AllowedValues': [1, 4, 8],
+                         'Description': '',
+                         'Label': 'size',
+                         'NoEcho': 'false',
+                         'Type': 'Number'}},
+            'Environment': {
+                'event_sinks': [],
+                'parameter_defaults': {
+                    'net_name': 'net2',
+                    'net_name2': 'net3',
+                    'merged_param': ['net1', 'net2', 'net3', 'net4']},
+                'parameters': {},
+                'resource_registry': {'resources': {}}}}
+        ret = self.engine.validate_template(
+            self.ctx, t,
+            params=params,
+            files=files, environment_files=['env1', 'env2'])
+        self.assertEqual(expected, ret)
 
     def test_validate_hot_empty_parameters_valid(self):
         t = template_format.parse(
@@ -1106,7 +1277,8 @@ class ValidateTest(common.HeatTestCase):
 
         res = dict(self.engine.validate_template(self.ctx, t, {}))
         expected = {"Description": "test.",
-                    "Parameters": {}}
+                    "Parameters": {},
+                    "Environment": self.empty_environment}
         self.assertEqual(expected, res)
 
     def test_validate_hot_empty_outputs_valid(self):
@@ -1119,7 +1291,8 @@ class ValidateTest(common.HeatTestCase):
 
         res = dict(self.engine.validate_template(self.ctx, t, {}))
         expected = {"Description": "test.",
-                    "Parameters": {}}
+                    "Parameters": {},
+                    "Environment": self.empty_environment}
         self.assertEqual(expected, res)
 
     def test_validate_properties(self):
@@ -1135,7 +1308,7 @@ class ValidateTest(common.HeatTestCase):
 
         res = dict(self.engine.validate_template(self.ctx, t, {}))
         self.assertEqual({'Error': 'Resources must contain Resource. '
-                          'Found a [%s] instead' % six.text_type},
+                          'Found a [%s] instead' % str},
                          res)
 
     def test_invalid_section_cfn(self):
@@ -1189,14 +1362,18 @@ class ValidateTest(common.HeatTestCase):
         t = template_format.parse(test_template_snapshot_deletion_policy)
 
         res = dict(self.engine.validate_template(self.ctx, t, {}))
-        self.assertEqual(
-            {'Error': '"Snapshot" deletion policy not supported'}, res)
+        self.assertEqual({'Error': 'Resources.WikiDatabase.DeletionPolicy: '
+                                   '"Snapshot" deletion policy '
+                                   'not supported'},
+                         res)
 
     def test_volume_snapshot_deletion_policy(self):
         t = template_format.parse(test_template_volume_snapshot)
 
         res = dict(self.engine.validate_template(self.ctx, t, {}))
-        self.assertEqual({'Description': u'test.', 'Parameters': {}}, res)
+        expected = {'Description': 'test.', 'Parameters': {},
+                    'Environment': self.empty_environment}
+        self.assertEqual(expected, res)
 
     def test_validate_template_without_resources(self):
         hot_tpl = template_format.parse('''
@@ -1204,7 +1381,8 @@ class ValidateTest(common.HeatTestCase):
         ''')
 
         res = dict(self.engine.validate_template(self.ctx, hot_tpl, {}))
-        expected = {'Description': 'No description', 'Parameters': {}}
+        expected = {'Description': 'No description', 'Parameters': {},
+                    'Environment': self.empty_environment}
         self.assertEqual(expected, res)
 
     def test_validate_template_with_invalid_resource_type(self):
@@ -1337,11 +1515,9 @@ class ValidateTest(common.HeatTestCase):
 
         self.stub_FlavorConstraint_validate()
         self.stub_ImageConstraint_validate()
-        self.m.ReplayAll()
 
         resource = stack['Instance']
         self.assertRaises(exception.StackValidationFailed, resource.validate)
-        self.m.VerifyAll()
 
     def test_unregistered_image(self):
         t = template_format.parse(test_template_image)
@@ -1351,18 +1527,14 @@ class ValidateTest(common.HeatTestCase):
 
         stack = parser.Stack(self.ctx, 'test_stack', template)
 
-        self._mock_get_image_id_fail('image_name',
-                                     exception.EntityNotFound(
-                                         entity='Image',
-                                         name='image_name'))
+        self._mock_get_image_id_fail(exception.EntityNotFound(
+                                     entity='Image',
+                                     name='image_name'))
         self.stub_KeypairConstraint_validate()
         self.stub_FlavorConstraint_validate()
-        self.m.ReplayAll()
 
         resource = stack['Instance']
         self.assertRaises(exception.StackValidationFailed, resource.validate)
-
-        self.m.VerifyAll()
 
     def test_duplicated_image(self):
         t = template_format.parse(test_template_image)
@@ -1372,68 +1544,56 @@ class ValidateTest(common.HeatTestCase):
 
         stack = parser.Stack(self.ctx, 'test_stack', template)
 
-        self._mock_get_image_id_fail('image_name',
-                                     exception.PhysicalResourceNameAmbiguity(
-                                         name='image_name'))
+        self._mock_get_image_id_fail(exception.PhysicalResourceNameAmbiguity(
+                                     name='image_name'))
 
         self.stub_KeypairConstraint_validate()
         self.stub_FlavorConstraint_validate()
-        self.m.ReplayAll()
 
         resource = stack['Instance']
         self.assertRaises(exception.StackValidationFailed,
                           resource.validate)
 
-        self.m.VerifyAll()
-
-    def test_invalid_security_groups_with_nics(self):
+    @mock.patch('heat.engine.clients.os.nova.NovaClientPlugin.client')
+    def test_invalid_security_groups_with_nics(self, mock_create):
         t = template_format.parse(test_template_invalid_secgroups)
         template = tmpl.Template(t,
                                  env=environment.Environment(
                                      {'KeyName': 'test'}))
         stack = parser.Stack(self.ctx, 'test_stack', template)
 
-        self._mock_get_image_id_success('image_name', 'image_id')
+        self._mock_get_image_id_success('image_id')
 
-        self.m.StubOutWithMock(nova.NovaClientPlugin, '_create')
-        nova.NovaClientPlugin._create().AndReturn(self.fc)
-        self.m.ReplayAll()
+        mock_create.return_value = self.fc
 
         resource = stack['Instance']
         self.assertRaises(exception.ResourcePropertyConflict,
                           resource.validate)
-        self.m.VerifyAll()
 
-    def test_invalid_security_group_ids_with_nics(self):
+    @mock.patch('heat.engine.clients.os.nova.NovaClientPlugin.client')
+    def test_invalid_security_group_ids_with_nics(self, mock_create):
         t = template_format.parse(test_template_invalid_secgroupids)
         template = tmpl.Template(
             t, env=environment.Environment({'KeyName': 'test'}))
         stack = parser.Stack(self.ctx, 'test_stack', template)
 
-        self._mock_get_image_id_success('image_name', 'image_id')
+        self._mock_get_image_id_success('image_id')
 
-        self.m.StubOutWithMock(nova.NovaClientPlugin, '_create')
-        nova.NovaClientPlugin._create().AndReturn(self.fc)
-        self.m.ReplayAll()
+        mock_create.return_value = self.fc
 
         resource = stack['Instance']
         self.assertRaises(exception.ResourcePropertyConflict,
                           resource.validate)
-        self.m.VerifyAll()
 
-    def test_client_exception_from_glance_client(self):
+    @mock.patch('heat.engine.clients.os.glance.GlanceClientPlugin.client')
+    def test_client_exception_from_glance_client(self, mock_client):
         t = template_format.parse(test_template_glance_client_exception)
         template = tmpl.Template(t)
         stack = parser.Stack(self.ctx, 'test_stack', template)
-        self.m.StubOutWithMock(self.gc.images, 'get')
-        self.gc.images.get('image_name').AndRaise(glance.exc.HTTPNotFound())
-        self.m.StubOutWithMock(glance.GlanceClientPlugin, 'client')
-        glance.GlanceClientPlugin.client().AndReturn(self.gc)
+        mock_client.return_value = self.gc
         self.stub_FlavorConstraint_validate()
-        self.m.ReplayAll()
 
         self.assertRaises(exception.StackValidationFailed, stack.validate)
-        self.m.VerifyAll()
 
     def test_validate_unique_logical_name(self):
         t = template_format.parse(test_template_unique_logical_name)
@@ -1460,7 +1620,7 @@ class ValidateTest(common.HeatTestCase):
                            'parameter_groups.Database '
                            'Group: The InstanceType parameter must be '
                            'assigned to one parameter group only.'),
-                         six.text_type(exc))
+                         str(exc))
 
     def test_validate_duplicate_parameters_no_label(self):
         t = template_format.parse(test_template_parameters_duplicate_no_label)
@@ -1473,7 +1633,7 @@ class ValidateTest(common.HeatTestCase):
                            'parameter_groups.: '
                            'The key_name parameter must be '
                            'assigned to one parameter group only.'),
-                         six.text_type(exc))
+                         str(exc))
 
     def test_validate_invalid_parameter_in_group(self):
         t = template_format.parse(test_template_invalid_parameter_name)
@@ -1491,7 +1651,7 @@ class ValidateTest(common.HeatTestCase):
                            'parameter_groups.Database Group: The grouped '
                            'parameter SomethingNotHere does not '
                            'reference a valid parameter.'),
-                         six.text_type(exc))
+                         str(exc))
 
     def test_validate_invalid_parameter_no_label(self):
         t = template_format.parse(test_template_invalid_parameter_no_label)
@@ -1505,7 +1665,7 @@ class ValidateTest(common.HeatTestCase):
                            'parameter_groups.: The grouped '
                            'parameter key_name does not '
                            'reference a valid parameter.'),
-                         six.text_type(exc))
+                         str(exc))
 
     def test_validate_no_parameters_in_group(self):
         t = template_format.parse(test_template_no_parameters)
@@ -1516,7 +1676,7 @@ class ValidateTest(common.HeatTestCase):
 
         self.assertEqual(_('Parameter Groups error: parameter_groups.Server '
                            'Group: The parameters must be provided for each '
-                           'parameter group.'), six.text_type(exc))
+                           'parameter group.'), str(exc))
 
     def test_validate_parameter_groups_not_list(self):
         t = template_format.parse(test_template_parameter_groups_not_list)
@@ -1527,7 +1687,7 @@ class ValidateTest(common.HeatTestCase):
 
         self.assertEqual(_('Parameter Groups error: parameter_groups: '
                            'The parameter_groups should be '
-                           'a list.'), six.text_type(exc))
+                           'a list.'), str(exc))
 
     def test_validate_parameters_not_list(self):
         t = template_format.parse(test_template_parameters_not_list)
@@ -1539,7 +1699,7 @@ class ValidateTest(common.HeatTestCase):
         self.assertEqual(_('Parameter Groups error: '
                            'parameter_groups.Server Group: '
                            'The parameters of parameter group should be '
-                           'a list.'), six.text_type(exc))
+                           'a list.'), str(exc))
 
     def test_validate_parameters_error_no_label(self):
         t = template_format.parse(test_template_parameters_error_no_label)
@@ -1550,7 +1710,7 @@ class ValidateTest(common.HeatTestCase):
 
         self.assertEqual(_('Parameter Groups error: parameter_groups.: '
                            'The parameters of parameter group should be '
-                           'a list.'), six.text_type(exc))
+                           'a list.'), str(exc))
 
     def test_validate_allowed_values_integer(self):
         t = template_format.parse(test_template_allowed_integers)
@@ -1589,15 +1749,15 @@ class ValidateTest(common.HeatTestCase):
         err = self.assertRaises(exception.StackValidationFailed,
                                 stack.validate)
         self.assertIn('"3" is not an allowed value [1, 4, 8]',
-                      six.text_type(err))
+                      str(err))
 
         # test with size parameter provided as number
         template.env = environment.Environment({'size': 3})
         stack = parser.Stack(self.ctx, 'test_stack', template)
         err = self.assertRaises(exception.StackValidationFailed,
                                 stack.validate)
-        self.assertIn('"3" is not an allowed value [1, 4, 8]',
-                      six.text_type(err))
+        self.assertIn('3 is not an allowed value [1, 4, 8]',
+                      str(err))
 
     def test_validate_not_allowed_values_integer_str(self):
         t = template_format.parse(test_template_allowed_integers_str)
@@ -1608,16 +1768,16 @@ class ValidateTest(common.HeatTestCase):
         stack = parser.Stack(self.ctx, 'test_stack', template)
         err = self.assertRaises(exception.StackValidationFailed,
                                 stack.validate)
-        self.assertIn('"3" is not an allowed value [1, 4, 8]',
-                      six.text_type(err))
+        self.assertIn('"3" is not an allowed value ["1", "4", "8"]',
+                      str(err))
 
         # test with size parameter provided as number
         template.env = environment.Environment({'size': 3})
         stack = parser.Stack(self.ctx, 'test_stack', template)
         err = self.assertRaises(exception.StackValidationFailed,
                                 stack.validate)
-        self.assertIn('"3" is not an allowed value [1, 4, 8]',
-                      six.text_type(err))
+        self.assertIn('3 is not an allowed value ["1", "4", "8"]',
+                      str(err))
 
     def test_validate_invalid_outputs(self):
         t = template_format.parse(test_template_invalid_outputs)
@@ -1628,7 +1788,7 @@ class ValidateTest(common.HeatTestCase):
         error_message = ('outputs.string.value.get_attr: Arguments to '
                          '"get_attr" must be of the form '
                          '[resource_name, attribute, (path), ...]')
-        self.assertEqual(error_message, six.text_type(err))
+        self.assertEqual(error_message, str(err))
 
     def test_validate_resource_attr_invalid_type(self):
         t = template_format.parse("""
@@ -1641,7 +1801,7 @@ class ValidateTest(common.HeatTestCase):
         stack = parser.Stack(self.ctx, 'test_stack', template)
         ex = self.assertRaises(exception.StackValidationFailed, stack.validate)
         self.assertEqual('Resource resource type type must be string',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_validate_resource_attr_invalid_type_cfn(self):
         t = template_format.parse("""
@@ -1653,7 +1813,7 @@ class ValidateTest(common.HeatTestCase):
         stack = parser.Stack(self.ctx, 'test_stack', tmpl.Template(t))
         ex = self.assertRaises(exception.StackValidationFailed, stack.validate)
         self.assertEqual('Resource Resource Type type must be string',
-                         six.text_type(ex))
+                         str(ex))
 
     def test_validate_resource_invalid_key(self):
         t = template_format.parse("""
@@ -1666,7 +1826,7 @@ class ValidateTest(common.HeatTestCase):
         template = tmpl.Template(t)
         stack = parser.Stack(self.ctx, 'test_stack', template)
         ex = self.assertRaises(exception.StackValidationFailed, stack.validate)
-        self.assertIn('wibble', six.text_type(ex))
+        self.assertIn('wibble', str(ex))
 
     def test_validate_resource_invalid_cfn_key_in_hot(self):
         t = template_format.parse("""
@@ -1679,7 +1839,7 @@ class ValidateTest(common.HeatTestCase):
         template = tmpl.Template(t)
         stack = parser.Stack(self.ctx, 'test_stack', template)
         ex = self.assertRaises(exception.StackValidationFailed, stack.validate)
-        self.assertIn('Properties', six.text_type(ex))
+        self.assertIn('Properties', str(ex))
 
     def test_validate_resource_invalid_key_cfn(self):
         t = template_format.parse("""
@@ -1730,7 +1890,8 @@ class ValidateTest(common.HeatTestCase):
             t,
             {},
             ignorable_errors=[exception.ResourceTypeUnavailable.error_code]))
-        expected = {'Description': 'No description', 'Parameters': {}}
+        expected = {'Description': 'No description', 'Parameters': {},
+                    'Environment': self.empty_environment}
         self.assertEqual(expected, res)
 
     def test_validate_with_ignorable_errors_invalid_error_code(self):
@@ -1748,3 +1909,216 @@ class ValidateTest(common.HeatTestCase):
         ex = webob.exc.HTTPBadRequest(explanation=msg)
         self.assertIsInstance(res, webob.exc.HTTPBadRequest)
         self.assertEqual(ex.explanation, res.explanation)
+
+    def test_validate_parameter_group_output(self):
+        engine = service.EngineService('a', 't')
+        params = {
+            "resource_registry": {
+                "OS::Test::TestResource": "https://server.test/nested.template"
+            }
+        }
+        root_template_str = '''
+heat_template_version: 2015-10-15
+parameters:
+    test_root_param:
+        type: string
+parameter_groups:
+-   label: RootTest
+    parameters:
+    -   test_root_param
+resources:
+    Nested:
+        type: OS::Test::TestResource
+'''
+        nested_template_str = '''
+heat_template_version: 2015-10-15
+parameters:
+    test_param:
+        type: string
+parameter_groups:
+-   label: Test
+    parameters:
+    -   test_param
+'''
+        root_template = template_format.parse(root_template_str)
+
+        self.patchobject(urlfetch, 'get')
+        urlfetch.get.return_value = nested_template_str
+
+        res = dict(engine.validate_template(self.ctx, root_template,
+                                            params, show_nested=True))
+        expected = {
+            'Description': 'No description',
+            'ParameterGroups': [{
+                'label': 'RootTest',
+                'parameters': ['test_root_param']}],
+            'Parameters': {
+                'test_root_param': {
+                    'Description': '',
+                    'Label': 'test_root_param',
+                    'NoEcho': 'false',
+                    'Type': 'String'}},
+            'NestedParameters': {
+                'Nested': {
+                    'Description': 'No description',
+                    'ParameterGroups': [{
+                        'label': 'Test',
+                        'parameters': ['test_param']}],
+                    'Parameters': {
+                        'test_param': {
+                            'Description': '',
+                            'Label': 'test_param',
+                            'NoEcho': 'false',
+                            'Type': 'String'}},
+                    'Type': 'OS::Test::TestResource'}},
+            'Environment': {
+                'event_sinks': [],
+                'parameter_defaults': {},
+                'parameters': {},
+                'resource_registry': {
+                    'OS::Test::TestResource':
+                    'https://server.test/nested.template',
+                    'resources': {}}}}
+        self.assertEqual(expected, res)
+
+    def test_validate_allowed_external_rsrc(self):
+        t = template_format.parse(test_template_external_rsrc)
+        template = tmpl.Template(t)
+        stack = parser.Stack(self.ctx, 'test_stack', template)
+
+        self.assertIsNone(stack.validate(validate_res_tmpl_only=True))
+
+        with mock.patch(
+            'heat.engine.resources.server_base.BaseServer._show_resource',
+            return_value={'id': 'foobar'}
+        ):
+            self.assertIsNone(stack.validate(validate_res_tmpl_only=False))
+
+    def test_validate_circular_reference(self):
+        t = template_format.parse(test_template_circular_reference)
+
+        exc = self.assertRaises(dispatcher.ExpectedException,
+                                self.engine.validate_template,
+                                self.ctx, t, {})
+        self.assertEqual(exception.CircularDependencyException,
+                         exc.exc_info[0])
+
+    def test_validate_hot_parameter_tags_older(self):
+        t = template_format.parse(test_template_hot_parameter_tags_older)
+
+        exc = self.assertRaises(dispatcher.ExpectedException,
+                                self.engine.validate_template,
+                                self.ctx, t, {})
+        self.assertEqual(exception.InvalidSchemaError,
+                         exc.exc_info[0])
+
+    def test_validate_hot_parameter_tags_pass(self):
+        t = template_format.parse(test_template_hot_parameter_tags_pass)
+
+        res = dict(self.engine.validate_template(self.ctx, t, {}))
+        parameters = res['Parameters']
+
+        expected = {'KeyName': {
+            'Description': 'Name of an existing key pair to use for the '
+                           'instance',
+            'NoEcho': 'false',
+            'Label': 'Nova KeyPair Name',
+            'Type': 'String',
+            'Tags': [
+                'feature1',
+                'feature2'
+            ]}}
+        self.assertEqual(expected, parameters)
+
+    def test_validate_hot_parameter_tags_fail(self):
+        t = template_format.parse(test_template_hot_parameter_tags_fail)
+
+        exc = self.assertRaises(dispatcher.ExpectedException,
+                                self.engine.validate_template,
+                                self.ctx, t, {})
+        self.assertEqual(exception.InvalidSchemaError,
+                         exc.exc_info[0])
+
+    def test_validate_empty_resource_group(self):
+        engine = service.EngineService('a', 't')
+        params = {
+            "resource_registry": {
+                "OS::Test::TestResource": "https://server.test/nested.template"
+            }
+        }
+        root_template_str = '''
+heat_template_version: 2015-10-15
+parameters:
+    test_root_param:
+        type: string
+resources:
+    Group:
+        type: OS::Heat::ResourceGroup
+        properties:
+            count: 0
+            resource_def:
+                type: OS::Test::TestResource
+'''
+        nested_template_str = '''
+heat_template_version: 2015-10-15
+parameters:
+    test_param:
+        type: string
+'''
+        root_template = template_format.parse(root_template_str)
+
+        self.patchobject(urlfetch, 'get')
+        urlfetch.get.return_value = nested_template_str
+
+        res = dict(engine.validate_template(self.ctx, root_template,
+                                            params, show_nested=True))
+        expected = {
+            'Description': 'No description',
+            'Environment': {
+                'event_sinks': [],
+                'parameter_defaults': {},
+                'parameters': {},
+                'resource_registry': {
+                    'OS::Test::TestResource':
+                        'https://server.test/nested.template',
+                    'resources': {}}},
+            'NestedParameters': {
+                'Group': {
+                    'Description': 'No description',
+                    'Parameters': {},
+                    'Type': 'OS::Heat::ResourceGroup',
+                    'NestedParameters': {
+                        '0': {
+                            'Description': 'No description',
+                            'Parameters': {
+                                'test_param': {
+                                    'Description': '',
+                                    'Label': 'test_param',
+                                    'NoEcho': 'false',
+                                    'Type': 'String'}},
+                            'Type': 'OS::Test::TestResource'}}}},
+            'Parameters': {
+                'test_root_param': {
+                    'Description': '',
+                    'Label': 'test_root_param',
+                    'NoEcho': 'false',
+                    'Type': 'String'}}}
+        self.assertEqual(expected, res)
+
+    def test_validate_bad_depends(self):
+        test_template = '''
+        heat_template_version: 2013-05-23
+
+        resources:
+          random_str:
+            type: OS::Heat::RandomString
+            depends_on: [{foo: bar}]
+        '''
+
+        t = template_format.parse(test_template)
+
+        res = dict(self.engine.validate_template(self.ctx, t, {}))
+        self.assertEqual(
+            {'Error': 'Resource random_str depends_on must be '
+                      'a list of strings'},
+            res)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -18,9 +17,7 @@ This does the work of actually implementing the API calls made by the user.
 Normal communications is done via the heat API which then calls into this
 engine.
 """
-
-import eventlet
-eventlet.monkey_patch()
+# flake8: noqa: E402
 
 import sys
 
@@ -29,10 +26,14 @@ from oslo_config import cfg
 import oslo_i18n as i18n
 from oslo_log import log as logging
 from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
+
+from oslo_service import backend
+backend.init_backend(backend.BackendType.THREADING)
+
 from oslo_service import service
 
 from heat.common import config
-from heat.common.i18n import _LC
 from heat.common import messaging
 from heat.common import profiler
 from heat.engine import template
@@ -41,15 +42,18 @@ from heat import version
 
 i18n.enable_lazy()
 
-LOG = logging.getLogger('heat.engine')
+CONF = cfg.CONF
 
 
-def main():
-    logging.register_options(cfg.CONF)
-    cfg.CONF(project='heat', prog='heat-engine',
-             version=version.version_info.version_string())
-    logging.setup(cfg.CONF, 'heat-engine')
-    logging.set_defaults()
+def launch_engine(setup_logging=True):
+    if setup_logging:
+        logging.register_options(CONF)
+    CONF(project='heat', prog='heat-engine',
+         version=version.version_info.version_string())
+    if setup_logging:
+        logging.setup(CONF, CONF.prog)
+        logging.set_defaults()
+    LOG = logging.getLogger(CONF.prog)
     messaging.setup()
 
     config.startup_sanity_check()
@@ -58,22 +62,25 @@ def main():
     try:
         mgr = template._get_template_extension_manager()
     except template.TemplatePluginNotRegistered as ex:
-        LOG.critical(_LC("%s"), ex)
+        LOG.critical("%s", ex)
     if not mgr or not mgr.names():
         sys.exit("ERROR: No template format plugins registered")
 
     from heat.engine import service as engine  # noqa
 
-    profiler.setup('heat-engine', cfg.CONF.host)
-    gmr.TextGuruMeditation.setup_autorun(version)
-    srv = engine.EngineService(cfg.CONF.host, rpc_api.ENGINE_TOPIC)
-    workers = cfg.CONF.num_engine_workers
+    profiler.setup(CONF.prog, CONF.host)
+    gmr_opts.set_defaults(CONF)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
+    srv = engine.EngineService(CONF.host, rpc_api.ENGINE_TOPIC)
+    workers = CONF.num_engine_workers
     if not workers:
         workers = max(4, processutils.get_worker_count())
 
-    launcher = service.launch(cfg.CONF, srv, workers=workers)
-    if cfg.CONF.enable_cloud_watch_lite:
-        # We create the periodic tasks here, which mean they are created
-        # only in the parent process when num_engine_workers>1 is specified
-        srv.create_periodic_tasks()
+    launcher = service.launch(CONF, srv, workers=workers,
+                              restart_method='mutate')
+    return launcher
+
+
+def main():
+    launcher = launch_engine()
     launcher.wait()

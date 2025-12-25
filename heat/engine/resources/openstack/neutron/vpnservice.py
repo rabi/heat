@@ -11,6 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import attributes
 from heat.engine import constraints
@@ -28,6 +29,8 @@ class VPNService(neutron.NeutronResource):
     """
 
     required_service_extension = 'vpnaas'
+
+    entity = 'vpnservice'
 
     PROPERTIES = (
         NAME, DESCRIPTION, ADMIN_STATE_UP,
@@ -148,6 +151,7 @@ class VPNService(neutron.NeutronResource):
     }
 
     def translation_rules(self, props):
+        client_plugin = self.client_plugin()
         return [
             translation.TranslationRule(
                 props,
@@ -159,9 +163,9 @@ class VPNService(neutron.NeutronResource):
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.SUBNET],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='subnet'
+                entity=client_plugin.RES_TYPE_SUBNET
             ),
             translation.TranslationRule(
                 props,
@@ -173,15 +177,12 @@ class VPNService(neutron.NeutronResource):
                 props,
                 translation.TranslationRule.RESOLVE,
                 [self.ROUTER],
-                client_plugin=self.client_plugin(),
+                client_plugin=client_plugin,
                 finder='find_resourceid_by_name_or_id',
-                entity='router'
+                entity=client_plugin.RES_TYPE_ROUTER
             ),
 
         ]
-
-    def _show_resource(self):
-        return self.client().show_vpnservice(self.resource_id)['vpnservice']
 
     def handle_create(self):
         props = self.prepare_properties(
@@ -192,6 +193,28 @@ class VPNService(neutron.NeutronResource):
         vpnservice = self.client().create_vpnservice({'vpnservice': props})[
             'vpnservice']
         self.resource_id_set(vpnservice['id'])
+
+    def check_create_complete(self, data):
+        attributes = self._show_resource()
+        status = attributes['status']
+        # The Neutron VPN service doesn't hit the ACTIVE status until
+        # it has a matching site-to-site connection. However, it is
+        # required that the VPNService resource be in CREATE_COMPLETE,
+        # in order for the IPsecSiteConnection resource to progress to
+        # CREATE_IN_PROGRESS. The only way to resolve this catch-22 is
+        # to already consider the VPNService resource complete, even
+        # when its underlying Neutron VPN service object is still in
+        # PENDING_CREATE.
+        if status in ['PENDING_CREATE', 'ACTIVE']:
+            return True
+        elif status == 'ERROR':
+            raise exception.ResourceInError(
+                resource_status=status,
+                status_reason=_('Error in VPNService'))
+        else:
+            raise exception.ResourceUnknownStatus(
+                resource_status=status,
+                result=_('VPNService creation failed'))
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         if prop_diff:
@@ -216,6 +239,8 @@ class IPsecSiteConnection(neutron.NeutronResource):
     """
 
     required_service_extension = 'vpnaas'
+
+    entity = 'ipsec_site_connection'
 
     PROPERTIES = (
         NAME, DESCRIPTION, PEER_ADDRESS, PEER_ID, PEER_CIDRS, MTU,
@@ -430,10 +455,6 @@ class IPsecSiteConnection(neutron.NeutronResource):
         ),
     }
 
-    def _show_resource(self):
-        return self.client().show_ipsec_site_connection(self.resource_id)[
-            'ipsec_site_connection']
-
     def handle_create(self):
         props = self.prepare_properties(
             self.properties,
@@ -441,6 +462,23 @@ class IPsecSiteConnection(neutron.NeutronResource):
         ipsec_site_connection = self.client().create_ipsec_site_connection(
             {'ipsec_site_connection': props})['ipsec_site_connection']
         self.resource_id_set(ipsec_site_connection['id'])
+
+    def check_create_complete(self, data):
+        attributes = self._show_resource()
+        status = attributes['status']
+
+        if status == 'PENDING_CREATE':
+            return False
+        elif status == 'ACTIVE':
+            return True
+        elif status == 'ERROR':
+            raise exception.ResourceInError(
+                resource_status=status,
+                status_reason=_('Error in IPsecSiteConnection'))
+        else:
+            raise exception.ResourceUnknownStatus(
+                resource_status=status,
+                result=_('IPsecSiteConnection creation failed'))
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         if prop_diff:
@@ -465,6 +503,8 @@ class IKEPolicy(neutron.NeutronResource):
     """
 
     required_service_extension = 'vpnaas'
+
+    entity = 'ikepolicy'
 
     PROPERTIES = (
         NAME, DESCRIPTION, AUTH_ALGORITHM, ENCRYPTION_ALGORITHM,
@@ -506,8 +546,10 @@ class IKEPolicy(neutron.NeutronResource):
             _('Authentication hash algorithm for the ike policy.'),
             default='sha1',
             constraints=[
-                constraints.AllowedValues(['sha1']),
-            ]
+                constraints.AllowedValues(['sha1', 'sha256',
+                                           'sha384', 'sha512']),
+            ],
+            update_allowed=True
         ),
         ENCRYPTION_ALGORITHM: properties.Schema(
             properties.Schema.STRING,
@@ -516,7 +558,8 @@ class IKEPolicy(neutron.NeutronResource):
             constraints=[
                 constraints.AllowedValues(['3des', 'aes-128', 'aes-192',
                                            'aes-256']),
-            ]
+            ],
+            update_allowed=True
         ),
         PHASE1_NEGOTIATION_MODE: properties.Schema(
             properties.Schema.STRING,
@@ -529,6 +572,7 @@ class IKEPolicy(neutron.NeutronResource):
         LIFETIME: properties.Schema(
             properties.Schema.MAP,
             _('Safety assessment lifetime configuration for the ike policy.'),
+            update_allowed=True,
             schema={
                 LIFETIME_UNITS: properties.Schema(
                     properties.Schema.STRING,
@@ -552,7 +596,8 @@ class IKEPolicy(neutron.NeutronResource):
             default='group5',
             constraints=[
                 constraints.AllowedValues(['group2', 'group5', 'group14']),
-            ]
+            ],
+            update_allowed=True
         ),
         IKE_VERSION: properties.Schema(
             properties.Schema.STRING,
@@ -560,7 +605,8 @@ class IKEPolicy(neutron.NeutronResource):
             default='v1',
             constraints=[
                 constraints.AllowedValues(['v1', 'v2']),
-            ]
+            ],
+            update_allowed=True
         ),
     }
 
@@ -604,9 +650,6 @@ class IKEPolicy(neutron.NeutronResource):
         ),
     }
 
-    def _show_resource(self):
-        return self.client().show_ikepolicy(self.resource_id)['ikepolicy']
-
     def handle_create(self):
         props = self.prepare_properties(
             self.properties,
@@ -637,6 +680,8 @@ class IPsecPolicy(neutron.NeutronResource):
     """
 
     required_service_extension = 'vpnaas'
+
+    entity = 'ipsecpolicy'
 
     PROPERTIES = (
         NAME, DESCRIPTION, TRANSFORM_PROTOCOL, ENCAPSULATION_MODE,
@@ -777,9 +822,6 @@ class IPsecPolicy(neutron.NeutronResource):
             type=attributes.Schema.STRING
         ),
     }
-
-    def _show_resource(self):
-        return self.client().show_ipsecpolicy(self.resource_id)['ipsecpolicy']
 
     def handle_create(self):
         props = self.prepare_properties(

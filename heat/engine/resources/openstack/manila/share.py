@@ -12,12 +12,9 @@
 #    under the License.
 
 from oslo_log import log as logging
-from oslo_utils import encodeutils
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -78,7 +75,7 @@ class ManilaShare(resource.Resource):
             _('Share protocol supported by shared filesystem.'),
             required=True,
             constraints=[constraints.AllowedValues(
-                ['NFS', 'CIFS', 'GlusterFS', 'HDFS'])]
+                ['NFS', 'CIFS', 'GlusterFS', 'HDFS', 'CEPHFS'])]
         ),
         SIZE: properties.Schema(
             properties.Schema.INTEGER,
@@ -139,7 +136,7 @@ class ManilaShare(resource.Resource):
                         properties.Schema.STRING,
                         _('Type of access that should be provided to guest.'),
                         constraints=[constraints.AllowedValues(
-                            ['ip', 'domain'])],
+                            ['ip', 'user', 'cert', 'cephx'])],
                         required=True
                     ),
                     ACCESS_LEVEL: properties.Schema(
@@ -194,9 +191,21 @@ class ManilaShare(resource.Resource):
     def _request_share(self):
         return self.client().shares.get(self.resource_id)
 
+    def _request_export_locations(self):
+        # Only return the "path" response parameter, because that is what was
+        # returned before API version "2.9" by the shares endpoint
+        return [export_location.to_dict()['path']
+                for export_location in
+                self.client().share_export_locations.list(self.resource_id)]
+
     def _resolve_attribute(self, name):
-        share = self._request_share()
-        return six.text_type(getattr(share, name))
+        if self.resource_id is None:
+            return
+        if name == self.EXPORT_LOCATIONS_ATTR:
+            attr = self._request_export_locations()
+            return attr
+        attr = getattr(self._request_share(), name)
+        return str(attr)
 
     def handle_create(self):
         # Request IDs of entities from manila
@@ -232,7 +241,7 @@ class ManilaShare(resource.Resource):
         if share_status == self.STATUS_CREATING:
             return False
         elif share_status == self.STATUS_AVAILABLE:
-            LOG.info(_LI('Applying access rules to created Share.'))
+            LOG.info('Applying access rules to created Share.')
             # apply access rules to created share. please note that it is not
             # possible to define rules for share with share_status = creating
             access_rules = self.properties.get(self.ACCESS_RULES)
@@ -246,11 +255,10 @@ class ManilaShare(resource.Resource):
                             access_level=rule.get(self.ACCESS_LEVEL))
                 return True
             except Exception as ex:
-                err_msg = encodeutils.exception_to_unicode(ex)
                 reason = _(
                     'Error during applying access rules to share "{0}". '
                     'The root cause of the problem is the following: {1}.'
-                ).format(self.resource_id, err_msg)
+                ).format(self.resource_id, str(ex))
                 raise exception.ResourceInError(
                     status_reason=reason, resource_status=share_status)
         elif share_status == self.STATUS_ERROR:
@@ -335,6 +343,18 @@ class ManilaShare(resource.Resource):
                         access=rule.get(self.ACCESS_TO),
                         access_level=rule.get(self.ACCESS_LEVEL)
                     )
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        result = super(ManilaShare, self).parse_live_resource_data(
+            resource_properties, resource_data)
+
+        rules = self.client().shares.access_list(self.resource_id)
+        result[self.ACCESS_RULES] = []
+        for rule in rules:
+            result[self.ACCESS_RULES].append(
+                {(k, v) for (k, v) in rule.items()
+                 if k in self._ACCESS_RULE_PROPERTIES})
+        return result
 
 
 def resource_mapping():

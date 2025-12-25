@@ -10,16 +10,19 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import mock
+
+from unittest import mock
+
 from oslo_config import cfg
 from oslo_messaging.rpc import dispatcher
 from oslo_service import threadgroup
-import six
+from swiftclient import exceptions
 
 from heat.common import environment_util as env_util
 from heat.common import exception
 from heat.engine.clients.os import glance
 from heat.engine.clients.os import nova
+from heat.engine.clients.os import swift
 from heat.engine import environment
 from heat.engine import properties
 from heat.engine.resources.aws.ec2 import instance as instances
@@ -38,42 +41,60 @@ class StackCreateTest(common.HeatTestCase):
         super(StackCreateTest, self).setUp()
         self.ctx = utils.dummy_context()
         self.man = service.EngineService('a-host', 'a-topic')
-        self.man.create_periodic_tasks()
+        self.man.thread_group_mgr = tools.DummyThreadGroupManager()
+        cfg.CONF.set_override('convergence_engine', False)
 
     @mock.patch.object(threadgroup, 'ThreadGroup')
     @mock.patch.object(stack.Stack, 'validate')
     def _test_stack_create(self, stack_name, mock_validate, mock_tg,
-                           environment_files=None):
+                           environment_files=None, files_container=None,
+                           error=False):
         mock_tg.return_value = tools.DummyThreadGroup()
 
         params = {'foo': 'bar'}
         template = '{ "Template": "data" }'
 
-        stk = tools.get_stack(stack_name, self.ctx)
+        stk = tools.get_stack(stack_name, self.ctx,
+                              convergence=cfg.CONF.convergence_engine)
+
+        files = None
+        if files_container:
+            files = {'/env/test.yaml': "{'resource_registry': {}}"}
 
         mock_tmpl = self.patchobject(templatem, 'Template', return_value=stk.t)
         mock_env = self.patchobject(environment, 'Environment',
                                     return_value=stk.env)
         mock_stack = self.patchobject(stack, 'Stack', return_value=stk)
         mock_merge = self.patchobject(env_util, 'merge_environments')
-        result = self.man.create_stack(self.ctx, stack_name,
-                                       template, params, None, {},
-                                       environment_files=environment_files)
-        self.assertEqual(stk.identifier(), result)
-        self.assertIsInstance(result, dict)
-        self.assertTrue(result['stack_id'])
-
-        mock_tmpl.assert_called_once_with(template, files=None)
-        mock_env.assert_called_once_with(params)
-        mock_stack.assert_called_once_with(
-            self.ctx, stack_name, stk.t, owner_id=None, nested_depth=0,
-            user_creds_id=None, stack_user_project_id=None,
-            convergence=cfg.CONF.convergence_engine, parent_resource=None)
-
-        if environment_files:
-            mock_merge.assert_called_once_with(environment_files, None,
-                                               params, mock.ANY)
-        mock_validate.assert_called_once_with()
+        if not error:
+            result = self.man.create_stack(self.ctx, stack_name,
+                                           template, params, None, {},
+                                           environment_files=environment_files,
+                                           files_container=files_container)
+            self.assertEqual(stk.identifier(), result)
+            self.assertIsInstance(result, dict)
+            self.assertTrue(result['stack_id'])
+            mock_tmpl.assert_called_once_with(template, files=files)
+            mock_env.assert_called_once_with(params)
+            mock_stack.assert_called_once_with(
+                self.ctx, stack_name, stk.t, owner_id=None, nested_depth=0,
+                user_creds_id=None, stack_user_project_id=None,
+                convergence=cfg.CONF.convergence_engine, parent_resource=None)
+            if environment_files:
+                mock_merge.assert_called_once_with(environment_files, files,
+                                                   params, mock.ANY)
+            mock_validate.assert_called_once_with()
+        else:
+            ex = self.assertRaises(dispatcher.ExpectedException,
+                                   self.man.create_stack,
+                                   self.ctx, stack_name,
+                                   template, params, None, {},
+                                   environment_files=environment_files,
+                                   files_container=files_container)
+            self.assertEqual(exception.NotFound, ex.exc_info[0])
+            self.assertIn('Could not fetch files from container '
+                          'test_container, reason: error.',
+                          str(ex.exc_info[1]))
 
     def test_stack_create(self):
         stack_name = 'service_create_test_stack'
@@ -85,19 +106,54 @@ class StackCreateTest(common.HeatTestCase):
         self._test_stack_create(stack_name,
                                 environment_files=environment_files)
 
+    def test_stack_create_with_files_container(self):
+        stack_name = 'env_files_test_stack'
+        environment_files = ['env_1', 'env_2']
+        files_container = 'test_container'
+        fake_get_object = (None, "{'resource_registry': {}}")
+        fake_get_container = ({'x-container-bytes-used': 100},
+                              [{'name': '/env/test.yaml'}])
+        mock_client = mock.Mock()
+        mock_client.get_object.return_value = fake_get_object
+        mock_client.get_container.return_value = fake_get_container
+        self.patchobject(swift.SwiftClientPlugin, '_create',
+                         return_value=mock_client)
+        self._test_stack_create(stack_name,
+                                environment_files=environment_files,
+                                files_container=files_container)
+        mock_client.get_container.assert_called_with(files_container)
+        mock_client.get_object.assert_called_with(files_container,
+                                                  '/env/test.yaml')
+
+    def test_stack_create_with_container_notfound_swift(self):
+        stack_name = 'env_files_test_stack'
+        environment_files = ['env_1', 'env_2']
+        files_container = 'test_container'
+        mock_client = mock.Mock()
+        mock_client.get_container.side_effect = exceptions.ClientException(
+            'error')
+        self.patchobject(swift.SwiftClientPlugin, '_create',
+                         return_value=mock_client)
+        self._test_stack_create(stack_name,
+                                environment_files=environment_files,
+                                files_container=files_container,
+                                error=True)
+        mock_client.get_container.assert_called_with(files_container)
+        mock_client.get_object.assert_not_called()
+
     def test_stack_create_equals_max_per_tenant(self):
-        cfg.CONF.set_override('max_stacks_per_tenant', 1, enforce_type=True)
+        cfg.CONF.set_override('max_stacks_per_tenant', 1)
         stack_name = 'service_create_test_stack_equals_max'
         self._test_stack_create(stack_name)
 
     def test_stack_create_exceeds_max_per_tenant(self):
-        cfg.CONF.set_override('max_stacks_per_tenant', 0, enforce_type=True)
+        cfg.CONF.set_override('max_stacks_per_tenant', 0)
         stack_name = 'service_create_test_stack_exceeds_max'
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self._test_stack_create, stack_name)
         self.assertEqual(exception.RequestLimitExceeded, ex.exc_info[0])
         self.assertIn("You have reached the maximum stacks per tenant",
-                      six.text_type(ex.exc_info[1]))
+                      str(ex.exc_info[1]))
 
     @mock.patch.object(stack.Stack, 'validate')
     def test_stack_create_verify_err(self, mock_validate):
@@ -182,7 +238,7 @@ class StackCreateTest(common.HeatTestCase):
                                template, params, None, {}, None)
         self.assertEqual(exception.MissingCredentialError, ex.exc_info[0])
         self.assertEqual('Missing required credential: X-Auth-Key',
-                         six.text_type(ex.exc_info[1]))
+                         str(ex.exc_info[1]))
 
         mock_tmpl.assert_called_once_with(template, files=None)
         mock_env.assert_called_once_with(params)
@@ -203,7 +259,7 @@ class StackCreateTest(common.HeatTestCase):
                                template, params, None, {})
         self.assertEqual(exception.MissingCredentialError, ex.exc_info[0])
         self.assertEqual('Missing required credential: X-Auth-User',
-                         six.text_type(ex.exc_info[1]))
+                         str(ex.exc_info[1]))
 
         mock_tmpl.assert_called_once_with(template, files=None)
         mock_env.assert_called_once_with(params)
@@ -234,7 +290,7 @@ class StackCreateTest(common.HeatTestCase):
                                     return_value=stk.env)
         mock_stack = self.patchobject(stack, 'Stack', return_value=stk)
 
-        cfg.CONF.set_override('max_resources_per_stack', 3, enforce_type=True)
+        cfg.CONF.set_override('max_resources_per_stack', 3)
 
         result = self.man.create_stack(self.ctx, stack_name, template, params,
                                        None, {})
@@ -249,7 +305,6 @@ class StackCreateTest(common.HeatTestCase):
         self.assertEqual(stk.identifier(), result)
         root_stack_id = stk.root_stack_id()
         self.assertEqual(3, stk.total_resources(root_stack_id))
-        self.man.thread_group_mgr.groups[stk.id].wait()
         stk.delete()
 
     def test_stack_create_total_resources_exceeds_max(self):
@@ -264,29 +319,33 @@ class StackCreateTest(common.HeatTestCase):
             }
         }
 
-        cfg.CONF.set_override('max_resources_per_stack', 2, enforce_type=True)
+        cfg.CONF.set_override('max_resources_per_stack', 2)
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.man.create_stack, self.ctx, stack_name,
                                tpl, params, None, {})
         self.assertEqual(exception.RequestLimitExceeded, ex.exc_info[0])
         self.assertIn(exception.StackResourceLimitExceeded.msg_fmt,
-                      six.text_type(ex.exc_info[1]))
+                      str(ex.exc_info[1]))
 
     @mock.patch.object(threadgroup, 'ThreadGroup')
     @mock.patch.object(stack.Stack, 'validate')
     def test_stack_create_nested(self, mock_validate, mock_tg):
         convergence_engine = cfg.CONF.convergence_engine
         stack_name = 'service_create_nested_test_stack'
+        parent_stack = tools.get_stack(stack_name + '_parent', self.ctx)
+        owner_id = parent_stack.store()
         mock_tg.return_value = tools.DummyThreadGroup()
 
-        stk = tools.get_stack(stack_name, self.ctx, with_params=True)
+        stk = tools.get_stack(stack_name, self.ctx, with_params=True,
+                              owner_id=owner_id, nested_depth=1)
         tmpl_id = stk.t.store(self.ctx)
 
         mock_load = self.patchobject(templatem.Template, 'load',
                                      return_value=stk.t)
         mock_stack = self.patchobject(stack, 'Stack', return_value=stk)
         result = self.man.create_stack(self.ctx, stack_name, None,
-                                       None, None, {}, nested_depth=1,
+                                       None, None, {},
+                                       owner_id=owner_id, nested_depth=1,
                                        template_id=tmpl_id)
         self.assertEqual(stk.identifier(), result)
         self.assertIsInstance(result, dict)
@@ -294,7 +353,7 @@ class StackCreateTest(common.HeatTestCase):
 
         mock_load.assert_called_once_with(self.ctx, tmpl_id)
         mock_stack.assert_called_once_with(self.ctx, stack_name, stk.t,
-                                           owner_id=None, nested_depth=1,
+                                           owner_id=owner_id, nested_depth=1,
                                            user_creds_id=None,
                                            stack_user_project_id=None,
                                            convergence=convergence_engine,
@@ -307,7 +366,7 @@ class StackCreateTest(common.HeatTestCase):
         stk = tools.get_stack(stack_name, self.ctx)
 
         fc = fakes_nova.FakeClient()
-        self.patchobject(nova.NovaClientPlugin, '_create', return_value=fc)
+        self.patchobject(nova.NovaClientPlugin, 'client', return_value=fc)
         self.patchobject(glance.GlanceClientPlugin, 'find_image_by_name_or_id',
                          return_value=744)
 
@@ -361,7 +420,7 @@ class StackCreateTest(common.HeatTestCase):
                                self.man._validate_deferred_auth_context,
                                ctx, stk)
         self.assertEqual('Missing required credential: X-Auth-User',
-                         six.text_type(ex))
+                         str(ex))
 
         # missing password
         ctx = utils.dummy_context(password=None)
@@ -369,13 +428,13 @@ class StackCreateTest(common.HeatTestCase):
                                self.man._validate_deferred_auth_context,
                                ctx, stk)
         self.assertEqual('Missing required credential: X-Auth-Key',
-                         six.text_type(ex))
+                         str(ex))
 
     @mock.patch.object(instances.Instance, 'validate')
     @mock.patch.object(stack.Stack, 'total_resources')
     def test_stack_create_max_unlimited(self, total_res_mock, validate_mock):
         total_res_mock.return_value = 9999
         validate_mock.return_value = None
-        cfg.CONF.set_override('max_resources_per_stack', -1, enforce_type=True)
+        cfg.CONF.set_override('max_resources_per_stack', -1)
         stack_name = 'service_create_test_max_unlimited'
         self._test_stack_create(stack_name)

@@ -17,13 +17,15 @@ import hashlib
 import logging
 import random
 import time
+from urllib import parse
 
-import six
-from six.moves.urllib import parse
+from oslo_config import cfg
 from swiftclient import client as sc
 from swiftclient import exceptions
 from swiftclient import utils as swiftclient_utils
 
+from heat.common import exception
+from heat.common.i18n import _
 from heat.engine.clients import client_plugin
 
 IN_PROGRESS = 'in progress'
@@ -45,23 +47,13 @@ class SwiftClientPlugin(client_plugin.ClientPlugin):
     service_types = [OBJECT_STORE] = ['object-store']
 
     def _create(self):
-
-        con = self.context
         endpoint_type = self._get_client_option(CLIENT_NAME, 'endpoint_type')
-        args = {
-            'auth_version': '2.0',
-            'tenant_name': con.project_name,
-            'user': con.username,
-            'key': None,
-            'authurl': None,
-            'preauthtoken': con.keystone_session.get_token(),
-            'preauthurl': self.url_for(service_type=self.OBJECT_STORE,
-                                       endpoint_type=endpoint_type),
-            'os_options': {'endpoint_type': endpoint_type},
-            'cacert': self._get_client_option(CLIENT_NAME, 'ca_file'),
-            'insecure': self._get_client_option(CLIENT_NAME, 'insecure')
-        }
-        return sc.Connection(**args)
+        os_options = {'endpoint_type': endpoint_type,
+                      'service_type': self.OBJECT_STORE,
+                      'region_name': self._get_region_name()}
+        return sc.Connection(auth_version=3,
+                             session=self.context.keystone_session,
+                             os_options=os_options)
 
     def is_client_exception(self, ex):
         return isinstance(ex, exceptions.ClientException)
@@ -94,7 +86,7 @@ class SwiftClientPlugin(client_plugin.ClientPlugin):
         return bool(len(parts) == 5 and
                     not parts[0] and
                     parts[1] == 'v1' and
-                    parts[2].endswith(self.context.tenant_id) and
+                    parts[2].endswith(self.context.project_id) and
                     parts[3] and
                     parts[4].strip('/'))
 
@@ -105,15 +97,15 @@ class SwiftClientPlugin(client_plugin.ClientPlugin):
         if key_header not in self.client().head_account():
             self.client().post_account({
                 key_header: hashlib.sha224(
-                    six.b(six.text_type(
-                        random.getrandbits(256)))).hexdigest()[:32]})
+                    str(random.getrandbits(256)).encode(
+                        "latin-1")).hexdigest()[:32]})
 
         key = self.client().head_account()[key_header]
 
-        path = '/v1/AUTH_%s/%s/%s' % (self.context.tenant_id, container_name,
+        path = '/v1/AUTH_%s/%s/%s' % (self.context.project_id, container_name,
                                       obj_name)
         if timeout is None:
-            timeout = MAX_EPOCH - 60 - time.time()
+            timeout = int(MAX_EPOCH - 60 - time.time())
         tempurl = swiftclient_utils.generate_temp_url(path, timeout, key,
                                                       method)
         sw_url = parse.urlparse(self.client().url)
@@ -147,3 +139,41 @@ class SwiftClientPlugin(client_plugin.ClientPlugin):
         # according to RFC 2616, all HTTP time headers must be
         # in GMT time, so create an offset-naive UTC datetime
         return datetime.datetime(*pd)
+
+    def get_files_from_container(self, files_container, files_to_skip=None):
+        """Gets the file contents from a container.
+
+         Get the file contents from the container in a files map. A list
+         of files to skip can also be specified and those would not be
+         downloaded from swift.
+         """
+        client = self.client()
+        files = {}
+
+        if files_to_skip is None:
+            files_to_skip = []
+
+        try:
+            headers, objects = client.get_container(files_container)
+            bytes_used = int(headers.get('x-container-bytes-used', 0))
+            if bytes_used > cfg.CONF.max_json_body_size:
+                msg = _("Total size of files to download (%(size)s bytes) "
+                        "exceeds maximum allowed (%(limit)s bytes).") % {
+                            'size': bytes_used,
+                            'limit': cfg.CONF.max_json_body_size}
+                raise exception.DownloadLimitExceeded(message=msg)
+            for obj in objects:
+                file_name = obj['name']
+                if file_name not in files_to_skip:
+                    contents = client.get_object(files_container, file_name)[1]
+                    if isinstance(contents, bytes):
+                        files[file_name] = contents.decode(encoding='utf-8')
+                    else:
+                        files[file_name] = contents
+        except exceptions.ClientException as cex:
+            raise exception.NotFound(_('Could not fetch files from '
+                                       'container %(container)s, '
+                                       'reason: %(reason)s.') %
+                                     {'container': files_container,
+                                      'reason': str(cex)})
+        return files

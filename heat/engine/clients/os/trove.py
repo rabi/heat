@@ -11,8 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
 from troveclient import client as tc
-from troveclient.openstack.common.apiclient import exceptions
+from troveclient import exceptions
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -35,7 +36,9 @@ class TroveClientPlugin(client_plugin.ClientPlugin):
         args = {
             'endpoint_type': endpoint_type,
             'service_type': self.DATABASE,
-            'session': con.keystone_session
+            'session': con.keystone_session,
+            'retries': cfg.CONF.client_retry_limit,
+            'region_name': self._get_region_name()
         }
 
         client = tc.Client('1.0', **args)

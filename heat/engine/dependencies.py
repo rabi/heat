@@ -14,21 +14,13 @@
 import collections
 import itertools
 
-import six
-
 from heat.common import exception
-from heat.common.i18n import _
-from heat.common.i18n import repr_wrapper
 
 
-class CircularDependencyException(exception.HeatException):
-    msg_fmt = _("Circular Dependency Found: %(cycle)s")
-
-
-@repr_wrapper
-@six.python_2_unicode_compatible
 class Node(object):
     """A node in a dependency graph."""
+
+    __slots__ = ('require', 'satisfy')
 
     def __init__(self, requires=None, required_by=None):
         """Initialisation of the node.
@@ -54,7 +46,9 @@ class Node(object):
         return iter(self.satisfy)
 
     def requires(self, target=None):
-        """Add a key that this node requires, and optionally add a new one."""
+        """List the keys that this node requires, and optionally add a new one.
+
+        """
         if target is not None:
             self.require.add(target)
         return iter(self.require)
@@ -90,15 +84,14 @@ class Node(object):
 
     def __str__(self):
         """Return a human-readable string representation of the node."""
-        text = '{%s}' % ', '.join(six.text_type(n) for n in self)
-        return six.text_type(text)
+        text = '{%s}' % ', '.join(str(n) for n in self)
+        return str(text)
 
     def __repr__(self):
         """Return a string representation of the node."""
         return repr(self.require)
 
 
-@six.python_2_unicode_compatible
 class Graph(collections.defaultdict):
     """A mutable mapping of objects to nodes in a dependency graph."""
 
@@ -130,7 +123,7 @@ class Graph(collections.defaultdict):
                 for rqd in node:
                     yield (rqr, rqd)
         return itertools.chain.from_iterable(outgoing_edges(*i)
-                                             for i in six.iteritems(self))
+                                             for i in self.items())
 
     def __delitem__(self, key):
         """Delete the node given by the specified key from the graph."""
@@ -145,10 +138,10 @@ class Graph(collections.defaultdict):
 
     def __str__(self):
         """Convert the graph to a human-readable string."""
-        pairs = ('%s: %s' % (six.text_type(k), six.text_type(v))
-                 for k, v in six.iteritems(self))
+        pairs = ('%s: %s' % (str(k), str(v))
+                 for k, v in self.items())
         text = '{%s}' % ', '.join(pairs)
-        return six.text_type(text)
+        return str(text)
 
     @staticmethod
     def toposort(graph):
@@ -156,8 +149,8 @@ class Graph(collections.defaultdict):
 
         This is a destructive operation for the graph.
         """
-        for iteration in six.moves.xrange(len(graph)):
-            for key, node in six.iteritems(graph):
+        for iteration in range(len(graph)):
+            for key, node in graph.items():
                 if not node:
                     yield key
                     del graph[key]
@@ -165,11 +158,9 @@ class Graph(collections.defaultdict):
             else:
                 # There are nodes remaining, but none without
                 # dependencies: a cycle
-                raise CircularDependencyException(cycle=six.text_type(graph))
+                raise exception.CircularDependencyException(cycle=str(graph))
 
 
-@repr_wrapper
-@six.python_2_unicode_compatible
 class Dependencies(object):
     """Helper class for calculating a dependency graph."""
 
@@ -203,12 +194,12 @@ class Dependencies(object):
 
         return self._graph[last].required_by()
 
-    def requires(self, target):
-        """List the keys that require the specified node."""
-        if target not in self._graph:
+    def requires(self, source):
+        """List the keys that the specified node requires."""
+        if source not in self._graph:
             raise KeyError
 
-        return self._graph[target].requires()
+        return self._graph[source].requires()
 
     def __getitem__(self, last):
         """Return a partial dependency graph starting with the specified node.
@@ -226,8 +217,8 @@ class Dependencies(object):
                 return itertools.chain([(rqr, key)], get_edges(rqr))
 
             # Get the edge list for each node that requires the current node
-            edge_lists = six.moves.map(requirer_edges,
-                                       self._graph[key].required_by())
+            edge_lists = map(requirer_edges,
+                             self._graph[key].required_by())
             # Combine the lists into one long list
             return itertools.chain.from_iterable(edge_lists)
 
@@ -262,12 +253,11 @@ class Dependencies(object):
 
     def __str__(self):
         """Return a human-readable string repr of the dependency graph."""
-        return six.text_type(self._graph)
+        return str(self._graph)
 
     def __repr__(self):
         """Return a consistent string representation of the object."""
-        edge_reprs = list(repr(e) for e in self._graph.edges())
-        edge_reprs.sort()
+        edge_reprs = sorted(repr(e) for e in self._graph.edges())
         text = 'Dependencies([%s])' % ', '.join(edge_reprs)
         return text
 

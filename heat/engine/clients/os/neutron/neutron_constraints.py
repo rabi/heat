@@ -17,28 +17,9 @@ from neutronclient.common import exceptions as qe
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.engine.clients.os import nova
 from heat.engine import constraints
 
 CLIENT_NAME = 'neutron'
-
-
-class NetworkConstraint(constraints.BaseCustomConstraint):
-
-    expected_exceptions = (qe.NeutronClientException,
-                           exception.EntityNotFound,
-                           exception.PhysicalResourceNameAmbiguity)
-
-    def validate_with_client(self, client, value):
-        try:
-            client.client(CLIENT_NAME)
-        except Exception:
-            # is not using neutron
-            client.client_plugin(nova.CLIENT_NAME).get_nova_network_id(value)
-        else:
-            neutron_plugin = client.client_plugin(CLIENT_NAME)
-            neutron_plugin.find_resourceid_by_name_or_id(
-                'network', value, cmd_resource=None)
 
 
 class NeutronConstraint(constraints.BaseCustomConstraint):
@@ -46,7 +27,6 @@ class NeutronConstraint(constraints.BaseCustomConstraint):
     expected_exceptions = (qe.NeutronClientException,
                            exception.EntityNotFound)
     resource_name = None
-    cmd_resource = None
     extension = None
 
     def validate_with_client(self, client, value):
@@ -56,7 +36,22 @@ class NeutronConstraint(constraints.BaseCustomConstraint):
             raise exception.EntityNotFound(entity='neutron extension',
                                            name=self.extension)
         neutron_plugin.find_resourceid_by_name_or_id(
-            self.resource_name, value, cmd_resource=self.cmd_resource)
+            self.resource_name, value)
+
+
+class NeutronExtConstraint(NeutronConstraint):
+
+    def validate_with_client(self, client, value):
+        neutron_plugin = client.client_plugin(CLIENT_NAME)
+        if (self.extension and
+                not neutron_plugin.has_extension(self.extension)):
+            raise exception.EntityNotFound(entity='neutron extension',
+                                           name=self.extension)
+        neutron_plugin.resolve_ext_resource(self.resource_name, value)
+
+
+class NetworkConstraint(NeutronConstraint):
+    resource_name = 'network'
 
 
 class PortConstraint(NeutronConstraint):
@@ -86,8 +81,22 @@ class AddressScopeConstraint(NeutronConstraint):
 
 class QoSPolicyConstraint(NeutronConstraint):
     resource_name = 'policy'
-    cmd_resource = 'qos_policy'
     extension = 'qos'
+
+
+class PortPairConstraint(NeutronExtConstraint):
+    resource_name = 'port_pair'
+    extension = 'sfc'
+
+
+class PortPairGroupConstraint(NeutronExtConstraint):
+    resource_name = 'port_pair_group'
+    extension = 'sfc'
+
+
+class FlowClassifierConstraint(NeutronExtConstraint):
+    resource_name = 'flow_classifier'
+    extension = 'sfc'
 
 
 class ProviderConstraint(constraints.BaseCustomConstraint):
@@ -112,7 +121,3 @@ class ProviderConstraint(constraints.BaseCustomConstraint):
                 {'provider': value, 'providers': names}
             )
             raise exception.StackValidationFailed(message=not_found_message)
-
-
-class LBaasV1ProviderConstraint(ProviderConstraint):
-    service_type = 'LOADBALANCER'

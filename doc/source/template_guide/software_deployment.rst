@@ -39,23 +39,26 @@ you might want to do this, including:
 
 A number of tools are available for building custom images, including:
 
-* diskimage-builder_ image building tools for OpenStack
+* :diskimage-builder-doc:`diskimage-builder <>` image building tools for OpenStack
 
 * imagefactory_ builds images for a variety of operating system/cloud
   combinations
 
-Examples in this guide which require custom images will use diskimage-builder_.
+Examples in this guide that require custom images will use
+:diskimage-builder-doc:`diskimage-builder <>`.
 
 User-data boot scripts and cloud-init
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 When booting a server it is possible to specify the contents of the user-data
 to be passed to that server. This user-data is made available either from
-configured config-drive or from the `Metadata service`_.
+configured config-drive or from the :nova-doc:`Metadata service
+<user/metadata.html#metadata-service>`
 
 How this user-data is consumed depends on the image being booted, but the most
-commonly used tool for default cloud images is Cloud-init_.
+commonly used tool for default cloud images is cloud-init_.
 
-Whether the image is using Cloud-init_ or not, it should be possible to
+Whether the image is using cloud-init_ or not, it should be possible to
 specify a shell script in the ``user_data`` property and have it be executed by
 the server during boot:
 
@@ -141,7 +144,7 @@ cloud-init boot configuration data. While ``HEAT_CFNTOOLS`` is the default
 for ``user_data_format``, it is considered legacy and ``RAW`` or
 ``SOFTWARE_CONFIG`` will generally be more appropriate.
 
-For ``RAW`` the user_data is passed to Nova unmodified. For a Cloud-init_
+For ``RAW`` the user_data is passed to Nova unmodified. For a cloud-init_
 enabled image, the following are both valid ``RAW`` user-data:
 
 .. code-block:: yaml
@@ -357,7 +360,7 @@ represented by text scripts, for example:
           user_data_format: SOFTWARE_CONFIG
           user_data: {get_resource: boot_script}
 
-The resource :ref:`OS::Heat::CloudConfig` allows Cloud-init_ cloud-config to
+The resource :ref:`OS::Heat::CloudConfig` allows cloud-init_ cloud-config to
 be represented as template YAML rather than a block string. This allows
 intrinsic functions to be included when building the cloud-config. This also
 ensures that the cloud-config is valid YAML, although no further checks for
@@ -388,7 +391,7 @@ valid cloud-config are done.
 
 The resource :ref:`OS::Heat::MultipartMime` allows multiple
 :ref:`OS::Heat::SoftwareConfig` and :ref:`OS::Heat::CloudConfig`
-resources to be combined into a single Cloud-init_ multi-part message:
+resources to be combined into a single cloud-init_ multi-part message:
 
 .. code-block:: yaml
 
@@ -474,12 +477,14 @@ required in later examples:
 
     # Clone the required repositories. Some of these are also available
     # via pypi or as distro packages.
-    git clone https://git.openstack.org/openstack/diskimage-builder.git
-    git clone https://git.openstack.org/openstack/tripleo-image-elements.git
-    git clone https://git.openstack.org/openstack/heat-templates.git
+    git clone https://opendev.org/openstack/tripleo-image-elements
+    git clone https://opendev.org/openstack/heat-agents
+
+    # Install diskimage-builder from source
+    sudo pip install git+https://opendev.org/openstack/diskimage-builder
 
     # Required by diskimage-builder to discover element collections
-    export ELEMENTS_PATH=tripleo-image-elements/elements:heat-templates/hot/software-config/elements
+    export ELEMENTS_PATH=tripleo-image-elements/elements:heat-agents/
 
     # The base operating system element(s) provided by the diskimage-builder
     # elements collection. Other values which may work include:
@@ -506,12 +511,16 @@ required in later examples:
     export IMAGE_NAME=fedora-software-config
 
     # Create the image
-    diskimage-builder/bin/disk-image-create vm $BASE_ELEMENTS $AGENT_ELEMENTS \
+    disk-image-create vm $BASE_ELEMENTS $AGENT_ELEMENTS \
          $DEPLOYMENT_BASE_ELEMENTS $DEPLOYMENT_TOOL -o $IMAGE_NAME.qcow2
 
     # Upload the image, assuming valid credentials are already sourced
-    glance image-create --disk-format qcow2 --container-format bare \
-        --name $IMAGE_NAME < $IMAGE_NAME.qcow2
+    openstack image create --disk-format qcow2 --container-format bare \
+        $IMAGE_NAME < $IMAGE_NAME.qcow2
+
+.. note:: Above script uses diskimage-builder, make sure the environment
+          already fulfill all requirements in requirements.txt of
+          diskimage-builder.
 
 
 Configuring with scripts
@@ -773,16 +782,13 @@ contents of the file ``example-puppet-manifest.pp``, containing:
     }
 
 
-
 .. _`AWS::CloudFormation::Init`: http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-init.html
-.. _diskimage-builder: https://git.openstack.org/cgit/openstack/diskimage-builder
-.. _imagefactory: http://imgfac.org/
-.. _`Metadata service`: http://docs.openstack.org/admin-guide/compute-networking-nova.html#metadata-service
-.. _Cloud-init: http://cloudinit.readthedocs.org/en/latest/
-.. _curl: http://curl.haxx.se/
-.. _`Orchestration API`: http://developer.openstack.org/api-ref/orchestration/v1/
-.. _os-refresh-config: https://git.openstack.org/cgit/openstack/os-refresh-config
-.. _os-apply-config: https://git.openstack.org/cgit/openstack/os-apply-config
-.. _tripleo-heat-templates: https://git.openstack.org/cgit/openstack/tripleo-heat-templates
-.. _tripleo-image-elements: https://git.openstack.org/cgit/openstack/tripleo-image-elements
-.. _puppet: http://puppetlabs.com/
+.. _imagefactory: https://imgfac.org/
+.. _cloud-init: https://cloudinit.readthedocs.io/
+.. _curl: https://curl.haxx.se/
+.. _`Orchestration API`: https://docs.openstack.org/api-ref/orchestration/v1/
+.. _os-refresh-config: https://opendev.org/openstack/os-refresh-config
+.. _os-apply-config: https://opendev.org/openstack/os-apply-config
+.. _tripleo-heat-templates: https://opendev.org/openstack/tripleo-heat-templates
+.. _tripleo-image-elements: https://opendev.org/openstack/tripleo-image-elements
+.. _puppet: https://puppet.com/

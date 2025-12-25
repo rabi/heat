@@ -31,6 +31,8 @@ class SecurityGroup(neutron.NeutronResource):
 
     required_service_extension = 'security-group'
 
+    entity = 'security_group'
+
     support_status = support.SupportStatus(version='2014.1')
 
     PROPERTIES = (
@@ -154,10 +156,6 @@ class SecurityGroup(neutron.NeutronResource):
         {"direction": "egress", "ethertype": "IPv6"}
     ]
 
-    def _show_resource(self):
-        return self.client().show_security_group(
-            self.resource_id)['security_group']
-
     def validate(self):
         super(SecurityGroup, self).validate()
         if self.properties[self.NAME] == 'default':
@@ -182,7 +180,7 @@ class SecurityGroup(neutron.NeutronResource):
 
         if 'remote_mode' in rule:
             remote_mode = rule.get(self.RULE_REMOTE_MODE)
-            del(rule[self.RULE_REMOTE_MODE])
+            del rule[self.RULE_REMOTE_MODE]
 
             if remote_mode == self.RULE_REMOTE_GROUP_ID:
                 rule[self.RULE_REMOTE_IP_PREFIX] = None

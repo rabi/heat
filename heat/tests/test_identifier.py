@@ -57,7 +57,7 @@ class IdentifierTest(common.HeatTestCase):
 
     def test_arn_url(self):
         hi = identifier.HeatIdentifier('t', 's', 'i', 'p')
-        self.assertEqual('/arn%3Aopenstack%3Aheat%3A%3At%3Astacks%2Fs%2Fi%2Fp',
+        self.assertEqual('/arn%3Aopenstack%3Aheat%3A%3At%3Astacks/s/i/p',
                          hi.arn_url_path())
 
     def test_arn_id_int(self):
@@ -208,7 +208,7 @@ class IdentifierTest(common.HeatTestCase):
         self.assertEqual(arn, hi.arn())
 
     def test_arn_url_parse_round_trip(self):
-        arn = '/arn%3Aopenstack%3Aheat%3A%3At%3Astacks%2Fs%2Fi%2Fp'
+        arn = '/arn%3Aopenstack%3Aheat%3A%3At%3Astacks/s/i/p'
         url = 'http://1.2.3.4/foo' + arn
         hi = identifier.HeatIdentifier.from_arn_url(url)
         self.assertEqual(arn, hi.arn_url_path())
@@ -230,7 +230,7 @@ class IdentifierTest(common.HeatTestCase):
         self.assertEqual('t/stacks/s/i', hi.url_path())
 
     def test_url_path_with_unicode_path(self):
-        hi = identifier.HeatIdentifier('t', 's', 'i', u'\u5de5')
+        hi = identifier.HeatIdentifier('t', 's', 'i', '\u5de5')
         self.assertEqual('t/stacks/s/i/%E5%B7%A5', hi.url_path())
 
     def test_tenant_escape(self):
@@ -335,28 +335,28 @@ class IdentifierTest(common.HeatTestCase):
     def test_equal(self):
         hi1 = identifier.HeatIdentifier('t', 's', 'i', 'p')
         hi2 = identifier.HeatIdentifier('t', 's', 'i', 'p')
-        self.assertTrue(hi1 == hi2)
+        self.assertTrue(hi1 == hi2)  # noqa: H204
 
     def test_equal_dict(self):
         hi = identifier.HeatIdentifier('t', 's', 'i', 'p')
-        self.assertTrue(hi == dict(hi))
-        self.assertTrue(dict(hi) == hi)
+        self.assertTrue(hi == dict(hi))  # noqa: H204
+        self.assertTrue(dict(hi) == hi)  # noqa: H204
 
     def test_not_equal(self):
         hi1 = identifier.HeatIdentifier('t', 's', 'i', 'p')
         hi2 = identifier.HeatIdentifier('t', 's', 'i', 'q')
-        self.assertFalse(hi1 == hi2)
-        self.assertFalse(hi2 == hi1)
+        self.assertFalse(hi1 == hi2)  # noqa: H204
+        self.assertFalse(hi2 == hi1)  # noqa: H204
 
     def test_not_equal_dict(self):
         hi1 = identifier.HeatIdentifier('t', 's', 'i', 'p')
         hi2 = identifier.HeatIdentifier('t', 's', 'i', 'q')
-        self.assertFalse(hi1 == dict(hi2))
-        self.assertFalse(dict(hi1) == hi2)
-        self.assertFalse(hi1 == {'tenant': 't',
+        self.assertFalse(hi1 == dict(hi2))  # noqa: H204
+        self.assertFalse(dict(hi1) == hi2)  # noqa: H204
+        self.assertFalse(hi1 == {'tenant': 't',  # noqa: H204
                                  'stack_name': 's',
                                  'stack_id': 'i'})
-        self.assertFalse({'tenant': 't',
+        self.assertFalse({'tenant': 't',  # noqa: H204
                           'stack_name': 's',
                           'stack_id': 'i'} == hi1)
 

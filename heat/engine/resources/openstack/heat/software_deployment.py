@@ -12,17 +12,18 @@
 #    under the License.
 
 import copy
+import itertools
 import uuid
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
-from six import itertools
 
 from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import attributes
 from heat.engine import constraints
+from heat.engine import output
 from heat.engine import properties
 from heat.engine import resource
 from heat.engine.resources.openstack.heat import resource_group
@@ -49,7 +50,7 @@ class SoftwareDeployment(signal_responder.SignalResponder):
 
     Whenever this resource goes to an IN_PROGRESS state, it creates an
     ephemeral config that includes the inputs values plus a number of extra
-    inputs which have names prefixed with deploy_. The extra inputs relate
+    inputs which have names prefixed with ``deploy_``. The extra inputs relate
     to the current state of the stack, along with the information and
     credentials required to signal back the deployment results.
 
@@ -69,6 +70,10 @@ class SoftwareDeployment(signal_responder.SignalResponder):
     """
 
     support_status = support.SupportStatus(version='2014.1')
+
+    default_client_name = 'heat'
+
+    entity = 'software_deployments'
 
     PROPERTIES = (
         CONFIG, SERVER, INPUT_VALUES,
@@ -99,7 +104,7 @@ class SoftwareDeployment(signal_responder.SignalResponder):
         DEPLOY_USERNAME, DEPLOY_PASSWORD,
         DEPLOY_PROJECT_ID, DEPLOY_USER_ID,
         DEPLOY_SIGNAL_VERB, DEPLOY_SIGNAL_TRANSPORT,
-        DEPLOY_QUEUE_ID
+        DEPLOY_QUEUE_ID, DEPLOY_REGION_NAME
     ) = (
         'deploy_server_id', 'deploy_action',
         'deploy_signal_id', 'deploy_stack_id',
@@ -107,7 +112,7 @@ class SoftwareDeployment(signal_responder.SignalResponder):
         'deploy_username', 'deploy_password',
         'deploy_project_id', 'deploy_user_id',
         'deploy_signal_verb', 'deploy_signal_transport',
-        'deploy_queue_id'
+        'deploy_queue_id', 'deploy_region_name'
     )
 
     SIGNAL_TRANSPORTS = (
@@ -209,11 +214,9 @@ class SoftwareDeployment(signal_responder.SignalResponder):
         return props
 
     def _delete_derived_config(self, derived_config_id):
-        try:
+        with self.rpc_client().ignore_error_by_name('NotFound'):
             self.rpc_client().delete_software_config(
                 self.context, derived_config_id)
-        except Exception as ex:
-            self.rpc_client().ignore_error_named(ex, 'NotFound')
 
     def _create_derived_config(self, action, source_config):
 
@@ -384,7 +387,7 @@ class SoftwareDeployment(signal_responder.SignalResponder):
                                   'values'))
                 yield swc_io.InputConfig(
                     name=self.DEPLOY_SIGNAL_VERB, value='POST',
-                    description=_('HTTP verb to use for signaling output'
+                    description=_('HTTP verb to use for signaling output '
                                   'values'))
 
             elif self._signal_transport_temp_url():
@@ -395,7 +398,7 @@ class SoftwareDeployment(signal_responder.SignalResponder):
                                   'values'))
                 yield swc_io.InputConfig(
                     name=self.DEPLOY_SIGNAL_VERB, value='PUT',
-                    description=_('HTTP verb to use for signaling output'
+                    description=_('HTTP verb to use for signaling output '
                                   'values'))
 
             elif (self._signal_transport_heat() or
@@ -416,7 +419,11 @@ class SoftwareDeployment(signal_responder.SignalResponder):
                 yield swc_io.InputConfig(
                     name=self.DEPLOY_PROJECT_ID, value=creds['project_id'],
                     description=_('ID of project for API authentication'))
-
+                if creds['region_name']:
+                    yield swc_io.InputConfig(
+                        name=self.DEPLOY_REGION_NAME,
+                        value=creds['region_name'],
+                        description=_('Region name for API authentication'))
             if self._signal_transport_zaqar():
                 yield swc_io.InputConfig(
                     name=self.DEPLOY_QUEUE_ID,
@@ -435,10 +442,14 @@ class SoftwareDeployment(signal_responder.SignalResponder):
         return self._check_complete()
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        prev_derived_config = self._get_derived_config_id()
-        old_config = self._load_config(prev_derived_config)
-        old_inputs = {i.name(): i
-                      for i in old_config[rpc_api.SOFTWARE_CONFIG_INPUTS]}
+        if self.resource_id is None:
+            prev_derived_config = None
+            old_inputs = {}
+        else:
+            prev_derived_config = self._get_derived_config_id()
+            old_config = self._load_config(prev_derived_config)
+            old_inputs = {i.name(): i
+                          for i in old_config[rpc_api.SOFTWARE_CONFIG_INPUTS]}
 
         self.properties = json_snippet.properties(self.properties_schema,
                                                   self.context)
@@ -462,10 +473,8 @@ class SoftwareDeployment(signal_responder.SignalResponder):
         return self._check_complete()
 
     def handle_delete(self):
-        try:
+        with self.rpc_client().ignore_error_by_name('NotFound'):
             return self._handle_action(self.DELETE)
-        except Exception as ex:
-            self.rpc_client().ignore_error_named(ex, 'NotFound')
 
     def check_delete_complete(self, sd=None):
         if not sd or not self._server_exists(sd) or self._check_complete():
@@ -473,20 +482,18 @@ class SoftwareDeployment(signal_responder.SignalResponder):
             return True
 
     def _delete_resource(self):
-        self._delete_signals()
-        self._delete_user()
-
         derived_config_id = None
         if self.resource_id is not None:
-            try:
+            with self.rpc_client().ignore_error_by_name('NotFound'):
                 derived_config_id = self._get_derived_config_id()
                 self.rpc_client().delete_software_deployment(
                     self.context, self.resource_id)
-            except Exception as ex:
-                self.rpc_client().ignore_error_named(ex, 'NotFound')
 
         if derived_config_id:
             self._delete_derived_config(derived_config_id)
+
+        self._delete_signals()
+        self._delete_user()
 
     def handle_suspend(self):
         return self._handle_action(self.SUSPEND)
@@ -509,14 +516,47 @@ class SoftwareDeployment(signal_responder.SignalResponder):
             self.context, self.resource_id, details,
             timeutils.utcnow().isoformat())
 
-    def get_attribute(self, key, *path):
-        """Resource attributes map to deployment outputs values."""
+    def _handle_cancel(self):
+        if self.resource_id is None:
+            return
+
         sd = self.rpc_client().show_software_deployment(
             self.context, self.resource_id)
-        ov = sd[rpc_api.SOFTWARE_DEPLOYMENT_OUTPUT_VALUES] or {}
-        if key in ov:
-            attribute = ov.get(key)
-            return attributes.select_from_attribute(attribute, path)
+
+        if sd is None:
+            return
+
+        status = sd[rpc_api.SOFTWARE_DEPLOYMENT_STATUS]
+        if status == SoftwareDeployment.IN_PROGRESS:
+            self.rpc_client().update_software_deployment(
+                self.context, self.resource_id,
+                status=SoftwareDeployment.FAILED,
+                status_reason=_('Deployment cancelled.'))
+
+    def handle_create_cancel(self, cookie):
+        self._handle_cancel()
+
+    def handle_update_cancel(self, cookie):
+        self._handle_cancel()
+
+    def handle_delete_cancel(self, cookie):
+        self._handle_cancel()
+
+    def handle_suspend_cancel(self, cookie):
+        self._handle_cancel()
+
+    def handle_resume_cancel(self, cookie):
+        self._handle_cancel()
+
+    def get_attribute(self, key, *path):
+        """Resource attributes map to deployment outputs values."""
+        if self.resource_id is not None:
+            sd = self.rpc_client().show_software_deployment(
+                self.context, self.resource_id)
+            ov = sd[rpc_api.SOFTWARE_DEPLOYMENT_OUTPUT_VALUES] or {}
+            if key in ov:
+                attribute = ov.get(key)
+                return attributes.select_from_attribute(attribute, path)
 
         # Since there is no value for this key yet, check the output schemas
         # to find out if the key is valid
@@ -539,8 +579,9 @@ class SoftwareDeployment(signal_responder.SignalResponder):
         if server:
             res = self.stack.resource_by_refid(server)
             if res:
-                if not (res.properties.get('user_data_format') ==
-                        'SOFTWARE_CONFIG'):
+                user_data_format = res.properties.get('user_data_format')
+                if user_data_format and \
+                   not (user_data_format == 'SOFTWARE_CONFIG'):
                     raise exception.StackValidationFailed(message=_(
                         "Resource %s's property user_data_format should be "
                         "set to SOFTWARE_CONFIG since there are software "
@@ -642,10 +683,24 @@ class SoftwareDeploymentGroup(resource_group.ResourceGroup):
             default=0),
     }
 
+    update_policy_schema = {
+        resource_group.ResourceGroup.ROLLING_UPDATE: properties.Schema(
+            properties.Schema.MAP,
+            schema=rolling_update_schema,
+            support_status=support.SupportStatus(version='7.0.0')
+        ),
+        resource_group.ResourceGroup.BATCH_CREATE: properties.Schema(
+            properties.Schema.MAP,
+            schema=resource_group.ResourceGroup.batch_create_schema,
+            support_status=support.SupportStatus(version='7.0.0')
+        )
+    }
+
     def get_size(self):
         return len(self.properties[self.SERVERS])
 
-    def _resource_names(self, size=None):
+    def _resource_names(self, size=None,
+                        update_rsrc_data=True):
         candidates = self.properties[self.SERVERS]
         if size is None:
             return iter(candidates)
@@ -654,7 +709,10 @@ class SoftwareDeploymentGroup(resource_group.ResourceGroup):
     def res_def_changed(self, prop_diff):
         return True
 
-    def _name_blacklist(self):
+    def _update_name_skiplist(self, properties):
+        pass
+
+    def _name_skiplist(self):
         return set()
 
     def get_resource_def(self, include_all=False):
@@ -668,8 +726,7 @@ class SoftwareDeploymentGroup(resource_group.ResourceGroup):
                                             'OS::Heat::SoftwareDeployment',
                                             props, None)
 
-    def get_attribute(self, key, *path):
-        rg = super(SoftwareDeploymentGroup, self)
+    def _member_attribute_name(self, key):
         if key == self.STDOUTS:
             n_attr = SoftwareDeployment.STDOUT
         elif key == self.STDERRS:
@@ -680,9 +737,24 @@ class SoftwareDeploymentGroup(resource_group.ResourceGroup):
             # Allow any attribute valid for a single SoftwareDeployment
             # including arbitrary outputs, so we can't validate here
             n_attr = key
+        return n_attr
+
+    def get_attribute(self, key, *path):
+        rg = super(SoftwareDeploymentGroup, self)
+        n_attr = self._member_attribute_name(key)
 
         rg_attr = rg.get_attribute(rg.ATTR_ATTRIBUTES, n_attr)
         return attributes.select_from_attribute(rg_attr, path)
+
+    def _nested_output_defns(self, resource_names, get_attr_fn, get_res_fn):
+        for attr in self.referenced_attrs():
+            key = attr if isinstance(attr, str) else attr[0]
+            n_attr = self._member_attribute_name(key)
+            output_name = self._attribute_output_name(self.ATTR_ATTRIBUTES,
+                                                      n_attr)
+            value = {r: get_attr_fn([r, n_attr])
+                     for r in resource_names}
+            yield output.OutputDefinition(output_name, value)
 
     def _try_rolling_update(self):
         if self.update_policy[self.ROLLING_UPDATE]:

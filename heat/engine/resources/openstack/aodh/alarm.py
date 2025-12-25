@@ -11,18 +11,31 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
-from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import constraints
 from heat.engine import properties
 from heat.engine.resources import alarm_base
+from heat.engine.resources.openstack.heat import none_resource
 from heat.engine import support
-from heat.engine import watchrule
+from heat.engine import translation
 
 
-class AodhAlarm(alarm_base.BaseAlarm):
+class AodhBaseActionsMixin:
+    def handle_create(self):
+        props = self.get_alarm_props(self.properties)
+        props['name'] = self.physical_resource_name()
+        alarm = self.client().alarm.create(props)
+        self.resource_id_set(alarm['alarm_id'])
+
+    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
+        if prop_diff:
+            new_props = json_snippet.properties(self.properties_schema,
+                                                self.context)
+            self.client().alarm.update(self.resource_id,
+                                       self.get_alarm_props(new_props))
+
+
+class AodhAlarm(AodhBaseActionsMixin, alarm_base.BaseAlarm):
     """A resource that implements alarming service of Aodh.
 
     A resource that allows for the setting alarms based on threshold evaluation
@@ -32,6 +45,13 @@ class AodhAlarm(alarm_base.BaseAlarm):
     instance if the instance has been up for more than 10 min, some action will
     be called.
     """
+    support_status = support.SupportStatus(
+        status=support.DEPRECATED,
+        message=_('Theshold alarm relies on ceilometer-api and has been '
+                  'deprecated in aodh since Ocata. Use '
+                  'OS::Aodh::GnocchiAggregationByResourcesAlarm instead.'),
+        version='10.0.0',
+        previous_status=support.SupportStatus(version='2014.1'))
 
     PROPERTIES = (
         COMPARISON_OPERATOR, EVALUATION_PERIODS, METER_NAME, PERIOD,
@@ -41,23 +61,11 @@ class AodhAlarm(alarm_base.BaseAlarm):
         'statistic', 'threshold', 'matching_metadata', 'query',
     )
 
-    QUERY_FACTOR_FIELDS = (
-        QF_FIELD, QF_OP, QF_VALUE,
-    ) = (
-        'field', 'op', 'value',
-    )
-
-    QF_OP_VALS = constraints.AllowedValues(['le', 'ge', 'eq',
-                                            'lt', 'gt', 'ne'])
-
     properties_schema = {
         COMPARISON_OPERATOR: properties.Schema(
             properties.Schema.STRING,
             _('Operator used to compare specified statistic with threshold.'),
-            constraints=[
-                constraints.AllowedValues(['ge', 'gt', 'eq', 'ne', 'lt',
-                                           'le']),
-            ],
+            constraints=[alarm_base.BaseAlarm.QF_OP_VALS],
             update_allowed=True
         ),
         EVALUATION_PERIODS: properties.Schema(
@@ -107,7 +115,7 @@ class AodhAlarm(alarm_base.BaseAlarm):
             schema=properties.Schema(
                 properties.Schema.MAP,
                 schema={
-                    QF_FIELD: properties.Schema(
+                    alarm_base.BaseAlarm.QF_FIELD: properties.Schema(
                         properties.Schema.STRING,
                         _('Name of attribute to compare. '
                           'Names of the form metadata.user_metadata.X '
@@ -118,12 +126,19 @@ class AodhAlarm(alarm_base.BaseAlarm):
                           'To see the attributes of your Samples, '
                           'use `ceilometer --debug sample-list`.')
                     ),
-                    QF_OP: properties.Schema(
+                    alarm_base.BaseAlarm.QF_TYPE: properties.Schema(
+                        properties.Schema.STRING,
+                        _('The type of the attribute.'),
+                        default='string',
+                        constraints=[alarm_base.BaseAlarm.QF_TYPE_VALS],
+                        support_status=support.SupportStatus(version='8.0.0')
+                    ),
+                    alarm_base.BaseAlarm.QF_OP: properties.Schema(
                         properties.Schema.STRING,
                         _('Comparison operator.'),
-                        constraints=[QF_OP_VALS]
+                        constraints=[alarm_base.BaseAlarm.QF_OP_VALS]
                     ),
-                    QF_VALUE: properties.Schema(
+                    alarm_base.BaseAlarm.QF_VALUE: properties.Schema(
                         properties.Schema.STRING,
                         _('String value with which to compare.')
                     )
@@ -155,7 +170,7 @@ class AodhAlarm(alarm_base.BaseAlarm):
 
         # make sure the matching_metadata appears in the query like this:
         # {field: metadata.$prefix.x, ...}
-        for m_k, m_v in six.iteritems(mmd):
+        for m_k, m_v in mmd.items():
             key = 'metadata.%s' % prefix
             if m_k.startswith('metadata.'):
                 m_k = m_k[len('metadata.'):]
@@ -166,7 +181,7 @@ class AodhAlarm(alarm_base.BaseAlarm):
             # NOTE(prazumovsky): type of query value must be a string, but
             # matching_metadata value type can not be a string, so we
             # must convert value to a string type.
-            query.append(dict(field=key, op='eq', value=six.text_type(m_v)))
+            query.append(dict(field=key, op='eq', value=str(m_v)))
         if self.MATCHING_METADATA in kwargs:
             del kwargs[self.MATCHING_METADATA]
         if self.QUERY in kwargs:
@@ -176,137 +191,281 @@ class AodhAlarm(alarm_base.BaseAlarm):
         kwargs['threshold_rule'] = rule
         return kwargs
 
-    def handle_create(self):
-        props = self.get_alarm_props(self.properties)
-        props['name'] = self.physical_resource_name()
-        alarm = self.client().alarm.create(props)
-        self.resource_id_set(alarm['alarm_id'])
-
-        # the watchrule below is for backwards compatibility.
-        # 1) so we don't create watch tasks unnecessarily
-        # 2) to support CW stats post, we will redirect the request
-        #    to ceilometer.
-        wr = watchrule.WatchRule(context=self.context,
-                                 watch_name=self.physical_resource_name(),
-                                 rule=dict(self.properties),
-                                 stack_id=self.stack.id)
-        wr.state = wr.CEILOMETER_CONTROLLED
-        wr.store()
-
-    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        if prop_diff:
-            kwargs = {}
-            kwargs.update(self.properties)
-            kwargs.update(prop_diff)
-            self.client().alarm.update(self.resource_id,
-                                       self.get_alarm_props(kwargs))
-
     def parse_live_resource_data(self, resource_properties, resource_data):
         record_reality = {}
         threshold_data = resource_data.get('threshold_rule').copy()
         threshold_data.update(resource_data)
-        props_upd_allowed = set(
-            self.PROPERTIES + alarm_base.COMMON_PROPERTIES) - {
-            self.METER_NAME, alarm_base.TIME_CONSTRAINTS}
+        props_upd_allowed = (set(self.PROPERTIES +
+                                 alarm_base.COMMON_PROPERTIES) -
+                             {self.METER_NAME, alarm_base.TIME_CONSTRAINTS} -
+                             set(alarm_base.INTERNAL_PROPERTIES))
         for key in props_upd_allowed:
             record_reality.update({key: threshold_data.get(key)})
 
         return record_reality
 
-    def handle_delete(self):
-        try:
-            wr = watchrule.WatchRule.load(
-                self.context, watch_name=self.physical_resource_name())
-            wr.destroy()
-        except exception.EntityNotFound:
-            pass
-
-        return super(AodhAlarm, self).handle_delete()
-
     def handle_check(self):
-        watch_name = self.physical_resource_name()
-        watchrule.WatchRule.load(self.context, watch_name=watch_name)
         self.client().alarm.get(self.resource_id)
 
-    def _show_resource(self):
-        return self.client().alarm.get(self.resource_id)
 
-
-class CombinationAlarm(alarm_base.BaseAlarm):
+class CombinationAlarm(none_resource.NoneResource):
     """A resource that implements combination of Aodh alarms.
 
-    Allows to use alarm as a combination of other alarms with some operator:
-    activate this alarm if any alarm in combination has been activated or
-    if all alarms in combination have been activated.
+    This resource is now deleted from Aodh, so will directly inherit from
+    NoneResource (placeholder resource). For old resources (which not a
+    placeholder resource), still can be deleted through client. Any newly
+    created resources will be considered as placeholder resources like none
+    resource. We will schedule to delete it from heat resources list.
     """
 
-    alarm_type = 'combination'
-
-    # aodhclient doesn't support to manage combination-alarm,
-    # so we use ceilometerclient to manage this resource as before,
-    # after two release cycles, to hidden this resource.
-    default_client_name = 'ceilometer'
-
-    entity = 'alarms'
+    default_client_name = 'aodh'
+    entity = 'alarm'
 
     support_status = support.SupportStatus(
-        status=support.DEPRECATED,
-        version='7.0.0',
-        message=_('The combination alarm is deprecated and '
-                  'disabled by default in Aodh.'),
-        previous_status=support.SupportStatus(version='2014.1'))
+        status=support.HIDDEN,
+        message=_('OS::Aodh::CombinationAlarm is deprecated and has been '
+                  'removed from Aodh, use OS::Aodh::CompositeAlarm instead.'),
+        version='9.0.0',
+        previous_status=support.SupportStatus(
+            status=support.DEPRECATED,
+            version='7.0.0',
+            previous_status=support.SupportStatus(version='2014.1')
+        )
+    )
+
+
+class EventAlarm(AodhBaseActionsMixin, alarm_base.BaseAlarm):
+    """A resource that implements event alarms.
+
+    Allows users to define alarms which can be evaluated based on events
+    passed from other OpenStack services. The events can be emitted when
+    the resources from other OpenStack services have been updated, created
+    or deleted, such as 'compute.instance.reboot.end',
+    'scheduler.select_destinations.end'.
+    """
+
+    alarm_type = 'event'
+
+    support_status = support.SupportStatus(version='8.0.0')
 
     PROPERTIES = (
-        ALARM_IDS, OPERATOR,
+        EVENT_TYPE, QUERY
     ) = (
-        'alarm_ids', 'operator',
+        'event_type', 'query'
     )
 
     properties_schema = {
-        ALARM_IDS: properties.Schema(
-            properties.Schema.LIST,
-            _('List of alarm identifiers to combine.'),
-            required=True,
-            constraints=[constraints.Length(min=1)],
-            update_allowed=True),
-        OPERATOR: properties.Schema(
+        EVENT_TYPE: properties.Schema(
             properties.Schema.STRING,
-            _('Operator used to combine the alarms.'),
-            constraints=[constraints.AllowedValues(['and', 'or'])],
-            update_allowed=True)
+            _('Event type to evaluate against. '
+              'If not specified will match all events.'),
+            update_allowed=True,
+            default='*'
+        ),
+        QUERY: properties.Schema(
+            properties.Schema.LIST,
+            _('A list for filtering events. Query conditions used '
+              'to filter specific events when evaluating the alarm.'),
+            update_allowed=True,
+            schema=properties.Schema(
+                properties.Schema.MAP,
+                schema={
+                    alarm_base.BaseAlarm.QF_FIELD: properties.Schema(
+                        properties.Schema.STRING,
+                        _('Name of attribute to compare.')
+                    ),
+                    alarm_base.BaseAlarm.QF_TYPE: properties.Schema(
+                        properties.Schema.STRING,
+                        _('The type of the attribute.'),
+                        default='string',
+                        constraints=[alarm_base.BaseAlarm.QF_TYPE_VALS]
+                    ),
+                    alarm_base.BaseAlarm.QF_OP: properties.Schema(
+                        properties.Schema.STRING,
+                        _('Comparison operator.'),
+                        constraints=[alarm_base.BaseAlarm.QF_OP_VALS]
+                    ),
+                    alarm_base.BaseAlarm.QF_VALUE: properties.Schema(
+                        properties.Schema.STRING,
+                        _('String value with which to compare.')
+                    )
+                }
+            )
+        )
+    }
+
+    properties_schema.update(alarm_base.common_properties_schema)
+
+    def get_alarm_props(self, props):
+        """Apply all relevant compatibility xforms."""
+
+        kwargs = self.actions_to_urls(props)
+        kwargs['type'] = self.alarm_type
+        rule = {}
+
+        for prop in (self.EVENT_TYPE, self.QUERY):
+            if prop in kwargs:
+                del kwargs[prop]
+        query = props.get(self.QUERY)
+        if query:
+            rule[self.QUERY] = query
+        event_type = props.get(self.EVENT_TYPE)
+        if event_type:
+            rule[self.EVENT_TYPE] = event_type
+        kwargs['event_rule'] = rule
+        return kwargs
+
+
+class LBMemberHealthAlarm(AodhBaseActionsMixin, alarm_base.BaseAlarm):
+    """A resource that implements a Loadbalancer Member Health Alarm.
+
+    Allows setting alarms based on the health of load balancer pool members,
+    where the health of a member is determined by the member reporting an
+    operating_status of ERROR beyond an initial grace period after creation
+    (120 seconds by default).
+    """
+
+    alarm_type = "loadbalancer_member_health"
+
+    support_status = support.SupportStatus(version='13.0.0')
+
+    PROPERTIES = (
+        POOL, STACK, AUTOSCALING_GROUP_ID
+    ) = (
+        "pool", "stack", "autoscaling_group_id"
+    )
+
+    RULE_PROPERTIES = (
+        POOL_ID, STACK_ID
+    ) = (
+        "pool_id", "stack_id"
+    )
+
+    properties_schema = {
+        POOL: properties.Schema(
+            properties.Schema.STRING,
+            _("Name or ID of the loadbalancer pool for which the health of "
+              "each member will be evaluated."),
+            update_allowed=True,
+            required=True,
+        ),
+        STACK: properties.Schema(
+            properties.Schema.STRING,
+            _("Name or ID of the root / top level Heat stack containing the "
+              "loadbalancer pool and members. An update will be triggered "
+              "on the root Stack if an unhealthy member is detected in the "
+              "loadbalancer pool."),
+            update_allowed=False,
+            required=True,
+        ),
+        AUTOSCALING_GROUP_ID: properties.Schema(
+            properties.Schema.STRING,
+            _("ID of the Heat autoscaling group that contains the "
+              "loadbalancer members. Unhealthy members will be marked "
+              "as such before an update is triggered on the root stack."),
+            update_allowed=True,
+            required=True,
+        ),
+    }
+
+    properties_schema.update(alarm_base.common_properties_schema)
+
+    def get_alarm_props(self, props):
+        """Apply all relevant compatibility xforms."""
+        kwargs = self.actions_to_urls(props)
+        kwargs['type'] = self.alarm_type
+
+        for prop in (self.POOL, self.STACK, self.AUTOSCALING_GROUP_ID):
+            if prop in kwargs:
+                del kwargs[prop]
+
+        rule = {
+            self.POOL_ID: props[self.POOL],
+            self.STACK_ID: props[self.STACK],
+            self.AUTOSCALING_GROUP_ID: props[self.AUTOSCALING_GROUP_ID]
+        }
+
+        kwargs["loadbalancer_member_health_rule"] = rule
+        return kwargs
+
+    def translation_rules(self, properties):
+        translation_rules = [
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                [self.POOL],
+                client_plugin=self.client_plugin('octavia'),
+                finder='get_pool'
+            ),
+        ]
+        return translation_rules
+
+
+class PrometheusAlarm(AodhBaseActionsMixin,
+                      alarm_base.BaseAlarm):
+    """A resource that implements Aodh alarm of type prometheus.
+
+    An alarm that evaluates threshold based on metric data fetched from
+    Prometheus.
+    """
+
+    support_status = support.SupportStatus(version='22.0.0')
+
+    PROPERTIES = (
+        COMPARISON_OPERATOR, QUERY, THRESHOLD,
+    ) = (
+        'comparison_operator', 'query', 'threshold',
+    )
+
+    properties_schema = {
+        COMPARISON_OPERATOR: properties.Schema(
+            properties.Schema.STRING,
+            _('Operator used to compare specified statistic with threshold.'),
+            constraints=[alarm_base.BaseAlarm.QF_OP_VALS],
+            update_allowed=True
+        ),
+        QUERY: properties.Schema(
+            properties.Schema.STRING,
+            _('The PromQL query string to fetch metrics data '
+              'from Prometheus.'),
+            required=True,
+            update_allowed=True
+        ),
+        THRESHOLD: properties.Schema(
+            properties.Schema.NUMBER,
+            _('Threshold to evaluate against.'),
+            required=True,
+            update_allowed=True
+        ),
     }
     properties_schema.update(alarm_base.common_properties_schema)
 
-    def handle_create(self):
-        props = self.actions_to_urls(self.properties)
-        props['name'] = self.physical_resource_name()
-        props['type'] = self.alarm_type
-        alarm = self.client().alarms.create(
-            **self._reformat_properties(props))
-        self.resource_id_set(alarm.alarm_id)
+    alarm_type = 'prometheus'
 
-    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        if prop_diff:
-            kwargs = {'alarm_id': self.resource_id}
-            kwargs.update(prop_diff)
-            alarms_client = self.client().alarms
-            alarms_client.update(**self._reformat_properties(
-                self.actions_to_urls(kwargs)))
+    def get_alarm_props(self, props):
+        kwargs = self.actions_to_urls(props)
+        kwargs['type'] = self.alarm_type
+        return self._reformat_properties(kwargs)
 
-    def handle_suspend(self):
-        self.client().alarms.update(
-            alarm_id=self.resource_id, enabled=False)
-
-    def handle_resume(self):
-        self.client().alarms.update(
-            alarm_id=self.resource_id, enabled=True)
-
-    def handle_check(self):
-        self.client().alarms.get(self.resource_id)
+    def parse_live_resource_data(self, resource_properties,
+                                 resource_data):
+        record_reality = {}
+        rule = self.alarm_type + '_rule'
+        data = resource_data.get(rule).copy()
+        data.update(resource_data)
+        for key in self.properties_schema.keys():
+            if key in alarm_base.INTERNAL_PROPERTIES:
+                continue
+            if self.properties_schema[key].update_allowed:
+                record_reality.update({key: data.get(key)})
+        return record_reality
 
 
 def resource_mapping():
     return {
         'OS::Aodh::Alarm': AodhAlarm,
         'OS::Aodh::CombinationAlarm': CombinationAlarm,
+        'OS::Aodh::EventAlarm': EventAlarm,
+        'OS::Aodh::LBMemberHealthAlarm': LBMemberHealthAlarm,
+        'OS::Aodh::PrometheusAlarm': PrometheusAlarm,
     }

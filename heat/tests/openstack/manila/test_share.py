@@ -12,9 +12,7 @@
 #    under the License.
 import collections
 import copy
-
-import mock
-import six
+from unittest import mock
 
 from heat.common import exception
 from heat.common import template_format
@@ -48,11 +46,20 @@ class DummyShare(object):
     def __init__(self):
         self.availability_zone = 'az'
         self.host = 'host'
-        self.export_locations = 'el'
         self.share_server_id = 'id'
         self.created_at = 'ca'
         self.status = 's'
         self.project_id = 'p_id'
+
+
+class DummyShareExportLocation(object):
+    def __init__(self):
+        self.export_location = {
+            'path': 'el'
+        }
+
+    def to_dict(self):
+        return self.export_location
 
 
 class ManilaShareTest(common.HeatTestCase):
@@ -76,14 +83,12 @@ class ManilaShareTest(common.HeatTestCase):
         self.stack = utils.parse_stack(tmp, stack_name=stack_name)
         res_def = self.stack.t.resource_definitions(self.stack)["test_share"]
         share = mshare.ManilaShare("test_share", res_def, self.stack)
+        self.patchobject(share, 'data_set')
 
         # replace clients and plugins with mocks
         mock_client = mock.MagicMock()
         client = mock.MagicMock(return_value=mock_client)
         share.client = client
-        mock_plugin = mock.MagicMock()
-        client_plugin = mock.MagicMock(return_value=mock_plugin)
-        share.client_plugin = client_plugin
 
         return share
 
@@ -108,14 +113,14 @@ class ManilaShareTest(common.HeatTestCase):
             share=share.resource_id, access_type="ip")
         args, kwargs = share.client().shares.create.call_args
         message_end = " parameter was not passed to manila client"
-        self.assertEqual(u"NFS", kwargs["share_proto"],
+        self.assertEqual("NFS", kwargs["share_proto"],
                          "Share protocol" + message_end)
         self.assertEqual(1, kwargs["size"], "Share size" + message_end)
         self.assertEqual("basic_test_share", kwargs["name"],
                          "Share name" + message_end)
         self.assertEqual("basic test share", kwargs["description"],
                          "Share description" + message_end)
-        self.assertEqual({u"key": u"value"}, kwargs["metadata"],
+        self.assertEqual({"key": "value"}, kwargs["metadata"],
                          "Metadata" + message_end)
         self.assertTrue(kwargs["is_public"])
         share.client().shares.get.assert_called_once_with(self.fake_share.id)
@@ -127,7 +132,7 @@ class ManilaShareTest(common.HeatTestCase):
         exc = self.assertRaises(exception.ResourceInError,
                                 share.check_create_complete,
                                 self.failed_share)
-        self.assertIn("Error during creation", six.text_type(exc))
+        self.assertIn("Error during creation", str(exc))
 
     def test_share_create_unknown_status(self):
         share = self._init_share("stack_share_create_unknown")
@@ -135,7 +140,7 @@ class ManilaShareTest(common.HeatTestCase):
         exc = self.assertRaises(exception.ResourceUnknownStatus,
                                 share.check_create_complete,
                                 self.deleting_share)
-        self.assertIn("Unknown status", six.text_type(exc))
+        self.assertIn("Unknown status", str(exc))
 
     def test_share_check(self):
         share = self._create_share("stack_share_check")
@@ -150,7 +155,7 @@ class ManilaShareTest(common.HeatTestCase):
         exc = self.assertRaises(exception.ResourceFailure,
                                 scheduler.TaskRunner(share.check))
         self.assertIn("Error: resources.test_share: 'status': expected "
-                      "'['available']'", six.text_type(exc))
+                      "'['available']'", str(exc))
 
     def test_share_update(self):
         share = self._create_share("stack_share_update")
@@ -216,10 +221,70 @@ class ManilaShareTest(common.HeatTestCase):
     def test_attributes(self):
         share = self._create_share("share")
         share.client().shares.get.return_value = DummyShare()
+        share.client().share_export_locations.list.return_value = [
+            DummyShareExportLocation()]
         self.assertEqual('az', share.FnGetAtt('availability_zone'))
         self.assertEqual('host', share.FnGetAtt('host'))
-        self.assertEqual('el', share.FnGetAtt('export_locations'))
+        self.assertEqual(['el'], share.FnGetAtt('export_locations'))
         self.assertEqual('id', share.FnGetAtt('share_server_id'))
         self.assertEqual('ca', share.FnGetAtt('created_at'))
         self.assertEqual('s', share.FnGetAtt('status'))
         self.assertEqual('p_id', share.FnGetAtt('project_id'))
+
+    def test_allowed_access_type(self):
+        tmp = template_format.parse(manila_template)
+        properties = tmp['resources']['test_share']['properties']
+        properties['access_rules'][0]['access_type'] = 'domain'
+        stack = utils.parse_stack(tmp, stack_name='access_type')
+        self.assertRaisesRegex(
+            exception.StackValidationFailed,
+            '.* "domain" is not an allowed value',
+            stack.validate)
+
+    def test_get_live_state(self):
+        share = self._create_share("share")
+
+        value = mock.MagicMock()
+        value.to_dict.return_value = {
+            'status': 'available',
+            'size': 1,
+            'description': None,
+            'share_proto': 'NFS',
+            'name': 'testshare',
+            'share_type': 'default',
+            'availability_zone': 'nova',
+            'created_at': '2016-02-04T10:20:52.000000',
+            'export_location': 'dummy',
+            'share_network_id': '5f0a3c90-36ef-4e92-8142-06afd6be2881',
+            'export_locations': ['dummy'],
+            'share_server_id': 'fcb9d90d-76e6-466f-a0cb-23e254ccc16c',
+            'host': 'ubuntu@generic1#GENERIC1',
+            'volume_type': 'default',
+            'snapshot_id': None,
+            'is_public': False,
+            'project_id': '221b4f51e9bd4f659845f657a3051a46',
+            'id': '3a68e59d-11c1-4da4-a102-03fc9448613e',
+            'metadata': {}}
+
+        share.client().shares.get.return_value = value
+        share.client().shares.access_list.return_value = [
+            {'access_to': '0.0.0.0', 'access_type': 'ip', 'access_level': 'r'}]
+        share.data = mock.MagicMock(return_value={'share_type': 'default'})
+
+        reality = share.get_live_state(share.properties)
+        expected = {
+            'description': None,
+            'name': 'testshare',
+            'is_public': False,
+            'metadata': {},
+            'access_rules': [{'access_to': '0.0.0.0',
+                              'access_type': 'ip',
+                              'access_level': 'r'}]}
+
+        self.assertEqual(set(expected.keys()), set(reality.keys()))
+        exp_rules = expected.pop('access_rules')
+        real_rules = reality.pop('access_rules')
+        self.assertEqual([set(rule.items()) for rule in exp_rules],
+                         real_rules)
+        for key in expected:
+            self.assertEqual(expected[key], reality[key])

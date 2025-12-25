@@ -12,38 +12,38 @@
 #    under the License.
 
 import copy
-import uuid
+import ipaddress
 
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_serialization import jsonutils
 from oslo_utils import uuidutils
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LE
 from heat.engine import attributes
 from heat.engine.clients import progress
 from heat.engine import constraints
-from heat.engine import function
 from heat.engine import properties
 from heat.engine.resources.openstack.neutron import port as neutron_port
 from heat.engine.resources.openstack.neutron import subnet
 from heat.engine.resources.openstack.nova import server_network_mixin
 from heat.engine.resources import scheduler_hints as sh
-from heat.engine.resources import stack_user
+from heat.engine.resources import server_base
 from heat.engine import support
 from heat.engine import translation
 from heat.rpc import api as rpc_api
 
 cfg.CONF.import_opt('default_software_config_transport', 'heat.common.config')
-cfg.CONF.import_opt('max_server_name_length', 'heat.common.config')
+cfg.CONF.import_opt('default_user_data_format', 'heat.common.config')
 
 LOG = logging.getLogger(__name__)
 
+NOVA_MICROVERSIONS = (MICROVERSION_TAGS, MICROVERSION_STR_NETWORK,
+                      MICROVERSION_NIC_TAGS, MICROVERSION_PERSONALITY_REMOVED
+                      ) = ('2.26', '2.37', '2.42', '2.57')
 
-class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
+
+class Server(server_base.BaseServer, sh.SchedulerHintsMixin,
              server_network_mixin.ServerNetworkMixin):
     """A resource for managing Nova instances.
 
@@ -57,14 +57,16 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         ADMIN_USER, AVAILABILITY_ZONE, SECURITY_GROUPS, NETWORKS,
         SCHEDULER_HINTS, METADATA, USER_DATA_FORMAT, USER_DATA,
         RESERVATION_ID, CONFIG_DRIVE, DISK_CONFIG, PERSONALITY,
-        ADMIN_PASS, SOFTWARE_CONFIG_TRANSPORT, USER_DATA_UPDATE_POLICY
+        ADMIN_PASS, SOFTWARE_CONFIG_TRANSPORT, USER_DATA_UPDATE_POLICY,
+        TAGS, DEPLOYMENT_SWIFT_DATA
     ) = (
         'name', 'image', 'block_device_mapping', 'block_device_mapping_v2',
         'flavor', 'flavor_update_policy', 'image_update_policy', 'key_name',
         'admin_user', 'availability_zone', 'security_groups', 'networks',
         'scheduler_hints', 'metadata', 'user_data_format', 'user_data',
         'reservation_id', 'config_drive', 'diskConfig', 'personality',
-        'admin_pass', 'software_config_transport', 'user_data_update_policy'
+        'admin_pass', 'software_config_transport', 'user_data_update_policy',
+        'tags', 'deployment_swift_data'
     )
 
     _BLOCK_DEVICE_MAPPING_KEYS = (
@@ -91,6 +93,8 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         BLOCK_DEVICE_MAPPING_BOOT_INDEX,
         BLOCK_DEVICE_MAPPING_VOLUME_SIZE,
         BLOCK_DEVICE_MAPPING_DELETE_ON_TERM,
+        BLOCK_DEVICE_MAPPING_EPHEMERAL_SIZE,
+        BLOCK_DEVICE_MAPPING_EPHEMERAL_FORMAT,
     ) = (
         'device_name',
         'volume_id',
@@ -103,15 +107,22 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         'boot_index',
         'volume_size',
         'delete_on_termination',
+        'ephemeral_size',
+        'ephemeral_format'
     )
 
     _NETWORK_KEYS = (
         NETWORK_UUID, NETWORK_ID, NETWORK_FIXED_IP, NETWORK_PORT,
-        NETWORK_SUBNET, NETWORK_PORT_EXTRA, NETWORK_FLOATING_IP
+        NETWORK_SUBNET, NETWORK_PORT_EXTRA, NETWORK_FLOATING_IP,
+        ALLOCATE_NETWORK, NIC_TAG,
     ) = (
         'uuid', 'network', 'fixed_ip', 'port',
-        'subnet', 'port_extra_properties', 'floating_ip'
+        'subnet', 'port_extra_properties', 'floating_ip',
+        'allocate_network', 'tag',
     )
+
+    _IFACE_MANAGED_KEYS = (NETWORK_PORT, NETWORK_ID,
+                           NETWORK_FIXED_IP, NETWORK_SUBNET)
 
     _SOFTWARE_CONFIG_FORMATS = (
         HEAT_CFNTOOLS, RAW, SOFTWARE_CONFIG
@@ -125,16 +136,31 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         'POLL_SERVER_CFN', 'POLL_SERVER_HEAT', 'POLL_TEMP_URL', 'ZAQAR_MESSAGE'
     )
 
-    ATTRIBUTES = (
-        NAME_ATTR, ADDRESSES, NETWORKS_ATTR, FIRST_ADDRESS,
-        INSTANCE_NAME, ACCESSIPV4, ACCESSIPV6, CONSOLE_URLS,
+    _ALLOCATE_TYPES = (
+        NETWORK_NONE, NETWORK_AUTO,
     ) = (
-        'name', 'addresses', 'networks', 'first_address',
-        'instance_name', 'accessIPv4', 'accessIPv6', 'console_urls',
+        'none', 'auto',
     )
 
-    # valid image Status
-    IMAGE_STATUS_ACTIVE = 'active'
+    _DEPLOYMENT_SWIFT_DATA_KEYS = (
+        CONTAINER, OBJECT
+    ) = (
+        'container', 'object',
+    )
+
+    ATTRIBUTES = (
+        NAME_ATTR, ADDRESSES, NETWORKS_ATTR, FIRST_ADDRESS,
+        INSTANCE_NAME, ACCESSIPV4, ACCESSIPV6, CONSOLE_URLS, TAGS_ATTR,
+        OS_COLLECT_CONFIG
+    ) = (
+        'name', 'addresses', 'networks', 'first_address',
+        'instance_name', 'accessIPv4', 'accessIPv6', 'console_urls', 'tags',
+        'os_collect_config'
+    )
+
+    # Image Statuses
+    IMAGE_STATUSES = (IMAGE_ACTIVE, IMAGE_ERROR,
+                      IMAGE_DELETED) = ('active', 'error', 'deleted')
 
     properties_schema = {
         NAME: properties.Schema(
@@ -218,12 +244,16 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                         properties.Schema.STRING,
                         _('The ID of the image to create a volume from.'),
                         support_status=support.SupportStatus(
-                            status=support.DEPRECATED,
-                            version='7.0.0',
+                            status=support.HIDDEN,
+                            version='9.0.0',
                             message=_('Use property %s.') %
                                     BLOCK_DEVICE_MAPPING_IMAGE,
                             previous_status=support.SupportStatus(
-                                version='5.0.0')
+                                status=support.DEPRECATED,
+                                version='7.0.0',
+                                previous_status=support.SupportStatus(
+                                    version='5.0.0')
+                            )
                         ),
                         constraints=[
                             constraints.CustomConstraint('glance.image')
@@ -250,6 +280,24 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                         properties.Schema.INTEGER,
                         _('The size of the swap, in MB.')
                     ),
+                    BLOCK_DEVICE_MAPPING_EPHEMERAL_SIZE: properties.Schema(
+                        properties.Schema.INTEGER,
+                        _('The size of the local ephemeral block device, '
+                          'in GB.'),
+                        support_status=support.SupportStatus(version='8.0.0'),
+                        constraints=[constraints.Range(min=1)]
+                    ),
+                    BLOCK_DEVICE_MAPPING_EPHEMERAL_FORMAT: properties.Schema(
+                        properties.Schema.STRING,
+                        _('The format of the local ephemeral block device. '
+                          'If no format is specified, uses default value, '
+                          'defined in nova configuration file.'),
+                        constraints=[
+                            constraints.AllowedValues(['ext2', 'ext3', 'ext4',
+                                                       'xfs', 'ntfs'])
+                        ],
+                        support_status=support.SupportStatus(version='8.0.0')
+                    ),
                     BLOCK_DEVICE_MAPPING_DEVICE_TYPE: properties.Schema(
                         properties.Schema.STRING,
                         _('Device type: at the moment we can make distinction '
@@ -264,13 +312,16 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                           'suitable default if omitted.'),
                         constraints=[
                             constraints.AllowedValues(['ide', 'lame_bus',
-                                                       'scsi', 'usb',
+                                                       'sata', 'scsi', 'usb',
                                                        'virtio']),
                         ],
                     ),
                     BLOCK_DEVICE_MAPPING_BOOT_INDEX: properties.Schema(
                         properties.Schema.INTEGER,
-                        _('Integer used for ordering the boot disks.'),
+                        _('Integer used for ordering the boot disks. If '
+                          'it is not specified, value "0" will be set '
+                          'for bootable sources (volume, snapshot, image); '
+                          'value "-1" will be set for non-bootable sources.'),
                     ),
                     BLOCK_DEVICE_MAPPING_VOLUME_SIZE: properties.Schema(
                         properties.Schema.INTEGER,
@@ -280,7 +331,10 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                     BLOCK_DEVICE_MAPPING_DELETE_ON_TERM: properties.Schema(
                         properties.Schema.BOOLEAN,
                         _('Indicate whether the volume should be deleted '
-                          'when the server is terminated.')
+                          'when the server is terminated. '
+                          'Defaults to "False" in case of a volume, snapshot '
+                          'or image and to "True" in case of swap or '
+                          'ephemeral.')
                     ),
                 },
             ),
@@ -381,6 +435,23 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                             constraints.CustomConstraint('neutron.network')
                         ]
                     ),
+                    ALLOCATE_NETWORK: properties.Schema(
+                        properties.Schema.STRING,
+                        _('The special string values of network, '
+                          'auto: means either a network that is already '
+                          'available to the project will be used, or if one '
+                          'does not exist, will be automatically created for '
+                          'the project; none: means no networking will be '
+                          'allocated for the created server. Supported by '
+                          'Nova API since version "2.37". This property can '
+                          'not be used with other network keys.'),
+                        support_status=support.SupportStatus(version='9.0.0'),
+                        constraints=[
+                            constraints.AllowedValues(
+                                [NETWORK_NONE, NETWORK_AUTO])
+                        ],
+                        update_allowed=True,
+                    ),
                     NETWORK_FIXED_IP: properties.Schema(
                         properties.Schema.STRING,
                         _('Fixed IP address to specify for the port '
@@ -417,6 +488,12 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                         properties.Schema.STRING,
                         _('ID of the floating IP to associate.'),
                         support_status=support.SupportStatus(version='6.0.0')
+                    ),
+                    NIC_TAG: properties.Schema(
+                        properties.Schema.STRING,
+                        _('Port tag. Heat ignores any update on this property '
+                          'as nova does not support it.'),
+                        support_status=support.SupportStatus(version='9.0.0')
                     )
                 },
             ),
@@ -433,7 +510,8 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
               'keys and values must be 255 characters or less. Non-string '
               'values will be serialized to JSON (and the serialized '
               'string must be 255 characters or less).'),
-            update_allowed=True
+            update_allowed=True,
+            default={}
         ),
         USER_DATA_FORMAT: properties.Schema(
             properties.Schema.STRING,
@@ -443,8 +521,10 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
               'the user_data is passed to Nova unmodified. '
               'For SOFTWARE_CONFIG user_data is bundled as part of the '
               'software config data, and metadata is derived from any '
-              'associated SoftwareDeployment resources.'),
-            default=HEAT_CFNTOOLS,
+              'associated SoftwareDeployment resources. And if the '
+              'user_data is in CoreOS ignition(json) format, the metadata '
+              'will be injected into the user_data automatically by Heat.'),
+            default=cfg.CONF.default_user_data_format,
             constraints=[
                 constraints.AllowedValues(_SOFTWARE_CONFIG_FORMATS),
             ]
@@ -468,18 +548,22 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         ),
         USER_DATA_UPDATE_POLICY: properties.Schema(
             properties.Schema.STRING,
-            _('Policy on how to apply a user_data update; either by '
-              'ignoring it or by replacing the entire server.'),
+            _('Policy on how to apply a user_data update; by '
+              'ignoring it, by replacing the entire server, '
+              'or rebuild the server.'),
             default='REPLACE',
             constraints=[
-                constraints.AllowedValues(['REPLACE', 'IGNORE']),
+                constraints.AllowedValues(['REPLACE', 'IGNORE', 'REBUILD']),
             ],
             support_status=support.SupportStatus(version='6.0.0'),
             update_allowed=True
         ),
         USER_DATA: properties.Schema(
             properties.Schema.STRING,
-            _('User data script to be executed by cloud-init.'),
+            _('User data script to be executed by cloud-init or CoreOS '
+              'ignition. Changes cause replacement of the resource '
+              'by default, but can be ignored altogether by setting the '
+              '`user_data_update_policy` property.'),
             default='',
             update_allowed=True
         ),
@@ -503,6 +587,17 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             properties.Schema.MAP,
             _('A map of files to create/overwrite on the server upon boot. '
               'Keys are file names and values are the file contents.'),
+            support_status=support.SupportStatus(
+                status=support.DEPRECATED,
+                version='12.0.0',
+                message=_('This is not supported with nova api '
+                          'microversion 2.57 and above. '
+                          'OS::Nova::Server resource will not support '
+                          'it in the future. Please use user_data or metadata '
+                          'instead. However, you can set heat config option '
+                          'max_nova_api_microversion < 2.57 to use '
+                          'this property in the meantime.')
+            ),
             default={}
         ),
         ADMIN_PASS: properties.Schema(
@@ -510,6 +605,44 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             _('The administrator password for the server.'),
             update_allowed=True
         ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('Server tags. Supported since client version 2.26.'),
+            support_status=support.SupportStatus(version='8.0.0'),
+            schema=properties.Schema(properties.Schema.STRING),
+            update_allowed=True
+        ),
+        DEPLOYMENT_SWIFT_DATA: properties.Schema(
+            properties.Schema.MAP,
+            _('Swift container and object to use for storing deployment data '
+              'for the server resource. The parameter is a map value '
+              'with the keys "container" and "object", and the values '
+              'are the corresponding container and object names. The '
+              'software_config_transport parameter must be set to '
+              'POLL_TEMP_URL for swift to be used. If not specified, '
+              'and software_config_transport is set to POLL_TEMP_URL, a '
+              'container will be automatically created from the resource '
+              'name, and the object name will be a generated uuid.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            default={},
+            update_allowed=True,
+            schema={
+                CONTAINER: properties.Schema(
+                    properties.Schema.STRING,
+                    _('Name of the container.'),
+                    constraints=[
+                        constraints.Length(min=1)
+                    ]
+                ),
+                OBJECT: properties.Schema(
+                    properties.Schema.STRING,
+                    _('Name of the object.'),
+                    constraints=[
+                        constraints.Length(min=1)
+                    ]
+                )
+            }
+        )
     }
 
     attributes_schema = {
@@ -518,13 +651,26 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             type=attributes.Schema.STRING
         ),
         ADDRESSES: attributes.Schema(
-            _('A dict of all network addresses with corresponding port_id. '
-              'Each network will have two keys in dict, they are network '
-              'name and network id. '
-              'The port ID may be obtained through the following expression: '
-              '"{get_attr: [<server>, addresses, <network name_or_id>, 0, '
-              'port]}".'),
-            type=attributes.Schema.MAP
+            _('A dict of all network addresses with corresponding port_id and '
+              'subnets. Each network will have two keys in dict, they are '
+              'network name and network id. The port ID may be obtained '
+              'through the following expression: ``{get_attr: [<server>, '
+              'addresses, <network name_or_id>, 0, port]}``. The subnets may '
+              'be obtained trough the following expression: ``{get_attr: '
+              '[<server>, addresses, <network name_or_id>, 0, subnets]}``. '
+              'The network may be obtained through the following expression: '
+              '``{get_attr: [<server>, addresses, <network name_or_id>, 0, '
+              'network]}``.'),
+            type=attributes.Schema.MAP,
+            support_status=support.SupportStatus(
+                version='11.0.0',
+                status=support.SUPPORTED,
+                message=_('The attribute was extended to include subnets and '
+                          'network with version 11.0.0.'),
+                previous_status=support.SupportStatus(
+                    status=support.SUPPORTED
+                )
+            )
         ),
         NETWORKS_ATTR: attributes.Schema(
             _('A dict of assigned network addresses of the form: '
@@ -559,12 +705,20 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         ACCESSIPV4: attributes.Schema(
             _('The manually assigned alternative public IPv4 address '
               'of the server.'),
-            type=attributes.Schema.STRING
+            type=attributes.Schema.STRING,
+            support_status=support.SupportStatus(
+                status=support.DEPRECATED,
+                version='14.0.0',
+                previous_status=support.SupportStatus(version='2015.1')),
         ),
         ACCESSIPV6: attributes.Schema(
             _('The manually assigned alternative public IPv6 address '
               'of the server.'),
-            type=attributes.Schema.STRING
+            type=attributes.Schema.STRING,
+            support_status=support.SupportStatus(
+                status=support.DEPRECATED,
+                version='14.0.0',
+                previous_status=support.SupportStatus(version='2015.1'))
         ),
         CONSOLE_URLS: attributes.Schema(
             _("URLs of server's consoles. "
@@ -572,19 +726,30 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
               "can be specified as parameter to the get_attr function, "
               "e.g. get_attr: [ <server>, console_urls, novnc ]. "
               "Currently supported types are "
-              "novnc, xvpvnc, spice-html5, rdp-html5, serial."),
+              "novnc, xvpvnc, spice-html5, rdp-html5, serial and webmks."),
             support_status=support.SupportStatus(version='2015.1'),
             type=attributes.Schema.MAP
         ),
+        TAGS_ATTR: attributes.Schema(
+            _('Tags from the server. Supported since client version 2.26.'),
+            support_status=support.SupportStatus(version='8.0.0'),
+            type=attributes.Schema.LIST
+        ),
+        OS_COLLECT_CONFIG: attributes.Schema(
+            _('The os-collect-config configuration for the server\'s local '
+              'agent to be configured to connect to Heat to retrieve '
+              'deployment data.'),
+            support_status=support.SupportStatus(version='9.0.0'),
+            type=attributes.Schema.MAP,
+            cache_mode=attributes.Schema.CACHE_NONE
+        ),
     }
-
-    physical_resource_name_limit = cfg.CONF.max_server_name_length
 
     default_client_name = 'nova'
 
-    entity = 'servers'
-
     def translation_rules(self, props):
+        neutron_client_plugin = self.client_plugin('neutron')
+        glance_client_plugin = self.client_plugin('glance')
         rules = [
             translation.TranslationRule(
                 props,
@@ -601,7 +766,7 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                 props,
                 translation.TranslationRule.RESOLVE,
                 translation_path=[self.IMAGE],
-                client_plugin=self.client_plugin('glance'),
+                client_plugin=glance_client_plugin,
                 finder='find_image_by_name_or_id'),
             translation.TranslationRule(
                 props,
@@ -614,185 +779,41 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                 translation.TranslationRule.RESOLVE,
                 translation_path=[self.BLOCK_DEVICE_MAPPING_V2,
                                   self.BLOCK_DEVICE_MAPPING_IMAGE],
-                client_plugin=self.client_plugin('glance'),
+                client_plugin=glance_client_plugin,
                 finder='find_image_by_name_or_id'),
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                translation_path=[self.NETWORKS, self.NETWORK_ID],
+                client_plugin=neutron_client_plugin,
+                finder='find_resourceid_by_name_or_id',
+                entity=neutron_client_plugin.RES_TYPE_NETWORK),
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                translation_path=[self.NETWORKS, self.NETWORK_SUBNET],
+                client_plugin=neutron_client_plugin,
+                finder='find_resourceid_by_name_or_id',
+                entity=neutron_client_plugin.RES_TYPE_SUBNET),
+            translation.TranslationRule(
+                props,
+                translation.TranslationRule.RESOLVE,
+                translation_path=[self.NETWORKS, self.NETWORK_PORT],
+                client_plugin=neutron_client_plugin,
+                finder='find_resourceid_by_name_or_id',
+                entity=neutron_client_plugin.RES_TYPE_PORT)
         ]
-        if self.is_using_neutron():
-            rules.extend([
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    translation_path=[self.NETWORKS, self.NETWORK_ID],
-                    client_plugin=self.client_plugin('neutron'),
-                    finder='find_resourceid_by_name_or_id',
-                    entity='network'),
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    translation_path=[self.NETWORKS, self.NETWORK_SUBNET],
-                    client_plugin=self.client_plugin('neutron'),
-                    finder='find_resourceid_by_name_or_id',
-                    entity='subnet'),
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    translation_path=[self.NETWORKS, self.NETWORK_PORT],
-                    client_plugin=self.client_plugin('neutron'),
-                    finder='find_resourceid_by_name_or_id',
-                    entity='port')])
-        else:
-            rules.extend([
-                translation.TranslationRule(
-                    props,
-                    translation.TranslationRule.RESOLVE,
-                    translation_path=[self.NETWORKS, self.NETWORK_ID],
-                    client_plugin=self.client_plugin('nova'),
-                    finder='get_nova_network_id')])
         return rules
 
     def __init__(self, name, json_snippet, stack):
         super(Server, self).__init__(name, json_snippet, stack)
         if self.user_data_software_config():
             self._register_access_key()
-
-    def _server_name(self):
-        name = self.properties[self.NAME]
-        if name:
-            return name
-
-        return self.physical_resource_name()
+        self.default_collectors = ['ec2']
 
     def _config_drive(self):
         # This method is overridden by the derived CloudServer resource
         return self.properties[self.CONFIG_DRIVE]
-
-    def _populate_deployments_metadata(self, meta, props):
-        meta['deployments'] = meta.get('deployments', [])
-        meta['os-collect-config'] = meta.get('os-collect-config', {})
-        occ = meta['os-collect-config']
-        collectors = ['ec2']
-        occ['collectors'] = collectors
-
-        # set existing values to None to override any boot-time config
-        occ_keys = ('heat', 'zaqar', 'cfn', 'request')
-        for occ_key in occ_keys:
-            if occ_key not in occ:
-                continue
-            existing = occ[occ_key]
-            for k in existing:
-                existing[k] = None
-
-        if self.transport_poll_server_heat(props):
-            occ.update({'heat': {
-                'user_id': self._get_user_id(),
-                'password': self.password,
-                'auth_url': self.context.auth_url,
-                'project_id': self.stack.stack_user_project_id,
-                'stack_id': self.stack.identifier().stack_path(),
-                'resource_name': self.name}})
-            collectors.append('heat')
-
-        elif self.transport_zaqar_message(props):
-            queue_id = self.physical_resource_name()
-            self.data_set('metadata_queue_id', queue_id)
-            occ.update({'zaqar': {
-                'user_id': self._get_user_id(),
-                'password': self.password,
-                'auth_url': self.context.auth_url,
-                'project_id': self.stack.stack_user_project_id,
-                'queue_id': queue_id}})
-            collectors.append('zaqar')
-
-        elif self.transport_poll_server_cfn(props):
-            heat_client_plugin = self.stack.clients.client_plugin('heat')
-            config_url = heat_client_plugin.get_cfn_metadata_server_url()
-            occ.update({'cfn': {
-                'metadata_url': config_url,
-                'access_key_id': self.access_key,
-                'secret_access_key': self.secret_key,
-                'stack_name': self.stack.name,
-                'path': '%s.Metadata' % self.name}})
-            collectors.append('cfn')
-
-        elif self.transport_poll_temp_url(props):
-            container = self.physical_resource_name()
-            object_name = self.data().get('metadata_object_name')
-            if not object_name:
-                object_name = str(uuid.uuid4())
-
-            self.client('swift').put_container(container)
-
-            url = self.client_plugin('swift').get_temp_url(
-                container, object_name, method='GET')
-            put_url = self.client_plugin('swift').get_temp_url(
-                container, object_name)
-            self.data_set('metadata_put_url', put_url)
-            self.data_set('metadata_object_name', object_name)
-
-            collectors.append('request')
-            occ.update({'request': {
-                'metadata_url': url}})
-
-        collectors.append('local')
-        self.metadata_set(meta)
-
-        # push replacement polling config to any existing push-based sources
-        queue_id = self.data().get('metadata_queue_id')
-        if queue_id:
-            zaqar_plugin = self.client_plugin('zaqar')
-            zaqar = zaqar_plugin.create_for_tenant(
-                self.stack.stack_user_project_id, self._user_token())
-            queue = zaqar.queue(queue_id)
-            queue.post({'body': meta, 'ttl': zaqar_plugin.DEFAULT_TTL})
-
-        object_name = self.data().get('metadata_object_name')
-        if object_name:
-            container = self.physical_resource_name()
-            self.client('swift').put_object(
-                container, object_name, jsonutils.dumps(meta))
-
-    def _register_access_key(self):
-        """Access is limited to this resource, which created the keypair."""
-        def access_allowed(resource_name):
-            return resource_name == self.name
-
-        if self.access_key is not None:
-            self.stack.register_access_allowed_handler(
-                self.access_key, access_allowed)
-        if self._get_user_id() is not None:
-            self.stack.register_access_allowed_handler(
-                self._get_user_id(), access_allowed)
-
-    def _create_transport_credentials(self, props):
-        if self.transport_poll_server_cfn(props):
-            self._create_user()
-            self._create_keypair()
-
-        elif (self.transport_poll_server_heat(props) or
-              self.transport_zaqar_message(props)):
-            self.password = uuid.uuid4().hex
-            self._create_user()
-
-        self._register_access_key()
-
-    @property
-    def access_key(self):
-        return self.data().get('access_key')
-
-    @property
-    def secret_key(self):
-        return self.data().get('secret_key')
-
-    @property
-    def password(self):
-        return self.data().get('password')
-
-    @password.setter
-    def password(self, password):
-        if password is None:
-            self.data_delete('password')
-        else:
-            self.data_set('password', password, True)
 
     def user_data_raw(self):
         return self.properties[self.USER_DATA_FORMAT] == self.RAW
@@ -801,30 +822,12 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         return self.properties[
             self.USER_DATA_FORMAT] == self.SOFTWARE_CONFIG
 
-    def transport_poll_server_cfn(self, props):
-        return props[
-            self.SOFTWARE_CONFIG_TRANSPORT] == self.POLL_SERVER_CFN
-
-    def transport_poll_server_heat(self, props):
-        return props[
-            self.SOFTWARE_CONFIG_TRANSPORT] == self.POLL_SERVER_HEAT
-
-    def transport_poll_temp_url(self, props):
-        return props[
-            self.SOFTWARE_CONFIG_TRANSPORT] == self.POLL_TEMP_URL
-
-    def transport_zaqar_message(self, props):
-        return props[
-            self.SOFTWARE_CONFIG_TRANSPORT] == self.ZAQAR_MESSAGE
-
     def get_software_config(self, ud_content):
-        try:
+        with self.rpc_client().ignore_error_by_name('NotFound'):
             sc = self.rpc_client().show_software_config(
                 self.context, ud_content)
             return sc[rpc_api.SOFTWARE_CONFIG_CONFIG]
-        except Exception as ex:
-            self.rpc_client().ignore_error_named(ex, 'NotFound')
-            return ud_content
+        return ud_content
 
     def handle_create(self):
         security_groups = self.properties[self.SECURITY_GROUPS]
@@ -850,7 +853,7 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
 
         availability_zone = self.properties[self.AVAILABILITY_ZONE]
         instance_meta = self.properties[self.METADATA]
-        if instance_meta is not None:
+        if instance_meta:
             instance_meta = self.client_plugin().meta_serialize(
                 instance_meta)
 
@@ -897,31 +900,112 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             if server is not None:
                 self.resource_id_set(server.id)
 
+        assert server is not None
         return server.id
 
     def check_create_complete(self, server_id):
         check = self.client_plugin()._check_active(server_id)
         if check:
+            if self.properties[self.TAGS]:
+                self._update_server_tags(self.properties[self.TAGS])
             self.store_external_ports()
-            # Addresses binds to server not immediately, so we need to wait
-            # until server is created and after that associate floating ip.
-            self.floating_ips_nova_associate()
         return check
 
-    def floating_ips_nova_associate(self):
-        # If there is no neutron used, floating_ip still unassociated,
-        # so need associate it with nova.
-        if not self.is_using_neutron():
-            for net in self.properties.get(self.NETWORKS) or []:
-                if net.get(self.NETWORK_FLOATING_IP):
-                    self._floating_ip_nova_associate(
-                        net.get(self.NETWORK_FLOATING_IP))
+    def _update_server_tags(self, tags):
+        server = self.client().servers.get(self.resource_id)
+        self.client().servers.set_tags(server, tags)
 
     def handle_check(self):
         server = self.client().servers.get(self.resource_id)
         status = self.client_plugin().get_status(server)
         checks = [{'attr': 'status', 'expected': 'ACTIVE', 'current': status}]
         self._verify_check_conditions(checks)
+
+    def get_live_resource_data(self):
+        try:
+            server = self.client().servers.get(self.resource_id)
+            server_data = server.to_dict()
+            active = self.client_plugin()._check_active(server)
+            if not active:
+                # There is no difference what error raised, because update
+                # method of resource just silently log it as warning.
+                raise exception.Error(_('Server %s is not '
+                                        'in ACTIVE state') % self.name)
+        except Exception as ex:
+            if self.client_plugin().is_not_found(ex):
+                raise exception.EntityNotFound(entity='Resource',
+                                               name=self.name)
+            raise
+
+        if self.client_plugin().is_version_supported(MICROVERSION_TAGS):
+            tag_server = self.client().servers.get(self.resource_id)
+            server_data['tags'] = tag_server.tag_list()
+        return server, server_data
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        server, server_data = resource_data
+        flavor = server_data.get(self.FLAVOR)
+        # NOTE(pas-ha) since compute API 2.47 flavor in instance
+        # does not have "id" but "original_name" instead,
+        # check for both here, and fail if none of them are in flavor.
+        if "id" in flavor:
+            flavor_value = flavor["id"]
+        elif "original_name" in flavor:
+            flavor_value = flavor["original_name"]
+        else:
+            raise KeyError("Flavor does not contain id or original_name")
+        result = {
+            # there's a risk that flavor id will be int type, so cast to str
+            self.FLAVOR: str(flavor_value),
+            self.IMAGE: str(server_data.get(self.IMAGE)['id']),
+            self.NAME: server_data.get(self.NAME),
+            self.METADATA: server_data.get(self.METADATA),
+            self.NETWORKS: self._get_live_networks(server, resource_properties)
+        }
+        if 'tags' in server_data:
+            result.update({self.TAGS: server_data['tags']})
+        return result
+
+    def _get_live_networks(self, server, props):
+        reality_nets = self._get_server_addresses(server,
+                                                  extend_networks=False)
+        reality_net_ids = {}
+        client_plugin = self.client_plugin('neutron')
+        for net_key in reality_nets:
+            try:
+                net_id = client_plugin.find_resourceid_by_name_or_id(
+                    client_plugin.RES_TYPE_NETWORK,
+                    net_key)
+            except Exception as ex:
+                if (client_plugin.is_not_found(ex) or
+                        client_plugin.is_no_unique(ex)):
+                    net_id = None
+                else:
+                    raise
+            if net_id:
+                reality_net_ids[net_id] = reality_nets.get(net_key)
+
+        resource_nets = props.get(self.NETWORKS)
+
+        result_nets = []
+        for net in resource_nets or []:
+            net_id = self._get_network_id(net)
+            if reality_net_ids.get(net_id):
+                for idx, address in enumerate(reality_net_ids.get(net_id)):
+                    if address['addr'] == net[self.NETWORK_FIXED_IP]:
+                        result_nets.append(net)
+                        reality_net_ids.get(net_id).pop(idx)
+                        break
+
+        for key, value in reality_nets.items():
+            for address in reality_nets[key]:
+                new_net = {self.NETWORK_ID: key,
+                           self.NETWORK_FIXED_IP: address['addr']}
+                if address['port'] not in [port['id']
+                                           for port in self._data_get_ports()]:
+                    new_net.update({self.NETWORK_PORT: address['port']})
+                result_nets.append(new_net)
+        return result_nets
 
     @classmethod
     def _build_block_device_mapping(cls, bdm):
@@ -995,6 +1079,22 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                     'volume_size': mapping.get(
                         cls.BLOCK_DEVICE_MAPPING_SWAP_SIZE),
                 }
+            elif (mapping.get(cls.BLOCK_DEVICE_MAPPING_EPHEMERAL_SIZE) or
+                  mapping.get(cls.BLOCK_DEVICE_MAPPING_EPHEMERAL_FORMAT)):
+                bmd_dict = {
+                    'source_type': 'blank',
+                    'destination_type': 'local',
+                    'boot_index': -1,
+                    'delete_on_termination': True
+                }
+                ephemeral_size = mapping.get(
+                    cls.BLOCK_DEVICE_MAPPING_EPHEMERAL_SIZE)
+                if ephemeral_size:
+                    bmd_dict.update({'volume_size': ephemeral_size})
+                ephemeral_format = mapping.get(
+                    cls.BLOCK_DEVICE_MAPPING_EPHEMERAL_FORMAT)
+                if ephemeral_format:
+                    bmd_dict.update({'guest_format': ephemeral_format})
 
             # NOTE(prazumovsky): In case of server doesn't take empty value of
             # device name, need to escape from such situation.
@@ -1017,21 +1117,80 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
 
         return bdm_v2_list
 
-    def _add_port_for_address(self, server):
-        """Method adds port id to list of addresses.
+    def _get_subnets_attr(self, fixed_ips):
+        subnets = []
+        try:
+            for fixed_ip in fixed_ips:
+                if fixed_ip.get('subnet_id'):
+                    subnets.append(self.client('neutron').show_subnet(
+                        fixed_ip['subnet_id'])['subnet'])
+        except Exception as ex:
+            LOG.warning("Failed to fetch resource attributes: %s", ex)
+            return
+        return subnets
+
+    def _get_network_attr(self, network_id):
+        try:
+            return self.client('neutron').show_network(network_id)['network']
+        except Exception as ex:
+            LOG.warning("Failed to fetch resource attributes: %s", ex)
+            return
+
+    def _get_server_addresses(self, server, extend_networks=True):
+        """Adds port id, subnets and network attributes to addresses list.
 
         This method is used only for resolving attributes.
+        :param server: The server resource
+        :param extend_networks: When False the network is not extended, i.e
+                                the net is returned without replacing name on
+                                id.
         """
-        nets = copy.deepcopy(server.addresses)
-        ifaces = server.interface_list()
-        ip_mac_mapping_on_port_id = dict(((iface.fixed_ips[0]['ip_address'],
-                                           iface.mac_addr), iface.port_id)
-                                         for iface in ifaces)
-        for net_name in nets:
-            for addr in nets[net_name]:
-                addr['port'] = ip_mac_mapping_on_port_id.get(
-                    (addr['addr'], addr['OS-EXT-IPS-MAC:mac_addr']))
-        return self._extend_networks(nets)
+        nets = {}
+        ifaces = self.client('neutron').list_ports(device_id=server.id)
+        for port in ifaces['ports']:
+            net_label = self.client('neutron').list_networks(
+                id=port['network_id'])['networks'][0]['name']
+            net = nets.setdefault(net_label, [])
+            for fixed_ip in port['fixed_ips']:
+                addr = {'addr': fixed_ip.get('ip_address'),
+                        'OS-EXT-IPS-MAC:mac_addr': port['mac_address'],
+                        'OS-EXT-IPS:type': 'fixed',
+                        'port': port['id']}
+
+                try:
+                    addr['version'] = ipaddress.ip_address(
+                        addr['addr']).version,
+                except ValueError:
+                    addr['version'] = None
+
+                if addr['addr']:
+                    fips = self.client('neutron').list_floatingips(
+                        fixed_ip_address=addr['addr'])
+                    for fip in fips['floatingips']:
+                        net.append({
+                            'addr': fip['floating_ip_address'],
+                            'version': addr['version'],
+                            'OS-EXT-IPS-MAC:mac_addr': port['mac_address'],
+                            'OS-EXT-IPS:type': 'floating',
+                            'port': None})
+
+                # _get_live_networks() uses this method to get reality_nets.
+                # We don't need to get subnets and network in that case. Only
+                # do the external calls if extend_networks is true, i.e called
+                # from _resolve_attribute()
+                if not extend_networks:
+                    net.append(addr)
+                    continue
+
+                addr['subnets'] = self._get_subnets_attr(port['fixed_ips'])
+                addr['network'] = self._get_network_attr(port['network_id'])
+
+                net.append(addr)
+
+        if extend_networks:
+            return self._extend_networks(nets)
+        else:
+            return nets
 
     def _extend_networks(self, networks):
         """Method adds same networks with replaced name on network id.
@@ -1039,20 +1198,30 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         This method is used only for resolving attributes.
         """
         nets = copy.deepcopy(networks)
+        client_plugin = self.client_plugin('neutron')
         for key in list(nets.keys()):
             try:
-                net_id = self.client_plugin().get_net_id_by_label(key)
-            except (exception.EntityNotFound,
-                    exception.PhysicalResourceNameAmbiguity):
-                net_id = None
+                net_id = client_plugin.find_resourceid_by_name_or_id(
+                    client_plugin.RES_TYPE_NETWORK,
+                    key)
+            except Exception as ex:
+                if (client_plugin.is_not_found(ex) or
+                        client_plugin.is_no_unique(ex)):
+                    net_id = None
+                else:
+                    raise
             if net_id:
                 nets[net_id] = nets[key]
         return nets
 
     def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
         if name == self.FIRST_ADDRESS:
             return self.client_plugin().server_to_ipaddress(
                 self.resource_id) or ''
+        if name == self.OS_COLLECT_CONFIG:
+            return self.metadata_get().get('os-collect-config', {})
         if name == self.NAME_ATTR:
             return self._server_name()
         try:
@@ -1061,7 +1230,7 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             self.client_plugin().ignore_not_found(e)
             return ''
         if name == self.ADDRESSES:
-            return self._add_port_for_address(server)
+            return self._get_server_addresses(server)
         if name == self.NETWORKS_ATTR:
             return self._extend_networks(server.networks)
         if name == self.INSTANCE_NAME:
@@ -1072,6 +1241,10 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             return server.accessIPv6
         if name == self.CONSOLE_URLS:
             return self.client_plugin('nova').get_console_urls(server)
+        if name == self.TAGS_ATTR:
+            if self.client_plugin().is_version_supported(MICROVERSION_TAGS):
+                return self.client().servers.tag_list(server)
+            return None
 
     def add_dependencies(self, deps):
         super(Server, self).add_dependencies(deps)
@@ -1080,12 +1253,22 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         # It is not known which subnet a server might be assigned
         # to so all subnets in a network should be created before
         # the servers in that network.
-        nets = self.properties[self.NETWORKS]
+        try:
+            nets = self.properties[self.NETWORKS]
+        except (ValueError, TypeError):
+            # Properties errors will be caught later in validation,
+            # where we can report them in their proper context.
+            return
         if not nets:
             return
-        for res in six.itervalues(self.stack):
+        for res in self.stack.values():
             if res.has_interface('OS::Neutron::Subnet'):
-                subnet_net = res.properties.get(subnet.Subnet.NETWORK)
+                try:
+                    subnet_net = res.properties.get(subnet.Subnet.NETWORK)
+                except (ValueError, TypeError):
+                    # Properties errors will be caught later in validation,
+                    # where we can report them in their proper context.
+                    continue
                 # Be wary of the case where we do not know a subnet's
                 # network. If that's the case, be safe and add it as a
                 # dependency.
@@ -1107,8 +1290,8 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                         deps += (self, res)
                         break
 
-    def _update_flavor(self, prop_diff):
-        flavor = prop_diff[self.FLAVOR]
+    def _update_flavor(self, after_props):
+        flavor = after_props[self.FLAVOR]
         handler_args = checker_args = {'args': (flavor,)}
         prg_resize = progress.ServerUpdateProgress(self.resource_id,
                                                    'resize',
@@ -1118,28 +1301,42 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                                                    'verify_resize')
         return prg_resize, prg_verify
 
-    def _update_image(self, prop_diff):
-        image_update_policy = (
-            prop_diff.get(self.IMAGE_UPDATE_POLICY) or
-            self.properties[self.IMAGE_UPDATE_POLICY])
-        image = prop_diff[self.IMAGE]
+    def _update_image(self, after_props):
+        image_update_policy = after_props[self.IMAGE_UPDATE_POLICY]
+
+        instance_meta = after_props[self.METADATA]
+        if instance_meta is not None:
+            instance_meta = self.client_plugin().meta_serialize(
+                instance_meta)
+        personality_files = after_props[self.PERSONALITY]
+
+        image = after_props[self.IMAGE]
         preserve_ephemeral = (
             image_update_policy == 'REBUILD_PRESERVE_EPHEMERAL')
-        password = (prop_diff.get(self.ADMIN_PASS) or
-                    self.properties[self.ADMIN_PASS])
+        password = after_props[self.ADMIN_PASS]
         kwargs = {'password': password,
-                  'preserve_ephemeral': preserve_ephemeral}
+                  'preserve_ephemeral': preserve_ephemeral,
+                  'meta': instance_meta,
+                  'files': personality_files}
         prg = progress.ServerUpdateProgress(self.resource_id,
                                             'rebuild',
                                             handler_extra={'args': (image,),
                                                            'kwargs': kwargs})
         return prg
 
-    def _update_networks(self, server, prop_diff):
+    def _update_user_data_rebuild(self, after_props):
+        user_data = after_props[self.USER_DATA]
+        prg = progress.ServerUpdateProgress(
+            self.resource_id,
+            'rebuild',
+            handler_extra={'args': (user_data,)})
+        return prg
+
+    def _update_networks(self, server, after_props):
         updaters = []
-        new_networks = prop_diff.get(self.NETWORKS)
+        new_networks = after_props[self.NETWORKS]
         old_networks = self.properties[self.NETWORKS]
-        security_groups = self.properties[self.SECURITY_GROUPS]
+        security_groups = after_props[self.SECURITY_GROUPS]
 
         if not server:
             server = self.client().servers.get(self.resource_id)
@@ -1151,16 +1348,16 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             updaters.append(
                 progress.ServerUpdateProgress(
                     self.resource_id, 'interface_detach',
-                    complete=True,
-                    handler_extra={'args': (port,)})
+                    handler_extra={'args': (port,)},
+                    checker_extra={'args': (port,)})
             )
 
         for args in add_nets:
             updaters.append(
                 progress.ServerUpdateProgress(
                     self.resource_id, 'interface_attach',
-                    complete=True,
-                    handler_extra={'kwargs': args})
+                    handler_extra={'kwargs': args},
+                    checker_extra={'args': (args['port_id'],)})
             )
 
         return updaters
@@ -1188,84 +1385,61 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                 before_props.get(self.USER_DATA_UPDATE_POLICY))
             return ud_update_policy == 'REPLACE'
 
-    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        if tmpl_diff.metadata_changed():
-            # If SOFTWARE_CONFIG user_data_format is enabled we require
-            # the "deployments" and "os-collect-config" keys for Deployment
-            # polling.  We can attempt to merge the occ data, but any
-            # metadata update containing deployments will be discarded.
-            new_md = json_snippet.metadata()
-            if self.user_data_software_config():
-                metadata = self.metadata_get(True) or {}
-                new_occ_md = new_md.get('os-collect-config', {})
-                occ_md = metadata.get('os-collect-config', {})
-                occ_md.update(new_occ_md)
-                new_md['os-collect-config'] = occ_md
-                deployment_md = metadata.get('deployments', [])
-                new_md['deployments'] = deployment_md
-            self.metadata_set(new_md)
+    def needs_replace_failed(self):
+        if not self.resource_id:
+            return True
 
-        updaters = []
+        with self.client_plugin().ignore_not_found:
+            server = self.client().servers.get(self.resource_id)
+            return server.status in ('ERROR', 'DELETED', 'SOFT_DELETED')
+
+        return True
+
+    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
+        updaters = super(Server, self).handle_update(
+            json_snippet,
+            tmpl_diff,
+            prop_diff)
         server = None
 
+        after_props = json_snippet.properties(self.properties_schema,
+                                              self.context)
         if self.METADATA in prop_diff:
             server = self.client_plugin().get_server(self.resource_id)
             self.client_plugin().meta_update(server,
-                                             prop_diff[self.METADATA])
+                                             after_props[self.METADATA])
 
-        if self.FLAVOR in prop_diff:
-            updaters.extend(self._update_flavor(prop_diff))
-
-        if self.IMAGE in prop_diff:
-            updaters.append(self._update_image(prop_diff))
-        elif self.ADMIN_PASS in prop_diff:
-            if not server:
-                server = self.client_plugin().get_server(self.resource_id)
-            server.change_password(prop_diff[self.ADMIN_PASS])
+        if self.TAGS in prop_diff:
+            self._update_server_tags(after_props[self.TAGS] or [])
 
         if self.NAME in prop_diff:
             if not server:
                 server = self.client_plugin().get_server(self.resource_id)
-            self.client_plugin().rename(server, prop_diff[self.NAME])
+            self.client_plugin().rename(server, after_props[self.NAME])
 
         if self.NETWORKS in prop_diff:
-            updaters.extend(self._update_networks(server, prop_diff))
+            updaters.extend(self._update_networks(server, after_props))
 
-        if self.SOFTWARE_CONFIG_TRANSPORT in prop_diff:
-            self._update_software_config_transport(prop_diff)
+        if self.FLAVOR in prop_diff:
+            updaters.extend(self._update_flavor(after_props))
+
+        if self.USER_DATA in prop_diff:
+            # We only care about rebuild here. The standard replace is
+            # dealt elsewere
+            if after_props[self.USER_DATA_UPDATE_POLICY] == 'REBUILD':
+                updaters.append(self._update_user_data_rebuild(after_props))
+
+        if self.IMAGE in prop_diff:
+            updaters.append(self._update_image(after_props))
+        elif self.ADMIN_PASS in prop_diff:
+            if not server:
+                server = self.client_plugin().get_server(self.resource_id)
+            server.change_password(after_props[self.ADMIN_PASS])
 
         # NOTE(pas-ha) optimization is possible (starting first task
         # right away), but we'd rather not, as this method already might
         # have called several APIs
         return updaters
-
-    def _update_software_config_transport(self, prop_diff):
-        if not self.user_data_software_config():
-            return
-        try:
-            metadata = self.metadata_get(True) or {}
-            self._create_transport_credentials(prop_diff)
-            self._populate_deployments_metadata(metadata, prop_diff)
-            # push new metadata to all sources by creating a dummy
-            # deployment
-            sc = self.rpc_client().create_software_config(
-                self.context, 'ignored', 'ignored', '')
-            sd = self.rpc_client().create_software_deployment(
-                self.context, self.resource_id, sc['id'])
-            self.rpc_client().delete_software_deployment(
-                self.context, sd['id'])
-            self.rpc_client().delete_software_config(
-                self.context, sc['id'])
-        except Exception:
-            # Updating the software config transport is on a best-effort
-            # basis as any raised exception here would result in the resource
-            # going into an ERROR state, which will be replaced on the next
-            # stack update. This is not desirable for a server. The old
-            # transport will continue to work, and the new transport may work
-            # despite exceptions in the above block.
-            LOG.exception(
-                _LE('Error while updating software config transport')
-            )
 
     def check_update_complete(self, updaters):
         """Push all updaters to completion in list order."""
@@ -1285,38 +1459,21 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             self.store_external_ports()
         return status
 
-    def metadata_update(self, new_metadata=None):
-        """Refresh the metadata if new_metadata is None."""
-        if new_metadata is None:
-            # Re-resolve the template metadata and merge it with the
-            # current resource metadata.  This is necessary because the
-            # attributes referenced in the template metadata may change
-            # and the resource itself adds keys to the metadata which
-            # are not specified in the template (e.g the deployments data)
-            meta = self.metadata_get(refresh=True) or {}
-            tmpl_meta = self.t.metadata()
-            meta.update(tmpl_meta)
-            self.metadata_set(meta)
-
-    @staticmethod
-    def _check_maximum(count, maximum, msg):
-        """Check a count against a maximum.
-
-        Unless maximum is -1 which indicates that there is no limit.
-        """
-        if maximum != -1 and count > maximum:
-            raise exception.StackValidationFailed(message=msg)
-
     def _validate_block_device_mapping(self):
 
         # either volume_id or snapshot_id needs to be specified, but not both
         # for block device mapping.
         bdm = self.properties[self.BLOCK_DEVICE_MAPPING] or []
-        bootable_vol = False
+        bdm_v2 = self.properties[self.BLOCK_DEVICE_MAPPING_V2] or []
+        image = self.properties[self.IMAGE]
+        if bdm and bdm_v2:
+            raise exception.ResourcePropertyConflict(
+                self.BLOCK_DEVICE_MAPPING, self.BLOCK_DEVICE_MAPPING_V2)
+        bootable = image is not None
         for mapping in bdm:
             device_name = mapping[self.BLOCK_DEVICE_MAPPING_DEVICE_NAME]
             if device_name == 'vda':
-                bootable_vol = True
+                bootable = True
 
             volume_id = mapping.get(self.BLOCK_DEVICE_MAPPING_VOLUME_ID)
             snapshot_id = mapping.get(self.BLOCK_DEVICE_MAPPING_SNAPSHOT_ID)
@@ -1329,36 +1486,53 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                         ' device mapping %s') % device_name
                 raise exception.StackValidationFailed(message=msg)
 
-        bdm_v2 = self.properties[self.BLOCK_DEVICE_MAPPING_V2] or []
-        if bdm and bdm_v2:
-            raise exception.ResourcePropertyConflict(
-                self.BLOCK_DEVICE_MAPPING, self.BLOCK_DEVICE_MAPPING_V2)
-
+        bootable_devs = [image]
         for mapping in bdm_v2:
             volume_id = mapping.get(self.BLOCK_DEVICE_MAPPING_VOLUME_ID)
             snapshot_id = mapping.get(self.BLOCK_DEVICE_MAPPING_SNAPSHOT_ID)
             image_id = mapping.get(self.BLOCK_DEVICE_MAPPING_IMAGE)
+            boot_index = mapping.get(self.BLOCK_DEVICE_MAPPING_BOOT_INDEX)
             swap_size = mapping.get(self.BLOCK_DEVICE_MAPPING_SWAP_SIZE)
+            ephemeral = (mapping.get(
+                self.BLOCK_DEVICE_MAPPING_EPHEMERAL_SIZE) or mapping.get(
+                self.BLOCK_DEVICE_MAPPING_EPHEMERAL_FORMAT))
 
-            property_tuple = (volume_id, snapshot_id, image_id, swap_size)
+            property_tuple = (volume_id, snapshot_id, image_id, swap_size,
+                              ephemeral)
 
-            if property_tuple.count(None) < 3:
+            if property_tuple.count(None) < 4:
                 raise exception.ResourcePropertyConflict(
                     self.BLOCK_DEVICE_MAPPING_VOLUME_ID,
                     self.BLOCK_DEVICE_MAPPING_SNAPSHOT_ID,
                     self.BLOCK_DEVICE_MAPPING_IMAGE,
-                    self.BLOCK_DEVICE_MAPPING_SWAP_SIZE)
+                    self.BLOCK_DEVICE_MAPPING_SWAP_SIZE,
+                    self.BLOCK_DEVICE_MAPPING_EPHEMERAL_SIZE,
+                    self.BLOCK_DEVICE_MAPPING_EPHEMERAL_FORMAT
+                )
 
-            if property_tuple.count(None) == 4:
-                msg = _('Either volume_id, snapshot_id, image_id or '
-                        'swap_size must be specified.')
+            if property_tuple.count(None) == 5:
+                msg = _('Either volume_id, snapshot_id, image_id, swap_size, '
+                        'ephemeral_size or ephemeral_format must be '
+                        'specified.')
                 raise exception.StackValidationFailed(message=msg)
 
             if any((volume_id is not None, snapshot_id is not None,
                     image_id is not None)):
-                bootable_vol = True
-
-        return bootable_vol
+                # boot_index is not specified, set boot_index=0 when
+                # build_block_device_mapping for volume, snapshot, image
+                if boot_index is None or boot_index == 0:
+                    bootable = True
+                    bootable_devs.append(volume_id)
+                    bootable_devs.append(snapshot_id)
+                    bootable_devs.append(image_id)
+        if not bootable:
+            msg = _('Neither image nor bootable volume is specified for '
+                    'instance %s') % self.name
+            raise exception.StackValidationFailed(message=msg)
+        if bdm_v2 and len(list(
+                dev for dev in bootable_devs if dev is not None)) != 1:
+            msg = _('Multiple bootable sources for instance %s.') % self.name
+            raise exception.StackValidationFailed(message=msg)
 
     def _validate_image_flavor(self, image, flavor):
         try:
@@ -1372,10 +1546,10 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                 return
             raise
         else:
-            if image_obj.status.lower() != self.IMAGE_STATUS_ACTIVE:
+            if image_obj.status.lower() != self.IMAGE_ACTIVE:
                 msg = _('Image status is required to be %(cstatus)s not '
                         '%(wstatus)s.') % {
-                    'cstatus': self.IMAGE_STATUS_ACTIVE,
+                    'cstatus': self.IMAGE_ACTIVE,
                     'wstatus': image_obj.status}
                 raise exception.StackValidationFailed(message=msg)
 
@@ -1406,46 +1580,77 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                         'with user_data_format of SOFTWARE_CONFIG')
                 raise exception.StackValidationFailed(message=msg)
 
-        bootable_vol = self._validate_block_device_mapping()
+        self._validate_block_device_mapping()
 
         # make sure the image exists if specified.
         image = self.properties[self.IMAGE]
-        if image is None and not bootable_vol:
-            msg = _('Neither image nor bootable volume is specified for'
-                    ' instance %s') % self.name
-            raise exception.StackValidationFailed(message=msg)
-
         flavor = self.properties[self.FLAVOR]
         if image:
             self._validate_image_flavor(image, flavor)
 
-        # network properties 'uuid' and 'network' shouldn't be used
-        # both at once for all networks
         networks = self.properties[self.NETWORKS] or []
-        # record if any networks include explicit ports
-        networks_with_port = False
         for network in networks:
-            networks_with_port = (networks_with_port or
-                                  network.get(self.NETWORK_PORT) is not None)
             self._validate_network(network)
 
-        # retrieve provider's absolute limits if it will be needed
-        metadata = self.properties[self.METADATA]
-        personality = self.properties[self.PERSONALITY]
-        if metadata is not None or personality:
-            limits = self.client_plugin().absolute_limits()
+        has_str_net = self._str_network(networks) is not None
+        if has_str_net:
+            if len(networks) != 1:
+                msg = _('Property "%s" can not be specified if '
+                        'multiple network interfaces set for '
+                        'server.') % self.ALLOCATE_NETWORK
+                raise exception.StackValidationFailed(message=msg)
+            # Check if str_network is allowed to use
+            if not self.client_plugin().is_version_supported(
+                    MICROVERSION_STR_NETWORK):
+                msg = (_('Cannot use "%s" property - compute service '
+                         'does not support the required api '
+                         'microversion.') % self.ALLOCATE_NETWORK)
+                raise exception.StackValidationFailed(message=msg)
 
+        # record if any networks include explicit ports
+        has_port = any(n[self.NETWORK_PORT] is not None for n in networks)
         # if 'security_groups' present for the server and explicit 'port'
         # in one or more entries in 'networks', raise validation error
-        if networks_with_port and self.properties[self.SECURITY_GROUPS]:
+        if has_port and self.properties[self.SECURITY_GROUPS]:
             raise exception.ResourcePropertyConflict(
                 self.SECURITY_GROUPS,
                 "/".join([self.NETWORKS, self.NETWORK_PORT]))
 
+        # Check if nic tag is allowed to use
+        if self._is_nic_tagged(networks=networks):
+            if not self.client_plugin().is_version_supported(
+                    MICROVERSION_NIC_TAGS):
+                msg = (_('Cannot use "%s" property in networks - '
+                         'nova does not support required '
+                         'api microversion.'), self.NIC_TAG)
+                raise exception.StackValidationFailed(message=msg)
+
+        # Check if tags is allowed to use
+        if self.properties[self.TAGS]:
+            if not self.client_plugin().is_version_supported(
+                    MICROVERSION_TAGS):
+                msg = (_('Cannot use "%s" property - nova does not support '
+                         'required api microversion.') % self.TAGS)
+                raise exception.StackValidationFailed(message=msg)
+
+        # retrieve provider's absolute limits if it will be needed
+        metadata = self.properties[self.METADATA]
+        personality = self.properties[self.PERSONALITY]
+
+        if personality:
+            if self.client_plugin().is_version_supported(
+                    MICROVERSION_PERSONALITY_REMOVED):
+                msg = (_('Cannot use the personality parameter as nova no '
+                         'longer supports it. Use user_data instead.'))
+                raise exception.StackValidationFailed(message=msg)
+
+        if metadata or personality:
+            limits = self.client_plugin().absolute_limits()
+
         # verify that the number of metadata entries is not greater
         # than the maximum number allowed in the provider's absolute
         # limits
-        if metadata is not None:
+        if metadata:
             msg = _('Instance metadata must not contain greater than %s '
                     'entries.  This is the maximum number allowed by your '
                     'service provider') % limits['maxServerMeta']
@@ -1470,29 +1675,6 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
                                         ) if contents is not None else 0,
                                     limits['maxPersonalitySize'], msg)
 
-    def _delete_temp_url(self):
-        object_name = self.data().get('metadata_object_name')
-        if not object_name:
-            return
-        with self.client_plugin('swift').ignore_not_found:
-            container = self.physical_resource_name()
-            swift = self.client('swift')
-            swift.delete_object(container, object_name)
-            headers = swift.head_container(container)
-            if int(headers['x-container-object-count']) == 0:
-                swift.delete_container(container)
-
-    def _delete_queue(self):
-        queue_id = self.data().get('metadata_queue_id')
-        if not queue_id:
-            return
-        client_plugin = self.client_plugin('zaqar')
-        zaqar = client_plugin.create_for_tenant(
-            self.stack.stack_user_project_id, self._user_token())
-        with client_plugin.ignore_not_found:
-            zaqar.queue(queue_id).delete()
-        self.data_delete('metadata_queue_id')
-
     def _delete(self):
         if self.user_data_software_config():
             self._delete_queue()
@@ -1505,8 +1687,6 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
 
         if self.resource_id is None:
             return
-
-        self._floating_ips_disassociate()
 
         try:
             self.client().servers.delete(self.resource_id)
@@ -1531,12 +1711,12 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
     def check_delete_complete(self, prg):
         if not prg:
             return True
-
         if not prg.image_complete:
-            image = self.client().images.get(prg.image_id)
-            if image.status in ('DELETED', 'ERROR'):
+            image = self.client_plugin('glance').get_image(prg.image_id)
+            if image.status.lower() in (self.IMAGE_ERROR,
+                                        self.IMAGE_DELETED):
                 raise exception.Error(image.status)
-            elif image.status == 'ACTIVE':
+            elif image.status.lower() == self.IMAGE_ACTIVE:
                 prg.image_complete = True
                 if not self._delete():
                     return True
@@ -1568,7 +1748,7 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             # if the server has been suspended successful,
             # no need to suspend again
             if self.client_plugin().get_status(server) != 'SUSPENDED':
-                LOG.debug('suspending server %s' % self.resource_id)
+                LOG.debug('suspending server %s', self.resource_id)
                 server.suspend()
             return server.id
 
@@ -1578,9 +1758,9 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         if not server:
             return False
         status = cp.get_status(server)
-        LOG.debug('%(name)s check_suspend_complete status = %(status)s'
-                  % {'name': self.name, 'status': status})
-        if status in list(cp.deferred_server_statuses + ['ACTIVE']):
+        LOG.debug('%(name)s check_suspend_complete status = %(status)s',
+                  {'name': self.name, 'status': status})
+        if status in (cp.deferred_server_statuses | {'ACTIVE'}):
             return status == 'SUSPENDED'
         else:
             exc = exception.ResourceUnknownStatus(
@@ -1611,7 +1791,7 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
             # if the server has been resumed successful,
             # no need to resume again
             if self.client_plugin().get_status(server) != 'ACTIVE':
-                LOG.debug('resuming server %s' % self.resource_id)
+                LOG.debug('resuming server %s', self.resource_id)
                 server.resume()
             return server.id
 
@@ -1625,26 +1805,41 @@ class Server(stack_user.StackUser, sh.SchedulerHintsMixin,
         return image_id
 
     def check_snapshot_complete(self, image_id):
-        image = self.client().images.get(image_id)
-        if image.status == 'ACTIVE':
-            return True
-        elif image.status == 'ERROR' or image.status == 'DELETED':
+        image = self.client_plugin('glance').get_image(image_id)
+        if image.status.lower() == self.IMAGE_ACTIVE:
+            server = self.client_plugin().get_server(self.resource_id)
+            task_state = getattr(server, 'OS-EXT-STS:task_state', '')
+            if task_state not in {'image_uploading', 'image_snapshot_pending',
+                                  'image_snapshot', 'image_pending_upload'}:
+                return True
+        elif image.status.lower() in (self.IMAGE_ERROR, self.IMAGE_DELETED):
             raise exception.Error(image.status)
 
         return False
 
     def handle_delete_snapshot(self, snapshot):
         image_id = snapshot['resource_data'].get('snapshot_image_id')
-        with self.client_plugin().ignore_not_found:
-            self.client().images.delete(image_id)
+        with self.client_plugin('glance').ignore_not_found:
+            self.client('glance').images.delete(image_id)
 
     def handle_restore(self, defn, restore_data):
         image_id = restore_data['resource_data']['snapshot_image_id']
-        props = function.resolve(self.properties.data)
+        props = dict((k, v) for k, v in self.properties.data.items()
+                     if v is not None)
+        for key in [self.BLOCK_DEVICE_MAPPING, self.BLOCK_DEVICE_MAPPING_V2,
+                    self.NETWORKS]:
+            if props.get(key) is not None:
+                props[key] = list(dict((k, v) for k, v in prop.items()
+                                       if v is not None)
+                                  for prop in props[key])
         props[self.IMAGE] = image_id
         return defn.freeze(properties=props)
 
     def prepare_for_replace(self):
+        # if the server has not been created yet, do nothing
+        if self.resource_id is None:
+            return
+
         self.prepare_ports_for_replace()
 
     def restore_prev_rsrc(self, convergence=False):

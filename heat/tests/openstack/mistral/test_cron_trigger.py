@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from heat.common import exception
 from heat.common import template_format
@@ -28,7 +28,7 @@ resources:
     type: OS::Mistral::CronTrigger
     properties:
       name: my_cron_trigger
-      pattern: "* * 0 * *"
+      pattern: "* * 1 * *"
       workflow: {'name': 'get_first_glance_image', 'input': {} }
       count: 3
       first_time: "2015-04-08 06:20"
@@ -76,12 +76,12 @@ class MistralCronTriggerTest(common.HeatTestCase):
         ct = self._create_resource('trigger', self.rsrc_defn, self.stack)
         expected_state = (ct.CREATE, ct.COMPLETE)
         self.assertEqual(expected_state, ct.state)
-        args = self.client.cron_triggers.create.call_args[1]
-        self.assertEqual('* * 0 * *', args['pattern'])
-        self.assertEqual('get_first_glance_image', args['workflow_name'])
-        self.assertEqual({}, args['workflow_input'])
-        self.assertEqual('2015-04-08 06:20', args['first_time'])
-        self.assertEqual(3, args['count'])
+        args, kwargs = self.client.cron_triggers.create.call_args
+        self.assertEqual('* * 1 * *', kwargs['pattern'])
+        self.assertEqual('get_first_glance_image', args[1])
+        self.assertEqual({}, kwargs['workflow_input'])
+        self.assertEqual('2015-04-08 06:20', kwargs['first_time'])
+        self.assertEqual(3, kwargs['count'])
         self.assertEqual('my_cron_trigger', ct.resource_id)
 
     def test_attributes(self):
@@ -101,8 +101,8 @@ class MistralCronTriggerTest(common.HeatTestCase):
         ct = self._create_resource('trigger', self.rsrc_defn, self.stack)
         msg = ("At least one of the following properties must be specified: "
                "pattern, first_time")
-        self.assertRaisesRegexp(exception.PropertyUnspecifiedError, msg,
-                                ct.validate)
+        self.assertRaisesRegex(exception.PropertyUnspecifiedError, msg,
+                               ct.validate)
 
     def test_validate_ok_without_first_time(self):
         t = template_format.parse(stack_template)

@@ -16,7 +16,6 @@ from oslo_log import log as logging
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.engine import resource
 
 LOG = logging.getLogger(__name__)
@@ -27,9 +26,6 @@ class StackUser(resource.Resource):
     # Subclasses create a user, and optionally keypair associated with a
     # resource in a stack. Users are created in the heat stack user domain
     # (in a project specific to the stack)
-    def __init__(self, name, json_snippet, stack):
-        super(StackUser, self).__init__(name, json_snippet, stack)
-
     def handle_create(self):
         self._create_user()
 
@@ -96,7 +92,7 @@ class StackUser(resource.Resource):
             # compatibility with resources created before the migration
             # to stack_user.StackUser domain users.  After an appropriate
             # transitional period, this should be removed.
-            LOG.warning(_LW('Reverting to legacy user delete path'))
+            LOG.warning('Reverting to legacy user delete path')
             try:
                 self.keystone().delete_stack_user(user_id)
             except kc_exception.NotFound:
@@ -168,3 +164,15 @@ class StackUser(resource.Resource):
 
         for data_key in ('access_key', 'secret_key', 'credential_id'):
             self.data_delete(data_key)
+
+    def _register_access_key(self):
+        """Access is limited to this resource, which created the keypair."""
+        def access_allowed(resource_name):
+            return resource_name == self.name
+
+        if self.access_key is not None:
+            self.stack.register_access_allowed_handler(
+                self.access_key, access_allowed)
+        if self._get_user_id() is not None:
+            self.stack.register_access_allowed_handler(
+                self._get_user_id(), access_allowed)

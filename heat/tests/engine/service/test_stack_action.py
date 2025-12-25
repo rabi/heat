@@ -10,7 +10,8 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
+
 from oslo_messaging.rpc import dispatcher
 
 from heat.common import exception
@@ -30,7 +31,11 @@ class StackServiceActionsTest(common.HeatTestCase):
         super(StackServiceActionsTest, self).setUp()
         self.ctx = utils.dummy_context()
         self.man = service.EngineService('a-host', 'a-topic')
-        self.man.create_periodic_tasks()
+        self.man.thread_group_mgr = service.ThreadGroupManager()
+
+    def tearDown(self):
+        self.man.thread_group_mgr.stopall()
+        super(StackServiceActionsTest, self).tearDown()
 
     @mock.patch.object(stack.Stack, 'load')
     @mock.patch.object(service.ThreadGroupManager, 'start')
@@ -44,12 +49,14 @@ class StackServiceActionsTest(common.HeatTestCase):
         thread = mock.MagicMock()
         mock_link = self.patchobject(thread, 'link')
         mock_start.return_value = thread
+        self.patchobject(service, 'NotifyEvent')
 
         result = self.man.stack_suspend(self.ctx, stk.identifier())
         self.assertIsNone(result)
         mock_load.assert_called_once_with(self.ctx, stack=s)
         mock_link.assert_called_once_with(mock.ANY)
-        mock_start.assert_called_once_with(stk.id, mock.ANY, stk)
+        mock_start.assert_called_once_with(stk.id, stk.suspend,
+                                           notify=mock.ANY)
 
         stk.delete()
 
@@ -64,13 +71,14 @@ class StackServiceActionsTest(common.HeatTestCase):
         thread = mock.MagicMock()
         mock_link = self.patchobject(thread, 'link')
         mock_start.return_value = thread
+        self.patchobject(service, 'NotifyEvent')
 
         result = self.man.stack_resume(self.ctx, stk.identifier())
         self.assertIsNone(result)
 
         mock_load.assert_called_once_with(self.ctx, stack=mock.ANY)
         mock_link.assert_called_once_with(mock.ANY)
-        mock_start.assert_called_once_with(stk.id, mock.ANY, stk)
+        mock_start.assert_called_once_with(stk.id, stk.resume, notify=mock.ANY)
 
         stk.delete()
 
@@ -108,6 +116,7 @@ class StackServiceActionsTest(common.HeatTestCase):
         stk = utils.parse_stack(t, stack_name=stack_name)
 
         stk.check = mock.Mock()
+        self.patchobject(service, 'NotifyEvent')
         mock_load.return_value = stk
         mock_start.side_effect = self._mock_thread_start
 
@@ -154,6 +163,7 @@ class StackServiceUpdateActionsNotSupportedTest(common.HeatTestCase):
                                self.ctx, old_stack.identifier(), template,
                                params, None, {})
         self.assertEqual(exception.NotSupported, ex.exc_info[0])
-        mock_load.assert_called_once_with(self.ctx, stack=s)
+        mock_load.assert_called_once_with(self.ctx, stack=s,
+                                          check_refresh_cred=True)
 
         old_stack.delete()

@@ -14,10 +14,11 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from unittest import mock
+
 from neutronclient.common import exceptions as qe
 from neutronclient.neutron import v2_0 as neutronV20
 from neutronclient.v2_0 import client as neutronclient
-import six
 
 from heat.common import exception
 from heat.common import template_format
@@ -83,27 +84,13 @@ sng = {
 class NeutronNetworkGatewayTest(common.HeatTestCase):
     def setUp(self):
         super(NeutronNetworkGatewayTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client, 'create_network_gateway')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_network_gateway')
-        self.m.StubOutWithMock(neutronclient.Client, 'delete_network_gateway')
-        self.m.StubOutWithMock(neutronclient.Client, 'connect_network_gateway')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_network_gateway')
-        self.m.StubOutWithMock(neutronclient.Client,
-                               'disconnect_network_gateway')
-        self.m.StubOutWithMock(neutronclient.Client, 'list_networks')
-        self.m.StubOutWithMock(timeutils, 'retry_backoff_delay')
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
         self.patchobject(neutronV20, 'find_resourceid_by_name_or_id',
                          return_value='6af055d3-26f6-48dd-a597-7611d7e58d35')
 
     def mock_create_fail_network_not_found_delete_success(self):
-        neutronclient.Client.create_network_gateway({
-            'network_gateway': {
-                'name': u'NetworkGateway',
-                'devices': [{'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                             'interface_name': u'breth1'}]
-            }
-        }
-        ).AndReturn({
+        self.mockclient.create_network_gateway.return_value = {
             'network_gateway': {
                 'id': 'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
                 'name': 'NetworkGateway',
@@ -114,21 +101,13 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
                     'interface_name': 'breth1'}]
             }
         }
-        )
-        neutronclient.Client.disconnect_network_gateway(
-            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 10,
-                'segmentation_type': u'vlan'
-            }
-        ).AndReturn(None)
+        self.mockclient.connect_network_gateway.side_effect = (
+            qe.NeutronClientException)
+        self.mockclient.disconnect_network_gateway.return_value = None
         # mock successful to delete the network_gateway
-        neutronclient.Client.delete_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndReturn(None)
-        neutronclient.Client.show_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndRaise(qe.NeutronClientException(status_code=404))
+        self.mockclient.delete_network_gateway.return_value = None
+        self.mockclient.show_network_gateway.side_effect = (
+            qe.NeutronClientException(status_code=404))
 
         t = template_format.parse(gw_template)
 
@@ -140,14 +119,7 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
         return rsrc
 
     def prepare_create_network_gateway(self, resolve_neutron=True):
-        neutronclient.Client.create_network_gateway({
-            'network_gateway': {
-                'name': u'NetworkGateway',
-                'devices': [{'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                             'interface_name': u'breth1'}]
-            }
-        }
-        ).AndReturn({
+        self.mockclient.create_network_gateway.return_value = {
             'network_gateway': {
                 'id': 'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
                 'name': 'NetworkGateway',
@@ -158,20 +130,13 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
                     'interface_name': 'breth1'}]
             }
         }
-        )
-        neutronclient.Client.connect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 10,
-                'segmentation_type': u'vlan'
-            }
-        ).AndReturn({
+        self.mockclient.connect_network_gateway.return_value = {
             'connection_info': {
-                'network_gateway_id': u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'port_id': u'32acc49c-899e-44ea-8177-6f4157e12eb4'
+                'network_gateway_id': 'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'port_id': '32acc49c-899e-44ea-8177-6f4157e12eb4'
             }
-        })
+        }
         self.stub_NetworkConstraint_validate()
         if resolve_neutron:
             t = template_format.parse(gw_template)
@@ -187,52 +152,21 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
 
     def _test_network_gateway_create(self, resolve_neutron=True):
         rsrc = self.prepare_create_network_gateway(resolve_neutron)
-        neutronclient.Client.disconnect_network_gateway(
-            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 10,
-                'segmentation_type': u'vlan'
-            }
-        ).AndReturn(None)
-
-        neutronclient.Client.disconnect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 10,
-                'segmentation_type': u'vlan'
-            }
-        ).AndReturn(qe.NeutronClientException(status_code=404))
-
-        neutronclient.Client.delete_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndReturn(None)
-
-        neutronclient.Client.show_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndReturn(sng)
-
-        timeutils.retry_backoff_delay(1, jitter_max=2.0).AndReturn(0.01)
-        neutronclient.Client.delete_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndReturn(None)
-
-        neutronclient.Client.show_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndRaise(qe.NeutronClientException(status_code=404))
-
-        neutronclient.Client.disconnect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 10,
-                'segmentation_type': u'vlan'
-            }
-        ).AndReturn(qe.NeutronClientException(status_code=404))
-
-        neutronclient.Client.delete_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndRaise(qe.NeutronClientException(status_code=404))
-
-        self.m.ReplayAll()
+        self.mockclient.disconnect_network_gateway.side_effect = [
+            None,
+            qe.NeutronClientException(status_code=404),
+            qe.NeutronClientException(status_code=404),
+        ]
+        self.mockclient.delete_network_gateway.side_effect = [
+            None,
+            None,
+            qe.NeutronClientException(status_code=404),
+        ]
+        self.mockclient.show_network_gateway.side_effect = [
+            sng,
+            qe.NeutronClientException(status_code=404),
+        ]
+        self.patchobject(timeutils, 'retry_backoff_delay', return_value=0.01)
 
         rsrc.validate()
         scheduler.TaskRunner(rsrc.create)()
@@ -240,7 +174,7 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
         ref_id = rsrc.FnGetRefId()
-        self.assertEqual(u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', ref_id)
+        self.assertEqual('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', ref_id)
 
         self.assertRaises(
             exception.InvalidTemplateAttribute, rsrc.FnGetAtt, 'Foo')
@@ -250,7 +184,32 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
         rsrc.state_set(rsrc.CREATE, rsrc.COMPLETE, 'to delete again')
         scheduler.TaskRunner(rsrc.delete)()
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_network_gateway.assert_called_once_with({
+            'network_gateway': {
+                'name': 'NetworkGateway',
+                'devices': [{'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                             'interface_name': 'breth1'}]
+            }
+        })
+        self.mockclient.connect_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            })
+        self.mockclient.disconnect_network_gateway.assert_called_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            })
+        self.mockclient.delete_network_gateway.assert_called_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37')
+        self.mockclient.show_network_gateway.assert_called_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37')
+        timeutils.retry_backoff_delay.assert_called_once_with(1,
+                                                              jitter_max=2.0)
 
     def test_network_gateway_create_deprecated(self):
         self._test_network_gateway_create(resolve_neutron=False)
@@ -264,120 +223,102 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
         # without residue network_gateway
         rsrc = self.mock_create_fail_network_not_found_delete_success()
         self.stub_NetworkConstraint_validate()
-        self.m.ReplayAll()
 
         rsrc.validate()
         self.assertRaises(exception.ResourceFailure,
                           scheduler.TaskRunner(rsrc.create))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
         ref_id = rsrc.FnGetRefId()
-        self.assertEqual(u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', ref_id)
+        self.assertEqual('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', ref_id)
 
         self.assertIsNone(scheduler.TaskRunner(rsrc.delete)())
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
-        self.m.VerifyAll()
+
+        self.mockclient.create_network_gateway.assert_called_once_with({
+            'network_gateway': {
+                'name': 'NetworkGateway',
+                'devices': [{'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                             'interface_name': 'breth1'}]
+            }
+        })
+        self.mockclient.connect_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            }
+        )
+        self.mockclient.disconnect_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            }
+        )
+        self.mockclient.delete_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37')
+        self.mockclient.show_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37')
 
     def test_network_gateway_update(self):
         rsrc = self.prepare_create_network_gateway()
-        neutronclient.Client.update_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_gateway': {
-                    'name': u'NetworkGatewayUpdate'
+        self.mockclient.update_network_gateway.return_value = None
+        self.mockclient.disconnect_network_gateway.side_effect = [
+            None,
+            qe.NeutronClientException(status_code=404),
+            None,
+        ]
+        self.mockclient.connect_network_gateway.side_effect = [
+            self.mockclient.connect_network_gateway.return_value,
+            {
+                'connection_info': {
+                    'network_gateway_id':
+                        'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+                    'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'port_id': 'aa800972-f6be-4c65-8453-9ab31834bf80'
                 }
-            }
-        ).AndReturn(None)
+            },
+            {
+                'connection_info': {
+                    'network_gateway_id':
+                        'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+                    'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'port_id': 'aa800972-f6be-4c65-8453-9ab31834bf80'
+                }
+            },
+            {
+                'connection_info': {
+                    'network_gateway_id':
+                        'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+                    'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'port_id': 'aa800972-f6be-4c65-8453-9ab31834bf80'
+                }
+            },
+            {
+                'connection_info': {
+                    'network_gateway_id':
+                        'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+                    'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'port_id': 'aa800972-f6be-4c65-8453-9ab31834bf80'
+                }
+            },
+        ]
+        self.mockclient.delete_network_gateway.return_value = None
 
-        neutronclient.Client.disconnect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 10,
-                'segmentation_type': u'vlan'
-            }
-        ).AndReturn(None)
-
-        neutronclient.Client.connect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 0,
-                'segmentation_type': u'flat'
-            }
-        ).AndReturn({
-            'connection_info': {
-                'network_gateway_id': u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'port_id': u'aa800972-f6be-4c65-8453-9ab31834bf80'
-            }
-        })
-
-        neutronclient.Client.disconnect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 0,
-                'segmentation_type': u'flat'
-            }
-        ).AndRaise(qe.NeutronClientException(status_code=404))
-
-        neutronclient.Client.connect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 1,
-                'segmentation_type': u'flat'
-            }
-        ).AndReturn({
-            'connection_info': {
-                'network_gateway_id': u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'port_id': u'aa800972-f6be-4c65-8453-9ab31834bf80'
-            }
-        })
-
-        neutronclient.Client.disconnect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 1,
-                'segmentation_type': u'flat'
-            }
-        ).AndReturn(None)
-
-        neutronclient.Client.delete_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).AndReturn(None)
-
-        neutronclient.Client.create_network_gateway({
-            'network_gateway': {
-                'name': u'NetworkGatewayUpdate',
-                'devices': [{'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                             'interface_name': u'breth2'}]
-            }
-        }
-        ).AndReturn({
-            'network_gateway': {
-                'id': 'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
-                'name': 'NetworkGateway',
-                'default': False,
-                'tenant_id': '96ba52dc-c5c5-44c6-9a9d-d3ba1a03f77f',
-                'devices': [{
-                    'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                    'interface_name': 'breth2'}]
-            }
-        }
-        )
-
-        neutronclient.Client.connect_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'segmentation_id': 1,
-                'segmentation_type': u'flat'
-            }
-        ).AndReturn({
-            'connection_info': {
-                'network_gateway_id': u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
-                'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                'port_id': u'aa800972-f6be-4c65-8453-9ab31834bf80'
-            }
-        })
-
-        self.m.ReplayAll()
+        self.mockclient.create_network_gateway.side_effect = [
+            self.mockclient.create_network_gateway.return_value,
+            {
+                'network_gateway': {
+                    'id': 'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+                    'name': 'NetworkGateway',
+                    'default': False,
+                    'tenant_id': '96ba52dc-c5c5-44c6-9a9d-d3ba1a03f77f',
+                    'devices': [{
+                        'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                        'interface_name': 'breth2'}]
+                }
+            },
+        ]
 
         rsrc.validate()
         scheduler.TaskRunner(rsrc.create)()
@@ -388,10 +329,10 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
             rsrc.name,
             rsrc.type(),
             {
-                'name': u'NetworkGatewayUpdate',
+                'name': 'NetworkGatewayUpdate',
                 'devices': [{
-                    'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                    'interface_name': u'breth1'}],
+                    'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                    'interface_name': 'breth1'}],
                 'connections': [{
                     'network': '6af055d3-26f6-48dd-a597-7611d7e58d35',
                     'segmentation_type': 'vlan',
@@ -404,13 +345,13 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
             rsrc.name,
             rsrc.type(),
             {
-                'name': u'NetworkGatewayUpdate',
+                'name': 'NetworkGatewayUpdate',
                 'devices': [{
-                    'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                    'interface_name': u'breth1'}],
+                    'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                    'interface_name': 'breth1'}],
                 'connections': [{
-                    'network': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                    'segmentation_type': u'flat',
+                    'network': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'segmentation_type': 'flat',
                     'segmentation_id': 0}]
             })
         scheduler.TaskRunner(rsrc.update, snippet_for_update2,
@@ -421,13 +362,13 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
             rsrc.name,
             rsrc.type(),
             {
-                'name': u'NetworkGatewayUpdate',
+                'name': 'NetworkGatewayUpdate',
                 'devices': [{
-                    'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                    'interface_name': u'breth1'}],
+                    'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                    'interface_name': 'breth1'}],
                 'connections': [{
-                    'network': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                    'segmentation_type': u'flat',
+                    'network': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'segmentation_type': 'flat',
                     'segmentation_id': 1}]
             })
         scheduler.TaskRunner(rsrc.update, snippet_for_update3,
@@ -438,33 +379,87 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
             rsrc.name,
             rsrc.type(),
             {
-                'name': u'NetworkGatewayUpdate',
+                'name': 'NetworkGatewayUpdate',
                 'devices': [{
-                    'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                    'interface_name': u'breth2'}],
+                    'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                    'interface_name': 'breth2'}],
                 'connections': [{
-                    'network_id': u'6af055d3-26f6-48dd-a597-7611d7e58d35',
-                    'segmentation_type': u'vlan',
+                    'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                    'segmentation_type': 'vlan',
                     'segmentation_id': 10}]
             })
         scheduler.TaskRunner(rsrc.update, snippet_for_update4,
                              snippet_for_update3)()
 
-        self.m.VerifyAll()
+        self.mockclient.create_network_gateway.assert_has_calls([
+            mock.call({
+                'network_gateway': {
+                    'name': 'NetworkGateway',
+                    'devices': [{'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                                 'interface_name': 'breth1'}]
+                }
+            }),
+            mock.call({
+                'network_gateway': {
+                    'name': 'NetworkGatewayUpdate',
+                    'devices': [{'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                                 'interface_name': 'breth2'}]
+                }
+            }),
+        ])
+        self.mockclient.connect_network_gateway.assert_has_calls([
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            }),
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 0,
+                'segmentation_type': 'flat'
+            }),
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 1,
+                'segmentation_type': 'flat'
+            }),
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 1,
+                'segmentation_type': 'flat'
+            }),
+        ])
+        self.mockclient.update_network_gateway.assert_has_calls([
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_gateway': {
+                    'name': 'NetworkGatewayUpdate'
+                }
+            }),
+        ])
+        self.mockclient.disconnect_network_gateway.assert_has_calls([
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            }),
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 0,
+                'segmentation_type': 'flat'
+            }),
+            mock.call('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 1,
+                'segmentation_type': 'flat'
+            }),
+        ])
+        self.mockclient.delete_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37')
 
     def test_network_gatway_create_failed(self):
-        neutronclient.Client.create_network_gateway({
-            'network_gateway': {
-                'name': u'NetworkGateway',
-                'devices': [{
-                    'id': u'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
-                    'interface_name': u'breth1'}]
-            }
-        }
-        ).AndRaise(qe.NeutronClientException)
+        self.mockclient.create_network_gateway.side_effect = (
+            qe.NeutronClientException)
         self.stub_NetworkConstraint_validate()
-
-        self.m.ReplayAll()
 
         t = template_format.parse(gw_template)
         stack = utils.parse_stack(t)
@@ -476,12 +471,19 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
         self.assertEqual(
             'NeutronClientException: resources.network_gateway: '
             'An unknown exception occurred.',
-            six.text_type(error))
+            str(error))
         self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
         self.assertIsNone(scheduler.TaskRunner(rsrc.delete)())
         self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
 
-        self.m.VerifyAll()
+        self.mockclient.create_network_gateway.assert_called_once_with({
+            'network_gateway': {
+                'name': 'NetworkGateway',
+                'devices': [{
+                    'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                    'interface_name': 'breth1'}]
+            }
+        })
 
     def test_gateway_validate_failed_with_vlan(self):
         t = template_format.parse(gw_template)
@@ -494,16 +496,12 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
             resource_defns['NetworkGateway'], stack)
         self.stub_NetworkConstraint_validate()
 
-        self.m.ReplayAll()
-
         error = self.assertRaises(exception.StackValidationFailed,
                                   scheduler.TaskRunner(rsrc.validate))
 
         self.assertEqual(
             'segmentation_id must be specified for using vlan',
-            six.text_type(error))
-
-        self.m.VerifyAll()
+            str(error))
 
     def test_gateway_validate_failed_with_flat(self):
         t = template_format.parse(gw_template)
@@ -516,26 +514,19 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
             resource_defns['NetworkGateway'], stack)
         self.stub_NetworkConstraint_validate()
 
-        self.m.ReplayAll()
-
         error = self.assertRaises(exception.StackValidationFailed,
                                   scheduler.TaskRunner(rsrc.validate))
 
         self.assertEqual(
             'segmentation_id cannot be specified except 0 for using flat',
-            six.text_type(error))
-
-        self.m.VerifyAll()
+            str(error))
 
     def test_network_gateway_attribute(self):
-        neutronclient.Client.show_network_gateway(
-            u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37'
-        ).MultipleTimes().AndReturn(sng)
         rsrc = self.prepare_create_network_gateway()
-        self.m.ReplayAll()
+        self.mockclient.show_network_gateway.return_value = sng
 
         scheduler.TaskRunner(rsrc.create)()
-        self.assertEqual(u'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
+        self.assertEqual('ed4c03b9-8251-4c09-acc4-e59ee9e6aa37',
                          rsrc.FnGetRefId())
         self.assertFalse(rsrc.FnGetAtt('default'))
 
@@ -543,6 +534,20 @@ class NeutronNetworkGatewayTest(common.HeatTestCase):
                                   rsrc.FnGetAtt, 'hoge')
         self.assertEqual(
             'The Referenced Attribute (test_network_gateway hoge) is '
-            'incorrect.', six.text_type(error))
+            'incorrect.', str(error))
 
-        self.m.VerifyAll()
+        self.mockclient.create_network_gateway.assert_called_once_with({
+            'network_gateway': {
+                'name': 'NetworkGateway',
+                'devices': [{'id': 'e52148ca-7db9-4ec3-abe6-2c7c0ff316eb',
+                             'interface_name': 'breth1'}]
+            }
+        })
+        self.mockclient.connect_network_gateway.assert_called_once_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37', {
+                'network_id': '6af055d3-26f6-48dd-a597-7611d7e58d35',
+                'segmentation_id': 10,
+                'segmentation_type': 'vlan'
+            })
+        self.mockclient.show_network_gateway.assert_called_with(
+            'ed4c03b9-8251-4c09-acc4-e59ee9e6aa37')

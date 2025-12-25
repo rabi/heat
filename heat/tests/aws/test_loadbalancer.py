@@ -12,13 +12,14 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 from oslo_config import cfg
 
 from heat.common import exception
 from heat.common import template_format
 from heat.engine.clients.os import nova
+from heat.engine import node_data
 from heat.engine.resources.aws.lb import loadbalancer as lb
 from heat.engine import rsrc_defn
 from heat.tests import common
@@ -88,9 +89,8 @@ class LoadBalancerTest(common.HeatTestCase):
         lb_defn = s.t.resource_definitions(s)[resource_name]
         rsrc = lb.LoadBalancer(resource_name, lb_defn, s)
 
-        self.patchobject(nova.NovaClientPlugin, '_create',
+        self.patchobject(nova.NovaClientPlugin, 'client',
                          return_value=self.fc)
-
         initial_md = {'AWS::CloudFormation::Init':
                       {'config':
                        {'files':
@@ -152,8 +152,7 @@ class LoadBalancerTest(common.HeatTestCase):
             rsrc.validate())
 
     def test_loadbalancer_validate_badtemplate(self):
-        cfg.CONF.set_override('loadbalancer_template', '/a/noexist/x.y',
-                              enforce_type=True)
+        cfg.CONF.set_override('loadbalancer_template', '/a/noexist/x.y')
         rsrc = self.setup_loadbalancer()
         self.assertRaises(exception.StackValidationFailed, rsrc.validate)
 
@@ -169,7 +168,7 @@ class LoadBalancerTest(common.HeatTestCase):
         self.stack = utils.parse_stack(template, cache_data=cache_data)
 
         resource_name = 'LoadBalancer'
-        lb_defn = self.stack.t.resource_definitions(self.stack)[resource_name]
+        lb_defn = self.stack.defn.resource_definition(resource_name)
         return lb.LoadBalancer(resource_name, lb_defn, self.stack)
 
     def test_loadbalancer_refid(self):
@@ -177,15 +176,16 @@ class LoadBalancerTest(common.HeatTestCase):
         self.assertEqual('LoadBalancer', rsrc.FnGetRefId())
 
     def test_loadbalancer_refid_convergence_cache_data(self):
-        cache_data = {'LoadBalancer': {
+        cache_data = {'LoadBalancer': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'reference_id': 'LoadBalancer_convg_mock'
-        }}
+        })}
         rsrc = self.setup_loadbalancer(cache_data=cache_data)
-        self.assertEqual('LoadBalancer_convg_mock', rsrc.FnGetRefId())
+        self.assertEqual('LoadBalancer_convg_mock',
+                         self.stack.defn[rsrc.name].FnGetRefId())
 
     def test_loadbalancer_attr_dnsname(self):
         rsrc = self.setup_loadbalancer()

@@ -12,9 +12,9 @@
 #    under the License.
 
 import datetime
+from unittest import mock
+import zoneinfo
 
-import mock
-import pytz
 from testtools import matchers
 
 from heat.engine.clients.os import swift
@@ -27,7 +27,7 @@ class SwiftClientPluginTestCase(common.HeatTestCase):
         super(SwiftClientPluginTestCase, self).setUp()
         self.swift_client = mock.Mock()
         self.context = utils.dummy_context()
-        self.context.tenant = "demo"
+        self.context.project_id = "demo"
         c = self.context.clients
         self.swift_plugin = c.client_plugin('swift')
         self.swift_plugin.client = lambda: self.swift_client
@@ -76,13 +76,13 @@ class SwiftUtilsTest(SwiftClientPluginTestCase):
         url = self.swift_plugin.get_temp_url(container_name, obj_name)
         self.assertFalse(self.swift_client.post_account.called)
         regexp = ("http://fake-host.com:8080/v1/AUTH_demo/%s"
-                  "/%s\?temp_url_sig=[0-9a-f]{40}&"
+                  r"/%s\?temp_url_sig=[0-9a-f]{40,64}&"
                   "temp_url_expires=[0-9]{10}" %
                   (container_name, obj_name))
         self.assertThat(url, matchers.MatchesRegex(regexp))
 
         timeout = int(url.split('=')[-1])
-        self.assertTrue(timeout < swift.MAX_EPOCH)
+        self.assertLess(timeout, swift.MAX_EPOCH)
 
     def test_get_temp_url_no_account_key(self):
         self.swift_client.url = ("http://fake-host.com:8080/v1/"
@@ -119,15 +119,16 @@ class SwiftUtilsTest(SwiftClientPluginTestCase):
         self.assertTrue(self.swift_client.put_container.called)
         self.assertTrue(self.swift_client.put_object.called)
         regexp = ("http://fake-host.com:8080/v1/AUTH_demo/%s"
-                  "/%s\?temp_url_sig=[0-9a-f]{40}&"
+                  r"/%s\?temp_url_sig=[0-9a-f]{40,64}&"
                   "temp_url_expires=[0-9]{10}" %
                   (container_name, obj_name))
         self.assertThat(url, matchers.MatchesRegex(regexp))
 
     def test_parse_last_modified(self):
         self.assertIsNone(self.swift_plugin.parse_last_modified(None))
+        tz = zoneinfo.ZoneInfo('GMT')
         now = datetime.datetime(
-            2015, 2, 5, 1, 4, 40, 0, pytz.timezone('GMT'))
+            2015, 2, 5, 1, 4, 40, 0, tz)
         now_naive = datetime.datetime(
             2015, 2, 5, 1, 4, 40, 0)
         last_modified = now.strftime('%a, %d %b %Y %H:%M:%S %Z')

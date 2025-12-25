@@ -13,10 +13,9 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import eventlet
 from oslo_config import cfg
 import oslo_messaging
-from oslo_serialization import jsonutils
+from oslo_messaging.rpc import dispatcher
 from osprofiler import profiler
 
 from heat.common import context
@@ -25,12 +24,6 @@ from heat.common import context
 TRANSPORT = None
 NOTIFICATIONS_TRANSPORT = None
 NOTIFIER = None
-
-_ALIASES = {
-    'heat.openstack.common.rpc.impl_kombu': 'rabbit',
-    'heat.openstack.common.rpc.impl_qpid': 'qpid',
-    'heat.openstack.common.rpc.impl_zmq': 'zmq',
-}
 
 
 class RequestContextSerializer(oslo_messaging.Serializer):
@@ -68,20 +61,14 @@ class RequestContextSerializer(oslo_messaging.Serializer):
         return context.RequestContext.from_dict(ctxt)
 
 
-class JsonPayloadSerializer(oslo_messaging.NoOpSerializer):
-    @classmethod
-    def serialize_entity(cls, context, entity):
-        return jsonutils.to_primitive(entity, convert_instances=True)
-
-
 def get_specific_transport(url, optional, exmods, is_for_notifications=False):
     try:
         if is_for_notifications:
             return oslo_messaging.get_notification_transport(
-                cfg.CONF, url, allowed_remote_exmods=exmods, aliases=_ALIASES)
+                cfg.CONF, url, allowed_remote_exmods=exmods)
         else:
-            return oslo_messaging.get_transport(
-                cfg.CONF, url, allowed_remote_exmods=exmods, aliases=_ALIASES)
+            return oslo_messaging.get_rpc_transport(
+                cfg.CONF, url, allowed_remote_exmods=exmods)
     except oslo_messaging.InvalidTransportURL as e:
         if not optional or e.url:
             # NOTE(sileht): oslo_messaging is configured but unloadable
@@ -104,15 +91,17 @@ def setup(url=None, optional=False):
     """Initialise the oslo_messaging layer."""
     global NOTIFIER
 
-    if url and url.startswith("fake://"):
-        # NOTE(sileht): oslo_messaging fake driver uses time.sleep
-        # for task switch, so we need to monkey_patch it
-        eventlet.monkey_patch(time=True)
     if not TRANSPORT or not NOTIFICATIONS_TRANSPORT:
         setup_transports(url, optional)
+        # In the fake driver, make the dict of exchanges local to each exchange
+        # manager, instead of using the shared class attribute. Doing otherwise
+        # breaks the unit tests.
+        if url and url.startswith("fake://"):
+            TRANSPORT._driver._exchange_manager._exchanges = {}
 
     if not NOTIFIER and NOTIFICATIONS_TRANSPORT:
-        serializer = RequestContextSerializer(JsonPayloadSerializer())
+        serializer = RequestContextSerializer(
+            oslo_messaging.JsonPayloadSerializer())
         NOTIFIER = oslo_messaging.Notifier(NOTIFICATIONS_TRANSPORT,
                                            serializer=serializer)
 
@@ -128,18 +117,21 @@ def cleanup():
 
 def get_rpc_server(target, endpoint):
     """Return a configured oslo_messaging rpc server."""
-    serializer = RequestContextSerializer(JsonPayloadSerializer())
+    serializer = RequestContextSerializer(
+        oslo_messaging.JsonPayloadSerializer())
+    access_policy = dispatcher.DefaultRPCAccessPolicy
     return oslo_messaging.get_rpc_server(TRANSPORT, target, [endpoint],
-                                         executor='eventlet',
-                                         serializer=serializer)
+                                         serializer=serializer,
+                                         access_policy=access_policy)
 
 
 def get_rpc_client(**kwargs):
     """Return a configured oslo_messaging RPCClient."""
     target = oslo_messaging.Target(**kwargs)
-    serializer = RequestContextSerializer(JsonPayloadSerializer())
-    return oslo_messaging.RPCClient(TRANSPORT, target,
-                                    serializer=serializer)
+    serializer = RequestContextSerializer(
+        oslo_messaging.JsonPayloadSerializer())
+    return oslo_messaging.get_rpc_client(
+        TRANSPORT, target, serializer=serializer)
 
 
 def get_notifier(publisher_id):

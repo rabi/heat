@@ -11,9 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
+from unittest import mock
 
-import mock
 from neutronclient.common import exceptions as qe
 
 from heat.common import exception
@@ -66,28 +65,6 @@ class NeutronClientPluginTest(NeutronClientPluginTestCase):
         self.neutron_client.list_security_groups.return_value = fake_list
         self.assertEqual(expected_groups,
                          self.neutron_plugin.get_secgroup_uuids(sgs_non_uuid))
-        # test only one belong to the tenant
-        fake_list = {
-            'security_groups': [
-                {
-                    'tenant_id': 'test_tenant_id',
-                    'id': '0389f747-7785-4757-b7bb-2ab07e4b09c3',
-                    'name': 'security_group_1',
-                    'security_group_rules': [],
-                    'description': 'no protocol'
-                },
-                {
-                    'tenant_id': 'not_test_tenant_id',
-                    'id': '384ccd91-447c-4d83-832c-06974a7d3d05',
-                    'name': 'security_group_1',
-                    'security_group_rules': [],
-                    'description': 'no protocol'
-                }
-            ]
-        }
-        self.neutron_client.list_security_groups.return_value = fake_list
-        self.assertEqual(expected_groups,
-                         self.neutron_plugin.get_secgroup_uuids(sgs_non_uuid))
         # test there are two securityGroups with same name, and the two
         # all belong to the tenant
         fake_list = {
@@ -131,48 +108,37 @@ class NeutronConstraintsValidate(common.HeatTestCase):
     scenarios = [
         ('validate_network',
             dict(constraint_class=nc.NetworkConstraint,
-                 resource_type='network',
-                 cmd_resource=None)),
+                 resource_type='network')),
         ('validate_port',
             dict(constraint_class=nc.PortConstraint,
-                 resource_type='port',
-                 cmd_resource=None)),
+                 resource_type='port')),
         ('validate_router',
             dict(constraint_class=nc.RouterConstraint,
-                 resource_type='router',
-                 cmd_resource=None)),
+                 resource_type='router')),
         ('validate_subnet',
             dict(constraint_class=nc.SubnetConstraint,
-                 resource_type='subnet',
-                 cmd_resource=None)),
+                 resource_type='subnet')),
         ('validate_subnetpool',
             dict(constraint_class=nc.SubnetPoolConstraint,
-                 resource_type='subnetpool',
-                 cmd_resource=None)),
+                 resource_type='subnetpool')),
         ('validate_address_scope',
             dict(constraint_class=nc.AddressScopeConstraint,
-                 resource_type='address_scope',
-                 cmd_resource=None)),
+                 resource_type='address_scope')),
         ('validate_loadbalancer',
             dict(constraint_class=lc.LoadbalancerConstraint,
-                 resource_type='loadbalancer',
-                 cmd_resource='lbaas_loadbalancer')),
+                 resource_type='loadbalancer')),
         ('validate_listener',
             dict(constraint_class=lc.ListenerConstraint,
-                 resource_type='listener',
-                 cmd_resource=None)),
+                 resource_type='listener')),
         ('validate_pool',
             dict(constraint_class=lc.PoolConstraint,
-                 resource_type='pool',
-                 cmd_resource='lbaas_pool')),
+                 resource_type='pool')),
         ('validate_qos_policy',
             dict(constraint_class=nc.QoSPolicyConstraint,
-                 resource_type='policy',
-                 cmd_resource='qos_policy')),
+                 resource_type='policy')),
         ('validate_security_group',
             dict(constraint_class=nc.SecurityGroupConstraint,
-                 resource_type='security_group',
-                 cmd_resource=None))
+                 resource_type='security_group'))
     ]
 
     def test_validate(self):
@@ -202,21 +168,16 @@ class NeutronConstraintsValidate(common.HeatTestCase):
             )
             expected = ("The neutron extension (%s) could not be found." %
                         constraint.extension)
-            self.assertEqual(expected, six.text_type(ex))
+            self.assertEqual(expected, str(ex))
         self.assertTrue(constraint.validate("foo", ctx))
         self.assertFalse(constraint.validate("bar", ctx))
         mock_find.assert_has_calls(
-            [mock.call(self.resource_type, 'foo',
-                       cmd_resource=self.cmd_resource),
-             mock.call(self.resource_type, 'bar',
-                       cmd_resource=self.cmd_resource)])
+            [mock.call(self.resource_type, 'foo'),
+             mock.call(self.resource_type, 'bar')])
 
 
 class NeutronProviderConstraintsValidate(common.HeatTestCase):
     scenarios = [
-        ('validate_lbaasv1',
-            dict(constraint_class=nc.LBaasV1ProviderConstraint,
-                 service_type='LOADBALANCER')),
         ('validate_lbaasv2',
             dict(constraint_class=lc.LBaasV2ProviderConstraint,
                  service_type='LOADBALANCERV2'))

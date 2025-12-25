@@ -12,11 +12,9 @@
 #    under the License.
 
 from oslo_log import log as logging
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LI
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -81,22 +79,21 @@ class User(stack_user.StackUser):
             # If a non-string (e.g embedded IAM dict policy) is passed, we
             # ignore the policy (don't reject it because we previously ignored
             # and we don't want to break templates which previously worked
-            if not isinstance(policy, six.string_types):
+            if not isinstance(policy, str):
                 LOG.debug("Ignoring policy %s, must be string "
-                          "resource name" % policy)
+                          "resource name", policy)
                 continue
 
             try:
                 policy_rsrc = self.stack[policy]
             except KeyError:
                 LOG.debug("Policy %(policy)s does not exist in stack "
-                          "%(stack)s"
-                          % {'policy': policy, 'stack': self.stack.name})
+                          "%(stack)s",
+                          {'policy': policy, 'stack': self.stack.name})
                 return False
 
             if not callable(getattr(policy_rsrc, 'access_allowed', None)):
-                LOG.debug("Policy %s is not an AccessPolicy resource"
-                          % policy)
+                LOG.debug("Policy %s is not an AccessPolicy resource", policy)
                 return False
 
         return True
@@ -120,9 +117,9 @@ class User(stack_user.StackUser):
     def access_allowed(self, resource_name):
         policies = (self.properties[self.POLICIES] or [])
         for policy in policies:
-            if not isinstance(policy, six.string_types):
+            if not isinstance(policy, str):
                 LOG.debug("Ignoring policy %s, must be string "
-                          "resource name" % policy)
+                          "resource name", policy)
                 continue
             policy_rsrc = self.stack[policy]
             if not policy_rsrc.access_allowed(resource_name):
@@ -221,7 +218,7 @@ class AccessKey(resource.Resource):
 
         user = self._get_user()
         if user is None:
-            LOG.debug('Error deleting %s - user not found' % str(self))
+            LOG.debug('Error deleting %s - user not found', str(self))
             return
         user._delete_keypair()
 
@@ -232,8 +229,8 @@ class AccessKey(resource.Resource):
         """
         if self._secret is None:
             if not self.resource_id:
-                LOG.info(_LI('could not get secret for %(username)s '
-                             'Error:%(msg)s'),
+                LOG.info('could not get secret for %(username)s '
+                         'Error:%(msg)s',
                          {'username': self.properties[self.USER_NAME],
                           'msg': "resource_id not yet set"})
             else:
@@ -252,10 +249,10 @@ class AccessKey(resource.Resource):
                         # And the ID of the v3 credential
                         self.data_set('credential_id', kp.id, redact=True)
                     except Exception as ex:
-                        LOG.info(_LI('could not get secret for %(username)s '
-                                     'Error:%(msg)s'), {
-                                 'username': self.properties[self.USER_NAME],
-                                 'msg': ex})
+                        LOG.info('could not get secret for %(username)s '
+                                 'Error:%(msg)s',
+                                 {'username': self.properties[self.USER_NAME],
+                                  'msg': ex})
 
         return self._secret or '000-000-000'
 

@@ -12,13 +12,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import constraints
 from heat.engine import properties
 from heat.engine.resources.openstack.neutron import neutron
+from heat.engine.resources.openstack.neutron import router
 from heat.engine import support
 
 
@@ -61,22 +60,33 @@ class ExtraRoute(neutron.NeutronResource):
 
     def add_dependencies(self, deps):
         super(ExtraRoute, self).add_dependencies(deps)
-        for resource in six.itervalues(self.stack):
+        for resource in self.stack.values():
             # depend on any RouterInterface in this template with the same
             # router_id as this router_id
             if resource.has_interface('OS::Neutron::RouterInterface'):
-                dep_router_id = self.client_plugin().resolve_router({
-                    'router': resource.properties.get('router'),
-                    'router_id': None}, 'router', 'router_id')
-                router_id = self.properties[self.ROUTER_ID]
+                try:
+                    router_id = self.properties[self.ROUTER_ID]
+                    dep_router_id = resource.properties.get(
+                        router.RouterInterface.ROUTER)
+                except (ValueError, TypeError):
+                    # Properties errors will be caught later in validation,
+                    # where we can report them in their proper context.
+                    continue
                 if dep_router_id == router_id:
                     deps += (self, resource)
             # depend on any RouterGateway in this template with the same
             # router_id as this router_id
-            elif (resource.has_interface('OS::Neutron::RouterGateway') and
-                  resource.properties['router_id'] ==
-                    self.properties['router_id']):
-                        deps += (self, resource)
+            elif resource.has_interface('OS::Neutron::RouterGateway'):
+                try:
+                    router_id = self.properties[self.ROUTER_ID]
+                    dep_router_id = resource.properties.get(
+                        router.RouterGateway.ROUTER_ID)
+                except (ValueError, TypeError):
+                    # Properties errors will be caught later in validation,
+                    # where we can report them in their proper context.
+                    continue
+                if dep_router_id == router_id:
+                    deps += (self, resource)
 
     def handle_create(self):
         router_id = self.properties.get(self.ROUTER_ID)
@@ -89,7 +99,7 @@ class ExtraRoute(neutron.NeutronResource):
         if new_route in routes:
             msg = _('Route duplicates an existing route.')
             raise exception.Error(msg)
-        routes.append(new_route)
+        routes.append(new_route.copy())
         self.client().update_router(router_id,
                                     {'router': {'routes': routes}})
         new_route['router_id'] = router_id
@@ -99,13 +109,15 @@ class ExtraRoute(neutron.NeutronResource):
     def handle_delete(self):
         if not self.resource_id:
             return
-        (router_id, destination, nexthop) = self.resource_id.split(':')
+        router_id = self.properties[self.ROUTER_ID]
         with self.client_plugin().ignore_not_found:
             routes = self.client().show_router(
                 router_id).get('router').get('routes', [])
             try:
-                routes.remove({'destination': destination,
-                               'nexthop': nexthop})
+                routes.remove(
+                    {'destination': self.properties[self.DESTINATION],
+                     'nexthop': self.properties[self.NEXTHOP]}
+                )
             except ValueError:
                 return
             self.client().update_router(router_id,

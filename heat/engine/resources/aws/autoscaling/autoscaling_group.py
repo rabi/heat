@@ -13,13 +13,10 @@
 
 from oslo_log import log as logging
 from oslo_utils import excutils
-import six
 
 from heat.common import exception
 from heat.common import grouputils
 from heat.common.i18n import _
-from heat.common.i18n import _LE
-from heat.common.i18n import _LI
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import function
@@ -35,7 +32,7 @@ from heat.scaling import scalingutil as sc_util
 LOG = logging.getLogger(__name__)
 
 
-class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
+class AutoScalingGroup(cooldown.CooldownMixin, instgrp.InstanceGroup):
 
     support_status = support.SupportStatus(version='2014.1')
 
@@ -188,6 +185,10 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
                                           schema=rolling_update_schema)
     }
 
+    def get_size(self):
+        """Get desired capacity."""
+        return self.properties[self.DESIRED_CAPACITY]
+
     def handle_create(self):
         return self.create_with_template(self.child_template())
 
@@ -225,19 +226,21 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
     def check_create_complete(self, task):
         """Update cooldown timestamp after create succeeds."""
         done = super(AutoScalingGroup, self).check_create_complete(task)
+        cooldown = self.properties[self.COOLDOWN]
         if done:
-            self._finished_scaling(
-                "%s : %s" % (sc_util.CFN_EXACT_CAPACITY,
-                             grouputils.get_size(self)))
+            self._finished_scaling(cooldown,
+                                   "%s : %s" % (sc_util.CFN_EXACT_CAPACITY,
+                                                grouputils.get_size(self)))
         return done
 
     def check_update_complete(self, cookie):
         """Update the cooldown timestamp after update succeeds."""
         done = super(AutoScalingGroup, self).check_update_complete(cookie)
+        cooldown = self.properties[self.COOLDOWN]
         if done:
-            self._finished_scaling(
-                "%s : %s" % (sc_util.CFN_EXACT_CAPACITY,
-                             grouputils.get_size(self)))
+            self._finished_scaling(cooldown,
+                                   "%s : %s" % (sc_util.CFN_EXACT_CAPACITY,
+                                                grouputils.get_size(self)))
         return done
 
     def _get_new_capacity(self, capacity,
@@ -250,6 +253,13 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
                                               adjustment_type,
                                               min_adjustment_step,
                                               lower, upper)
+
+    def resize(self, capacity):
+        try:
+            super(AutoScalingGroup, self).resize(capacity)
+        finally:
+            # allow InstanceList to be re-resolved
+            self.clear_stored_attributes()
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         """Updates self.properties, if Properties has changed.
@@ -279,11 +289,11 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
 
     def adjust(self, adjustment,
                adjustment_type=sc_util.CFN_CHANGE_IN_CAPACITY,
-               min_adjustment_step=None):
+               min_adjustment_step=None, cooldown=None):
         """Adjust the size of the scaling group if the cooldown permits."""
         if self.status != self.COMPLETE:
-            LOG.info(_LI("%s NOT performing scaling adjustment, "
-                         "when status is not COMPLETE") % self.name)
+            LOG.info("%s NOT performing scaling adjustment, "
+                     "when status is not COMPLETE", self.name)
             raise resource.NoActionRequired
 
         capacity = grouputils.get_size(self)
@@ -291,16 +301,14 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
                                               adjustment_type,
                                               min_adjustment_step)
         if new_capacity == capacity:
-            LOG.info(_LI("%s NOT performing scaling adjustment, "
-                         "as there is no change in capacity.") % self.name)
+            LOG.info("%s NOT performing scaling adjustment, "
+                     "as there is no change in capacity.", self.name)
             raise resource.NoActionRequired
 
-        if not self._is_scaling_allowed():
-            LOG.info(_LI("%(name)s NOT performing scaling adjustment, "
-                         "cooldown %(cooldown)s") % {
-                'name': self.name,
-                'cooldown': self.properties[self.COOLDOWN]})
-            raise resource.NoActionRequired
+        if cooldown is None:
+            cooldown = self.properties[self.COOLDOWN]
+
+        self._check_scaling_allowed(cooldown)
 
         # send a notification before, on-error and on-success.
         notif = {
@@ -322,12 +330,12 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
                 with excutils.save_and_reraise_exception():
                     try:
                         notif.update({'suffix': 'error',
-                                      'message': six.text_type(resize_ex),
+                                      'message': str(resize_ex),
                                       'capacity': grouputils.get_size(self),
                                       })
                         notification.send(**notif)
                     except Exception:
-                        LOG.exception(_LE('Failed sending error notification'))
+                        LOG.exception('Failed sending error notification')
             else:
                 size_changed = True
                 notif.update({
@@ -338,11 +346,12 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
                 })
                 notification.send(**notif)
         except Exception:
-            LOG.error(_LE("Error in performing scaling adjustment for"
-                          "group %s.") % self.name)
+            LOG.error("Error in performing scaling adjustment for "
+                      "group %s.", self.name)
             raise
         finally:
-            self._finished_scaling("%s : %s" % (adjustment_type, adjustment),
+            self._finished_scaling(cooldown,
+                                   "%s : %s" % (adjustment_type, adjustment),
                                    size_changed=size_changed)
 
     def _tags(self):
@@ -396,16 +405,6 @@ class AutoScalingGroup(instgrp.InstanceGroup, cooldown.CooldownMixin):
                 raise exception.StackValidationFailed(message=msg)
 
         super(AutoScalingGroup, self).validate()
-
-    def _resolve_attribute(self, name):
-        """Resolves the resource's attributes.
-
-        heat extension: "InstanceList" returns comma delimited list of server
-        ip addresses.
-        """
-        if name == self.INSTANCE_LIST:
-            return u','.join(inst.FnGetAtt('PublicIp')
-                             for inst in grouputils.get_members(self)) or None
 
     def child_template(self):
         if self.properties[self.DESIRED_CAPACITY]:

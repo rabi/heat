@@ -31,14 +31,16 @@ class SubnetPool(neutron.NeutronResource):
 
     required_service_extension = 'subnet_allocation'
 
+    entity = 'subnetpool'
+
     PROPERTIES = (
         NAME, PREFIXES, ADDRESS_SCOPE, DEFAULT_QUOTA,
         DEFAULT_PREFIXLEN, MIN_PREFIXLEN, MAX_PREFIXLEN,
-        IS_DEFAULT, TENANT_ID, SHARED,
+        IS_DEFAULT, TENANT_ID, SHARED, TAGS,
     ) = (
         'name', 'prefixes', 'address_scope', 'default_quota',
         'default_prefixlen', 'min_prefixlen', 'max_prefixlen',
-        'is_default', 'tenant_id', 'shared',
+        'is_default', 'tenant_id', 'shared', 'tags',
     )
 
     properties_schema = {
@@ -119,6 +121,13 @@ class SubnetPool(neutron.NeutronResource):
               'attribute to administrative users only.'),
             default=False,
         ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('The tags to be added to the subnetpool.'),
+            schema=properties.Schema(properties.Schema.STRING),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='9.0.0')
+        ),
     }
 
     def validate(self):
@@ -172,20 +181,23 @@ class SubnetPool(neutron.NeutronResource):
             self.properties,
             self.physical_resource_name())
         if self.ADDRESS_SCOPE in props and props[self.ADDRESS_SCOPE]:
-            props['address_scope_id'] = self.client_plugin(
-                ).find_resourceid_by_name_or_id(
-                'address_scope', props.pop(self.ADDRESS_SCOPE))
+            client_plugin = self.client_plugin()
+            scope_id = client_plugin.find_resourceid_by_name_or_id(
+                client_plugin.RES_TYPE_ADDRESS_SCOPE,
+                props.pop(self.ADDRESS_SCOPE))
+            props['address_scope_id'] = scope_id
+        tags = props.pop(self.TAGS, [])
         subnetpool = self.client().create_subnetpool(
             {'subnetpool': props})['subnetpool']
         self.resource_id_set(subnetpool['id'])
+
+        if tags:
+            self.set_tags(tags)
 
     def handle_delete(self):
         if self.resource_id is not None:
             with self.client_plugin().ignore_not_found:
                 self.client().delete_subnetpool(self.resource_id)
-
-    def _show_resource(self):
-        return self.client().show_subnetpool(self.resource_id)['subnetpool']
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         # check that new prefixes are superset of existing prefixes
@@ -193,14 +205,17 @@ class SubnetPool(neutron.NeutronResource):
             self._validate_prefixes_for_update(prop_diff)
         if self.ADDRESS_SCOPE in prop_diff:
             if prop_diff[self.ADDRESS_SCOPE]:
-                prop_diff[
-                    'address_scope_id'] = self.client_plugin(
-                    ).find_resourceid_by_name_or_id(
-                    self.client(), 'address_scope',
+                client_plugin = self.client_plugin()
+                scope_id = client_plugin.find_resourceid_by_name_or_id(
+                    self.client(),
+                    client_plugin.RES_TYPE_ADDRESS_SCOPE,
                     prop_diff.pop(self.ADDRESS_SCOPE))
             else:
-                prop_diff[
-                    'address_scope_id'] = prop_diff.pop(self.ADDRESS_SCOPE)
+                scope_id = prop_diff.pop(self.ADDRESS_SCOPE)
+            prop_diff['address_scope_id'] = scope_id
+        if self.TAGS in prop_diff:
+            tags = prop_diff.pop(self.TAGS)
+            self.set_tags(tags)
         if prop_diff:
             self.prepare_update_properties(prop_diff)
             self.client().update_subnetpool(

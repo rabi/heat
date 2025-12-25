@@ -12,12 +12,12 @@
 #    under the License.
 
 import croniter
-import eventlet
+import json
 import netaddr
-import pytz
-import six
+import time
+import zoneinfo
 
-from oslo_utils import netutils
+from neutron_lib.api import validators
 from oslo_utils import timeutils
 
 from heat.common.i18n import _
@@ -28,14 +28,19 @@ from heat.engine import constraints
 class TestConstraintDelay(constraints.BaseCustomConstraint):
 
     def validate_with_client(self, client, value):
-        eventlet.sleep(value)
+        time.sleep(value)
 
 
 class IPConstraint(constraints.BaseCustomConstraint):
 
     def validate(self, value, context, template=None):
         self._error_message = 'Invalid IP address'
-        return netutils.is_valid_ip(value)
+        if not isinstance(value, str):
+            return False
+        msg = validators.validate_ip_address(value)
+        if msg is not None:
+            return False
+        return True
 
 
 class MACConstraint(constraints.BaseCustomConstraint):
@@ -54,7 +59,7 @@ class DNSNameConstraint(constraints.BaseCustomConstraint):
             self._error_message = ("'%(value)s' not in valid format."
                                    " Reason: %(reason)s") % {
                                        'value': value,
-                                       'reason': six.text_type(ex)}
+                                       'reason': str(ex)}
             return False
         return True
 
@@ -100,19 +105,35 @@ class DNSDomainConstraint(DNSNameConstraint):
 
 class CIDRConstraint(constraints.BaseCustomConstraint):
 
-    def _validate_whitespace(self, data):
-        self._error_message = ("Invalid net cidr '%s' contains "
-                               "whitespace" % data)
-        if len(data.split()) > 1:
+    def validate(self, value, context, template=None):
+        try:
+            netaddr.IPNetwork(netaddr.cidr_abbrev_to_verbose(value))
+            msg = validators.validate_subnet(value)
+            if msg is not None:
+                self._error_message = msg
+                return False
+            return True
+        except Exception as ex:
+            self._error_message = 'Invalid net cidr %s ' % str(ex)
             return False
-        return True
+
+
+class IPCIDRConstraint(constraints.BaseCustomConstraint):
 
     def validate(self, value, context, template=None):
         try:
-            netaddr.IPNetwork(value)
-            return self._validate_whitespace(value)
-        except Exception as ex:
-            self._error_message = 'Invalid net cidr %s ' % six.text_type(ex)
+            if '/' in value:
+                msg = validators.validate_subnet(value)
+            else:
+                msg = validators.validate_ip_address(value)
+            if msg is not None:
+                self._error_message = msg
+                return False
+            else:
+                return True
+        except Exception:
+            self._error_message = '{} is not a valid IP or CIDR'.format(
+                value)
             return False
 
 
@@ -137,7 +158,7 @@ class CRONExpressionConstraint(constraints.BaseCustomConstraint):
             return True
         except Exception as ex:
             self._error_message = _(
-                'Invalid CRON expression: %s') % six.text_type(ex)
+                'Invalid CRON expression: %s') % str(ex)
         return False
 
 
@@ -147,11 +168,11 @@ class TimezoneConstraint(constraints.BaseCustomConstraint):
         if not value:
             return True
         try:
-            pytz.timezone(value)
+            zoneinfo.ZoneInfo(value)
             return True
         except Exception as ex:
             self._error_message = _(
-                'Invalid timezone: %s') % six.text_type(ex)
+                'Invalid timezone: %s') % str(ex)
         return False
 
 
@@ -168,6 +189,19 @@ class ExpirationConstraint(constraints.BaseCustomConstraint):
             raise ValueError(_('Expiration time is out of date.'))
         except Exception as ex:
             self._error_message = (_(
-                'Expiration {0} is invalid: {1}').format(value,
-                                                         six.text_type(ex)))
+                'Expiration {0} is invalid: {1}').format(value, str(ex)))
+        return False
+
+
+class JsonStringConstraint(constraints.BaseCustomConstraint):
+
+    def validate(self, value, context):
+        if not value:
+            return True
+        try:
+            json.loads(value)
+            return True
+        except json.decoder.JSONDecodeError as ex:
+            self._error_message = (_(
+                'JSON string {0} is invalid: {1}').format(value, str(ex)))
         return False

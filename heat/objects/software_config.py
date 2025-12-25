@@ -12,7 +12,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-
 """SoftwareConfig object."""
 
 from oslo_versionedobjects import base
@@ -65,6 +64,10 @@ class SoftwareConfig(
     def get_all(cls, context, **kwargs):
         scs = db_api.software_config_get_all(context, **kwargs)
         return [cls._from_db_object(context, cls(), sc) for sc in scs]
+
+    @classmethod
+    def count_all(cls, context, **kwargs):
+        return db_api.software_config_count_all(context, **kwargs)
 
     @classmethod
     def delete(cls, context, config_id):

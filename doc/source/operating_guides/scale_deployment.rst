@@ -31,13 +31,12 @@ Assumptions
 
 This guide, using a devstack installation of OpenStack, assumes that:
 
-    1. You have configured devstack from `Single Machine Installation Guide
-       <http://devstack.org/guides/single-machine.html>`_;
-    2. You have set up heat on devstack, as defined at `heat and DevStack
-       <http://docs.openstack.org/developer/heat/getting_started/
-       on_devstack.html>`_;
-    3. You have installed `HAProxy <http://haproxy.1wt.eu>`_ on the devstack
-       server.
+1. You have configured devstack from :devstack-doc:`Single Machine
+   Installation Guide <guides/single-machine.html>`;
+2. You have set up heat on devstack, as defined at :doc:`heat and DevStack
+   <../getting_started/on_devstack>`;
+3. You have installed HAProxy_ on the devstack
+   server.
 
 Architecture
 ============
@@ -48,11 +47,10 @@ used and the target scaled out architecture.
 Basic Architecture
 ------------------
 
-The heat architecture is as defined at `heat architecture
-<http://docs.openstack.org/developer/heat/architecture.html>`_ and shown in the
-diagram below, where we have a CLI that sends HTTP requests to the REST and CFN
-APIs, which in turn make calls using AMQP to the heat-engine.
-::
+The heat architecture is as defined at :doc:`heat architecture
+<../developing_guides/architecture>` and shown in the diagram below, where we have
+a CLI that sends HTTP requests to the REST and CFN APIs, which in turn make
+calls using AMQP to the heat-engine::
 
                    |- [REST API] -|
  [CLI] -- <HTTP> --                -- <AMQP> -- [ENGINE]
@@ -65,7 +63,7 @@ As there is a need to use a load balancer mechanism between the multiple APIs
 and the CLI, a proxy has to be deployed.
 
 Because the heat CLI and APIs communicate by exchanging HTTP requests and
-responses, a `HAProxy <http://haproxy.1wt.eu>`_ HTTP load balancer server will
+responses, a HAProxy_ HTTP load balancer server will
 be deployed between them.
 
 This way, the proxy will take the CLIs requests to the APIs and act on their
@@ -113,23 +111,15 @@ new REST and CFN API services, you must run:
     python bin/heat-api --config-file=/etc/heat/heat.conf
     python bin/heat-api-cfn --config-file=/etc/heat/heat.conf
 
-Each API service must have a unique address to listen. This address have to be
-defined in the configuration file. For REST and CFN APIs, modify the
-*[heat_api]* and *[heat_api_cfn]* blocks, respectively.
+Each API service must have a unique address to listen. Also the host value
+should be unique.
 ::
 
-    [heat_api]
-    bind_port = {API_PORT}
-    bind_host = {API_HOST}
-
-    ...
-
-    [heat_api_cfn]
-    bind_port = {API_CFN_PORT}
-    bind_host = {API_CFN_HOST}
+    [DEFAULT]
+    host = {host}
 
 If you wish to run multiple API processes on the same machine, you must create
-multiple copies of the heat.conf file, each containing a unique port number.
+multiple copies of the heat.conf file, each containing a unique host string.
 
 In addition, if you want to run some API services in different machines than
 the devstack server, you have to update the loopback addresses found at the
@@ -165,13 +155,6 @@ the REST and CFN APIs deployed when installing devstack by the HAProxy server.
 This way, there is no need to update, on the CLI, the addresses where it should
 look for the APIs. In this case, when it makes a call to any API, it will find
 the proxy, acting on their behalf.
-
-Note that the addresses that the HAProxy will be listening to are the pairs
-*API_HOST:API-PORT* and *API_CFN_HOST:API_CFN_PORT*, found at the *[heat_api]*
-and *[heat_api_cfn]* blocks on the devstack server's configuration file. In
-addition, the original *heat-api* and *heat-api-cfn* processes running in these
-ports have to be killed, because these addresses must be free to be used by the
-proxy.
 
 To deploy the HAProxy server on the devstack server, run
 *haproxy -f apis-proxy.conf*, where this configuration file looks like:
@@ -256,10 +239,10 @@ Running the API and Engine Services
 
 For each machine, B and C, you must do the following steps:
 
-    1. Clone the heat repository https://git.openstack.org/cgit/openstack/heat, run:
+    1. Clone the heat repository https://opendev.org/openstack/heat, run:
 
     ::
-        git clone https://git.openstack.org/openstack/heat
+        git clone https://opendev.org/openstack/heat
 
     2. Create a local copy of the configuration file */etc/heat/heat.conf* from
        the machine A;
@@ -290,14 +273,8 @@ The original file from A looks like:
     ...
     sql_connection = mysql+pymysql://root:admin@127.0.0.1/heat?charset=utf8
     rabbit_host = localhost
+    host = localhost
     ...
-    [heat_api]
-    bind_port = 8004
-    bind_host = 10.0.0.1
-    ...
-    [heat_api_cfn]
-    bind_port = 8000
-    bind_host = 10.0.0.1
 
 After the changes for B, it looks like:
 ::
@@ -306,14 +283,8 @@ After the changes for B, it looks like:
     ...
     sql_connection = mysql+pymysql://root:admin@10.0.0.1/heat?charset=utf8
     rabbit_host = 10.0.0.1
+    host = 10.0.0.2
     ...
-    [heat_api]
-    bind_port = 8004
-    bind_host = 10.0.0.2
-    ...
-    [heat_api_cfn]
-    bind_port = 8000
-    bind_host = 10.0.0.2
 
 Setting Up HAProxy
 ------------------
@@ -354,3 +325,5 @@ On the machine A, kill the *heat-api* and *heat-api-cfn* processes by running
         option  httpchk
         server cfn-server-1 10.0.0.2:8000
         server cfn-server-2 10.0.0.3:8000
+
+.. _HAProxy: https://www.haproxy.org/

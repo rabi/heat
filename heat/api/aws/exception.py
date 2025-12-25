@@ -17,7 +17,6 @@
 """Heat API exception subclasses - maps API response errors to AWS Errors."""
 
 from oslo_utils import reflection
-import six
 import webob.exc
 
 from heat.common.i18n import _
@@ -298,7 +297,6 @@ def map_remote_error(ex):
         'ResourceActionNotSupported',
         'ResourceNotFound',
         'ResourceNotAvailable',
-        'WatchRuleNotFound',
         'StackValidationFailed',
         'InvalidSchemaError',
         'InvalidTemplateReference',
@@ -311,6 +309,7 @@ def map_remote_error(ex):
         'PropertyUnspecifiedError',
         'NotSupported',
         'InvalidBreakPointHook',
+        'PhysicalResourceIDAmbiguity',
     )
     denied_errors = ('Forbidden', 'NotAuthorized')
     already_exists_errors = ('StackExists')
@@ -318,20 +317,22 @@ def map_remote_error(ex):
     request_limit_exceeded = ('RequestLimitExceeded')
 
     ex_type = reflection.get_class_name(ex, fully_qualified=False)
-
     if ex_type.endswith('_Remote'):
         ex_type = ex_type[:-len('_Remote')]
 
+    safe = getattr(ex, 'safe', False)
+    detail = str(ex) if safe else None
+
     if ex_type in inval_param_errors:
-        return HeatInvalidParameterValueError(detail=six.text_type(ex))
+        return HeatInvalidParameterValueError(detail=detail)
     elif ex_type in denied_errors:
-        return HeatAccessDeniedError(detail=six.text_type(ex))
+        return HeatAccessDeniedError(detail=detail)
     elif ex_type in already_exists_errors:
-        return AlreadyExistsError(detail=six.text_type(ex))
+        return AlreadyExistsError(detail=detail)
     elif ex_type in invalid_action_errors:
-        return HeatActionInProgressError(detail=six.text_type(ex))
+        return HeatActionInProgressError(detail=detail)
     elif ex_type in request_limit_exceeded:
-        return HeatRequestLimitExceeded(detail=six.text_type(ex))
+        return HeatRequestLimitExceeded(detail=detail)
     else:
         # Map everything else to internal server error for now
-        return HeatInternalFailureError(detail=six.text_type(ex))
+        return HeatInternalFailureError(detail=detail)

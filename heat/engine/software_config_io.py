@@ -16,12 +16,13 @@ APIs for dealing with input and output definitions for Software Configurations.
 """
 
 import collections
-import six
+import copy
 
 from heat.common.i18n import _
 
 from heat.common import exception
 from heat.engine import constraints
+from heat.engine import parameters
 from heat.engine import properties
 
 
@@ -59,7 +60,7 @@ input_config_schema = {
         constraints=[constraints.AllowedValues(TYPES)]
     ),
     DEFAULT: properties.Schema(
-        properties.Schema.STRING,
+        properties.Schema.ANY,
         _('Default value for the input if none is specified.'),
     ),
     REPLACE_ON_CHANGE: properties.Schema(
@@ -102,7 +103,7 @@ class IOConfig(object):
         try:
             self._props.validate()
         except exception.StackValidationFailed as exc:
-            raise ValueError(six.text_type(exc))
+            raise ValueError(str(exc))
 
     def name(self):
         """Return the name of the input or output."""
@@ -126,6 +127,17 @@ class InputConfig(IOConfig):
     schema = input_config_schema
 
     def __init__(self, value=_no_value, **config):
+        if TYPE in config and DEFAULT in config:
+            if config[DEFAULT] == '' and config[TYPE] != STRING_TYPE:
+                # This is a legacy path, because default used to be of string
+                # type, so we need to skip schema validation in this case.
+                pass
+            else:
+                self.schema = copy.deepcopy(self.schema)
+                config_param = parameters.Schema.from_dict(
+                    'config', {'Type': config[TYPE]})
+                self.schema[DEFAULT] = properties.Schema.from_parameter(
+                    config_param)
         super(InputConfig, self).__init__(**config)
         self._value = value
 
@@ -166,10 +178,14 @@ def check_io_schema_list(io_configs):
     Raises TypeError if the list itself is not a list, or if any of the
     members are not dicts.
     """
-    if (not isinstance(io_configs, collections.Sequence) or
-            isinstance(io_configs, collections.Mapping) or
-            isinstance(io_configs, six.string_types)):
+    if (
+        not isinstance(io_configs, collections.abc.Sequence) or
+        isinstance(io_configs, collections.abc.Mapping) or
+        isinstance(io_configs, str)
+    ):
         raise TypeError('Software Config I/O Schema must be in a list')
 
-    if not all(isinstance(conf, collections.Mapping) for conf in io_configs):
+    if not all(
+        isinstance(conf, collections.abc.Mapping) for conf in io_configs
+    ):
         raise TypeError('Software Config I/O Schema must be a dict')

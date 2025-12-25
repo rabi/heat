@@ -11,14 +11,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
+from heat.engine.clients.os.keystone import fake_keystoneclient as fake_ks
 from heat.engine import resource
 from heat.engine.resources.openstack.keystone import user
 from heat.engine import stack
 from heat.engine import template
 from heat.tests import common
-from heat.tests import fakes
 from heat.tests import utils
 
 keystone_user_template = {
@@ -41,8 +41,6 @@ keystone_user_template = {
     }
 }
 
-RESOURCE_TYPE = 'OS::Keystone::User'
-
 
 class KeystoneUserTest(common.HeatTestCase):
     def setUp(self):
@@ -60,7 +58,7 @@ class KeystoneUserTest(common.HeatTestCase):
         # Mock client
         self.keystoneclient = mock.Mock()
         self.patchobject(resource.Resource, 'client',
-                         return_value=fakes.FakeKeystoneClient(
+                         return_value=fake_ks.FakeKeystoneClient(
                              client=self.keystoneclient))
         self.users = self.keystoneclient.users
 
@@ -83,12 +81,17 @@ class KeystoneUserTest(common.HeatTestCase):
         value = mock.MagicMock()
         user_id = '477e8273-60a7-4c41-b683-fdb0bc7cd151'
         value.id = user_id
-
+        value.name = 'test_user_1'
+        value.default_project_id = 'project_1'
+        value.domain_id = 'default'
+        value.enabled = True
+        value.password_expires_at = '2016-12-10T17:28:49.000000'
         return value
 
     def test_user_handle_create(self):
         mock_user = self._get_mock_user()
         self.users.create.return_value = mock_user
+        self.users.get.return_value = mock_user
         self.users.add_to_group = mock.MagicMock()
 
         # validate the properties
@@ -280,3 +283,59 @@ class KeystoneUserTest(common.HeatTestCase):
         self.users.get.return_value = user
         res = self.test_user._show_resource()
         self.assertEqual({'attr': 'val'}, res)
+
+    def test_get_live_state(self):
+        user = mock.MagicMock()
+        user.to_dict.return_value = {
+            'description': '',
+            'enabled': True,
+            'domain_id': 'default',
+            'email': 'fake@312.com',
+            'default_project_id': '859aee961e30408e813853e1cffad089',
+            'id': '4060e773e26842a88b7490528d78de4f',
+            'name': 'user1-user-275g3vdmwuo5'}
+        self.users.get.return_value = user
+        role = mock.MagicMock()
+        role.to_dict.return_value = {
+            'scope': {'domain': {'id': '1234'}}, 'role': {'id': '4321'}
+        }
+        self.keystoneclient.role_assignments.list.return_value = [role]
+        group = mock.MagicMock()
+        group.id = '39393'
+        self.keystoneclient.groups.list.return_value = [group]
+        self.test_user.resource_id = '1111'
+
+        reality = self.test_user.get_live_state(self.test_user.properties)
+        expected = {
+            'description': '',
+            'enabled': True,
+            'domain': 'default',
+            'email': 'fake@312.com',
+            'default_project': '859aee961e30408e813853e1cffad089',
+            'name': 'user1-user-275g3vdmwuo5',
+            'groups': ['39393'],
+            'roles': [{'role': '4321', 'domain': '1234', 'project': None}]
+        }
+        self.assertEqual(set(expected.keys()), set(reality.keys()))
+        for key in expected:
+            self.assertEqual(expected[key], reality[key])
+
+    def test_resolve_attributes(self):
+        mock_user = self._get_mock_user()
+        self.test_user.resource_id = mock_user['id']
+        self.users.get.return_value = mock_user
+        self.assertEqual(
+            mock_user.name,
+            self.test_user._resolve_attribute('name'))
+        self.assertEqual(
+            mock_user.default_project_id,
+            self.test_user._resolve_attribute('default_project_id'))
+        self.assertEqual(
+            mock_user.domain_id,
+            self.test_user._resolve_attribute('domain_id'))
+        self.assertEqual(
+            mock_user.enabled,
+            self.test_user._resolve_attribute('enabled'))
+        self.assertEqual(
+            mock_user.password_expires_at,
+            self.test_user._resolve_attribute('password_expires_at'))

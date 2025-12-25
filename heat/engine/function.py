@@ -16,13 +16,11 @@ import collections
 import itertools
 import weakref
 
-import six
-
+from heat.common import exception
 from heat.common.i18n import _
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Function(object):
+class Function(metaclass=abc.ABCMeta):
     """Abstract base class for template functions."""
 
     def __init__(self, stack, fn_name, args):
@@ -44,7 +42,8 @@ class Function(object):
             return None
 
         stack = ref()
-        assert stack is not None, "Need a reference to the Stack object"
+        assert stack is not None, ("Need a reference to the "
+                                   "StackDefinition object")
         return stack
 
     def validate(self):
@@ -72,8 +71,37 @@ class Function(object):
 
         Return an iterator over any attributes of the specified resource that
         this function references.
+
+        The special value heat.engine.attributes.ALL_ATTRIBUTES may be used to
+        indicate that all attributes of the resource are required.
         """
         return dep_attrs(self.args, resource_name)
+
+    def all_dep_attrs(self):
+        """Return resource, attribute name pairs of all attributes referenced.
+
+        Return an iterator over the resource name, attribute name tuples of
+        all attributes that this function references.
+
+        The special value heat.engine.attributes.ALL_ATTRIBUTES may be used to
+        indicate that all attributes of the resource are required.
+
+        By default this calls the dep_attrs() method, but subclasses can
+        override to provide a more efficient implementation.
+        """
+        # If we are using the default dep_attrs method then it will only
+        # return data from the args anyway
+        if type(self).dep_attrs == Function.dep_attrs:
+            return all_dep_attrs(self.args)
+
+        def res_dep_attrs(resource_name):
+            return zip(itertools.repeat(resource_name),
+                       self.dep_attrs(resource_name))
+
+        resource_names = self.stack.enabled_rsrc_names()
+
+        return itertools.chain.from_iterable(map(res_dep_attrs,
+                                                 resource_names))
 
     def __reduce__(self):
         """Return a representation of the function suitable for pickling.
@@ -129,8 +157,7 @@ class Function(object):
     __hash__ = None
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Macro(Function):
+class Macro(Function, metaclass=abc.ABCMeta):
     """Abstract base class for template macros.
 
     A macro differs from a function in that it controls how the template is
@@ -168,7 +195,7 @@ class Macro(Function):
 
     def result(self):
         """Return the resolved result of the macro contents."""
-        return resolve(self.parsed)
+        return resolve(self.parsed, nullable=True)
 
     def dependencies(self, path):
         return dependencies(self.parsed, '.'.join([path, self.fn_name]))
@@ -178,36 +205,105 @@ class Macro(Function):
 
         Return an iterator over any attributes of the specified resource that
         this function references.
+
+        The special value heat.engine.attributes.ALL_ATTRIBUTES may be used to
+        indicate that all attributes of the resource are required.
         """
         return dep_attrs(self.parsed, resource_name)
+
+    def all_dep_attrs(self):
+        """Return resource, attribute name pairs of all attributes referenced.
+
+        Return an iterator over the resource name, attribute name tuples of
+        all attributes that this function references.
+
+        The special value heat.engine.attributes.ALL_ATTRIBUTES may be used to
+        indicate that all attributes of the resource are required.
+
+        By default this calls the dep_attrs() method, but subclasses can
+        override to provide a more efficient implementation.
+        """
+        # If we are using the default dep_attrs method then it will only
+        # return data from the transformed parsed args anyway
+        if type(self).dep_attrs == Macro.dep_attrs:
+            return all_dep_attrs(self.parsed)
+
+        return super(Macro, self).all_dep_attrs()
+
+    def __reduce__(self):
+        """Return a representation of the macro result suitable for pickling.
+
+        This allows the copy module (which works by pickling and then
+        unpickling objects) to copy a template. Functions in the copy will
+        return to their original (JSON) form (i.e. a single-element map).
+
+        Unlike other functions, macros are *not* preserved during a copy. The
+        the processed (but unparsed) output is returned in their place.
+        """
+        if isinstance(self.parsed, Function):
+            return self.parsed.__reduce__()
+        if self.parsed is None:
+            return type(None), tuple()
+        if self.parsed is Ellipsis:
+            return type(Ellipsis), tuple()
+        return type(self.parsed), (self.parsed,)
 
     def _repr_result(self):
         return repr(self.parsed)
 
 
-def resolve(snippet):
-    if isinstance(snippet, Function):
-        return snippet.result()
+def _non_null_item(i):
+    k, v = i
+    return v is not Ellipsis
 
-    if isinstance(snippet, collections.Mapping):
-        return dict((k, resolve(v)) for k, v in snippet.items())
-    elif (not isinstance(snippet, six.string_types) and
-          isinstance(snippet, collections.Iterable)):
-        return [resolve(v) for v in snippet]
+
+def _non_null_value(v):
+    return v is not Ellipsis
+
+
+def resolve(snippet, nullable=False):
+    if isinstance(snippet, Function):
+        result = snippet.result()
+        if not (nullable or _non_null_value(result)):
+            result = None
+        return result
+
+    if isinstance(snippet, collections.abc.Mapping):
+        return dict(filter(_non_null_item,
+                           ((k, resolve(v, nullable=True))
+                            for k, v in snippet.items())))
+    elif (not isinstance(snippet, str) and
+          isinstance(snippet, collections.abc.Iterable)):
+        return list(filter(_non_null_value,
+                           (resolve(v, nullable=True) for v in snippet)))
 
     return snippet
 
 
-def validate(snippet):
+def validate(snippet, path=None):
+    if path is None:
+        path = []
+    elif isinstance(path, str):
+        path = [path]
+
     if isinstance(snippet, Function):
-        snippet.validate()
-    elif isinstance(snippet, collections.Mapping):
-        for v in six.itervalues(snippet):
-            validate(v)
-    elif (not isinstance(snippet, six.string_types) and
-          isinstance(snippet, collections.Iterable)):
-        for v in snippet:
-            validate(v)
+        try:
+            snippet.validate()
+        except AssertionError:
+            raise
+        except Exception as e:
+            raise exception.StackValidationFailed(
+                path=path + [snippet.fn_name],
+                message=str(e))
+    elif isinstance(snippet, collections.abc.Mapping):
+        for k, v in snippet.items():
+            validate(v, path + [k])
+    elif (not isinstance(snippet, str) and
+          isinstance(snippet, collections.abc.Iterable)):
+        basepath = list(path)
+        parent = basepath.pop() if basepath else ''
+        for i, v in enumerate(snippet):
+            validate(v, basepath + ['%s[%d]' % (parent, i)])
 
 
 def dependencies(snippet, path=''):
@@ -220,16 +316,16 @@ def dependencies(snippet, path=''):
     if isinstance(snippet, Function):
         return snippet.dependencies(path)
 
-    elif isinstance(snippet, collections.Mapping):
+    elif isinstance(snippet, collections.abc.Mapping):
         def mkpath(key):
-            return '.'.join([path, six.text_type(key)])
+            return '.'.join([path, str(key)])
 
         deps = (dependencies(value,
                              mkpath(key)) for key, value in snippet.items())
         return itertools.chain.from_iterable(deps)
 
-    elif (not isinstance(snippet, six.string_types) and
-          isinstance(snippet, collections.Iterable)):
+    elif (not isinstance(snippet, str) and
+          isinstance(snippet, collections.abc.Iterable)):
         def mkpath(idx):
             return ''.join([path, '[%d]' % idx])
 
@@ -248,19 +344,42 @@ def dep_attrs(snippet, resource_name):
     appropriate.
 
     :returns: an iterator over the attributes of the specified resource that
-    are referenced in the template snippet.
+              are referenced in the template snippet.
     """
 
     if isinstance(snippet, Function):
         return snippet.dep_attrs(resource_name)
 
-    elif isinstance(snippet, collections.Mapping):
-        attrs = (dep_attrs(value, resource_name) for value in snippet.items())
+    elif isinstance(snippet, collections.abc.Mapping):
+        attrs = (dep_attrs(val, resource_name) for val in snippet.values())
         return itertools.chain.from_iterable(attrs)
-    elif (not isinstance(snippet, six.string_types) and
-          isinstance(snippet, collections.Iterable)):
+    elif (not isinstance(snippet, str) and
+          isinstance(snippet, collections.abc.Iterable)):
         attrs = (dep_attrs(value, resource_name) for value in snippet)
         return itertools.chain.from_iterable(attrs)
+    return []
+
+
+def all_dep_attrs(snippet):
+    """Iterator over resource, attribute name pairs referenced in a snippet.
+
+    The snippet should be already parsed to insert Function objects where
+    appropriate.
+
+    :returns: an iterator over the resource name, attribute name tuples of all
+              attributes that are referenced in the template snippet.
+    """
+
+    if isinstance(snippet, Function):
+        return snippet.all_dep_attrs()
+
+    elif isinstance(snippet, collections.abc.Mapping):
+        res_attrs = (all_dep_attrs(value) for value in snippet.values())
+        return itertools.chain.from_iterable(res_attrs)
+    elif (not isinstance(snippet, str) and
+          isinstance(snippet, collections.abc.Iterable)):
+        res_attrs = (all_dep_attrs(value) for value in snippet)
+        return itertools.chain.from_iterable(res_attrs)
     return []
 
 

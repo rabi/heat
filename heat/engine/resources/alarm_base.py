@@ -17,16 +17,20 @@ from heat.engine import properties
 from heat.engine import resource
 from heat.engine import support
 
+from urllib import parse
+
 
 COMMON_PROPERTIES = (
-    ALARM_ACTIONS, OK_ACTIONS, REPEAT_ACTIONS,
-    INSUFFICIENT_DATA_ACTIONS, DESCRIPTION, ENABLED, TIME_CONSTRAINTS,
-    SEVERITY,
+    ALARM_ACTIONS, OK_ACTIONS, INSUFFICIENT_DATA_ACTIONS,
+    ALARM_QUEUES, OK_QUEUES, INSUFFICIENT_DATA_QUEUES,
+    REPEAT_ACTIONS, DESCRIPTION, ENABLED, TIME_CONSTRAINTS, SEVERITY,
 ) = (
-    'alarm_actions', 'ok_actions', 'repeat_actions',
-    'insufficient_data_actions', 'description', 'enabled', 'time_constraints',
-    'severity',
+    'alarm_actions', 'ok_actions', 'insufficient_data_actions',
+    'alarm_queues', 'ok_queues', 'insufficient_data_queues',
+    'repeat_actions', 'description', 'enabled', 'time_constraints', 'severity',
 )
+
+INTERNAL_PROPERTIES = (ALARM_QUEUES, OK_QUEUES, INSUFFICIENT_DATA_QUEUES)
 
 _TIME_CONSTRAINT_KEYS = (
     NAME, START, DURATION, TIMEZONE, TIME_CONSTRAINT_DESCRIPTION,
@@ -62,6 +66,42 @@ common_properties_schema = {
         properties.Schema.LIST,
         _('A list of URLs (webhooks) to invoke when state transitions to '
           'insufficient-data.'),
+        update_allowed=True
+    ),
+    ALARM_QUEUES: properties.Schema(
+        properties.Schema.LIST,
+        _('A list of Zaqar queues to post to when state transitions to '
+          'alarm.'),
+        support_status=support.SupportStatus(version='8.0.0'),
+        schema=properties.Schema(
+            properties.Schema.STRING,
+            constraints=[constraints.CustomConstraint('zaqar.queue')]
+        ),
+        default=[],
+        update_allowed=True
+    ),
+    OK_QUEUES: properties.Schema(
+        properties.Schema.LIST,
+        _('A list of Zaqar queues to post to when state transitions to '
+          'ok.'),
+        support_status=support.SupportStatus(version='8.0.0'),
+        schema=properties.Schema(
+            properties.Schema.STRING,
+            constraints=[constraints.CustomConstraint('zaqar.queue')]
+        ),
+        default=[],
+        update_allowed=True
+    ),
+    INSUFFICIENT_DATA_QUEUES: properties.Schema(
+        properties.Schema.LIST,
+        _('A list of Zaqar queues to post to when state transitions to '
+          'insufficient-data.'),
+        support_status=support.SupportStatus(version='8.0.0'),
+        schema=properties.Schema(
+            properties.Schema.STRING,
+            constraints=[constraints.CustomConstraint('zaqar.queue')]
+        ),
+        default=[],
         update_allowed=True
     ),
     REPEAT_ACTIONS: properties.Schema(
@@ -123,7 +163,7 @@ common_properties_schema = {
                 TIMEZONE: properties.Schema(
                     properties.Schema.STRING,
                     _("Timezone for the time constraint "
-                      "(eg. 'Taiwan/Taipei', 'Europe/Amsterdam')."),
+                      "(eg. 'Asia/Taipei', 'Europe/Amsterdam')."),
                     constraints=[
                         constraints.CustomConstraint('timezone')
                     ],
@@ -137,7 +177,7 @@ common_properties_schema = {
 }
 
 
-NOVA_METERS = ['instance', 'memory', 'memory.usage',
+NOVA_METERS = ['instance', 'memory', 'memory.usage', 'memory.resident',
                'cpu', 'cpu_util', 'vcpus',
                'disk.read.requests', 'disk.read.requests.rate',
                'disk.write.requests', 'disk.write.requests.rate',
@@ -163,34 +203,51 @@ class BaseAlarm(resource.Resource):
 
     alarm_type = 'threshold'
 
+    QUERY_FACTOR_FIELDS = (
+        QF_FIELD, QF_OP, QF_VALUE, QF_TYPE,
+    ) = (
+        'field', 'op', 'value', 'type',
+    )
+
+    QF_OP_VALS = constraints.AllowedValues(['le', 'ge', 'eq',
+                                            'lt', 'gt', 'ne'])
+    QF_TYPE_VALS = constraints.AllowedValues(['integer', 'float', 'string',
+                                              'boolean', 'datetime'])
+
     def actions_to_urls(self, props):
-        kwargs = {}
-        for k, v in iter(props.items()):
-            if k in [ALARM_ACTIONS, OK_ACTIONS,
-                     INSUFFICIENT_DATA_ACTIONS] and v is not None:
-                kwargs[k] = []
-                for act in v:
-                    # if the action is a resource name
-                    # we ask the destination resource for an alarm url.
-                    # the template writer should really do this in the
-                    # template if possible with:
-                    # {Fn::GetAtt: ['MyAction', 'AlarmUrl']}
-                    if act in self.stack:
-                        url = self.stack[act].FnGetAtt('AlarmUrl')
-                        kwargs[k].append(url)
-                    else:
-                        if act:
-                            kwargs[k].append(act)
-            else:
-                kwargs[k] = v
+        kwargs = dict(props)
+
+        def get_urls(action_type, queue_type):
+            for act in kwargs.get(action_type) or []:
+                # if the action is a resource name
+                # we ask the destination resource for an alarm url.
+                # the template writer should really do this in the
+                # template if possible with:
+                # {Fn::GetAtt: ['MyAction', 'AlarmUrl']}
+                if act in self.stack:
+                    yield self.stack[act].FnGetAtt('AlarmUrl')
+                elif act:
+                    yield act
+
+            for queue in kwargs.pop(queue_type, []):
+                query = {'queue_name': queue}
+                yield 'trust+zaqar://?%s' % parse.urlencode(query)
+
+        action_props = {arg_types[0]: list(get_urls(*arg_types))
+                        for arg_types in ((ALARM_ACTIONS, ALARM_QUEUES),
+                                          (OK_ACTIONS, OK_QUEUES),
+                                          (INSUFFICIENT_DATA_ACTIONS,
+                                           INSUFFICIENT_DATA_QUEUES))}
+        kwargs.update(action_props)
         return kwargs
 
     def _reformat_properties(self, props):
         rule = {}
+        # Note that self.PROPERTIES includes only properties specific to the
+        # child class; BaseAlarm properties are not included.
         for name in self.PROPERTIES:
-            value = props.pop(name, None)
-            if value:
-                rule[name] = value
+            if name in props:
+                rule[name] = props.pop(name)
         if rule:
             props['%s_rule' % self.alarm_type] = rule
         return props

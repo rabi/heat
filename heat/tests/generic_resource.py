@@ -13,9 +13,7 @@
 
 import collections
 from oslo_log import log as logging
-import six
 
-from heat.common.i18n import _LW
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -39,26 +37,32 @@ class GenericResource(resource.Resource):
         return (True, None)
 
     def handle_create(self):
-        LOG.warning(_LW('Creating generic resource (Type "%s")'),
+        LOG.warning('Creating generic resource (Type "%s")',
                     self.type())
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        LOG.warning(_LW('Updating generic resource (Type "%s")'),
+        LOG.warning('Updating generic resource (Type "%s")',
                     self.type())
 
     def handle_delete(self):
-        LOG.warning(_LW('Deleting generic resource (Type "%s")'),
+        LOG.warning('Deleting generic resource (Type "%s")',
                     self.type())
 
     def _resolve_attribute(self, name):
         return self.name
 
     def handle_suspend(self):
-        LOG.warning(_LW('Suspending generic resource (Type "%s")'),
+        LOG.warning('Suspending generic resource (Type "%s")',
                     self.type())
 
     def handle_resume(self):
-        LOG.warning(_LW('Resuming generic resource (Type "%s")'),
+        LOG.warning(('Resuming generic resource (Type "%s")'),
+                    self.type())
+
+
+class CheckableResource(GenericResource):
+    def handle_check(self):
+        LOG.warning(('Checking generic resource (Type "%s")'),
                     self.type())
 
 
@@ -67,14 +71,14 @@ class CancellableResource(GenericResource):
         return True
 
     def handle_create_cancel(self, cookie):
-        LOG.warning(_LW('Cancelling create generic resource (Type "%s")'),
+        LOG.warning('Cancelling create generic resource (Type "%s")',
                     self.type())
 
     def check_update_complete(self, cookie):
         return True
 
     def handle_update_cancel(self, cookie):
-        LOG.warning(_LW('Cancelling update generic resource (Type "%s")'),
+        LOG.warning('Cancelling update generic resource (Type "%s")',
                     self.type())
 
 
@@ -160,6 +164,7 @@ class ResourceWithProps(GenericResource):
     properties_schema = {
         'Foo': properties.Schema(properties.Schema.STRING),
         'FooInt': properties.Schema(properties.Schema.INTEGER)}
+    atomic_key = None
 
 
 class ResourceWithPropsRefPropOnDelete(ResourceWithProps):
@@ -185,9 +190,9 @@ class ResourceWithResourceID(GenericResource):
         self.resource_id_set(self.properties.get('ID'))
 
     def handle_delete(self):
-        self.mox_resource_id(self.resource_id)
+        self.mock_resource_id(self.resource_id)
 
-    def mox_resource_id(self, resource_id):
+    def mock_resource_id(self, resource_id):
         pass
 
 
@@ -257,7 +262,7 @@ class SignalResource(signal_responder.SignalResponder):
         self.resource_id_set(self._get_user_id())
 
     def handle_signal(self, details=None):
-        LOG.warning(_LW('Signaled resource (Type "%(type)s") %(details)s'),
+        LOG.warning('Signaled resource (Type "%(type)s") %(details)s',
                     {'type': self.type(), 'details': details})
 
     def _resolve_attribute(self, name):
@@ -302,10 +307,28 @@ class ResourceWithAttributeType(GenericResource):
 class ResourceWithDefaultClientName(resource.Resource):
     default_client_name = 'sample'
 
+    properties_schema = {}
+
 
 class ResourceWithDefaultClientNameExt(resource.Resource):
     default_client_name = 'sample'
     required_service_extension = 'foo'
+
+    properties_schema = {}
+
+
+class ResourceWithDefaultClientNameMultiStrExt(resource.Resource):
+    default_client_name = 'sample'
+    required_service_extension = 'foo,bar'
+
+    properties_schema = {}
+
+
+class ResourceWithDefaultClientNameMultiExt(resource.Resource):
+    default_client_name = 'sample'
+    required_service_extension = ['foo', 'bar']
+
+    properties_schema = {}
 
 
 class ResourceWithFnGetAttType(GenericResource):
@@ -373,35 +396,14 @@ class ResourceWithRestoreType(ResWithComplexPropsAndAttrs):
     def handle_restore(self, defn, data):
         props = dict(
             (key, value) for (key, value) in
-            six.iteritems(defn.properties(self.properties_schema))
+            self.properties.data.items()
             if value is not None)
         value = data['resource_data']['a_string']
         props['a_string'] = value
         return defn.freeze(properties=props)
 
-
-class DynamicSchemaResource(resource.Resource):
-    """Resource with an attribute not registered in the attribute schema."""
-    properties_schema = {}
-
-    attributes_schema = {
-        'stat_attr': attributes.Schema('A generic static attribute',
-                                       type=attributes.Schema.STRING),
-    }
-
-    def _init_attributes(self):
-        # software deployment scheme is not static
-        # so return dynamic attributes for it
-        return attributes.DynamicSchemeAttributes(
-            self.name, self.attributes_schema, self._resolve_attribute)
-
-    def _resolve_attribute(self, name):
-        if name == 'stat_attr':
-            return "static_attribute"
-        elif name == 'dynamic_attr':
-            return "dynamic_attribute"
-        else:
-            raise KeyError()
+    def handle_delete_snapshot(self, snapshot):
+        return snapshot['resource_data'].get('a_string')
 
 
 class ResourceTypeUnSupportedLiberty(GenericResource):

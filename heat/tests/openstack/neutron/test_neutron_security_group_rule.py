@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from heat.common import exception
 from heat.common import template_format
@@ -47,10 +47,10 @@ class SecurityGroupRuleTest(common.HeatTestCase):
             'security_group_rule': {'id': '1234'}}
         expected = {
             'security_group_rule': {
-                'security_group_id': u'123',
-                'description': u'test description',
-                'remote_group_id': u'123',
-                'protocol': u'tcp',
+                'security_group_id': '123',
+                'description': 'test description',
+                'remote_group_id': '123',
+                'protocol': 'tcp',
                 'port_range_min': '100',
                 'direction': 'ingress',
                 'ethertype': 'IPv4'
@@ -63,14 +63,22 @@ class SecurityGroupRuleTest(common.HeatTestCase):
             expected)
 
     def test_validate_conflict_props(self):
+        self.patchobject(security_group_rule.SecurityGroupRule,
+                         'is_service_available',
+                         return_value=(True, None))
+
         tmpl = inline_templates.SECURITY_GROUP_RULE_TEMPLATE
-        tmpl += '      remote_ip_prefix: "123"'
+        tmpl += '      remote_ip_prefix: "10.0.0.0/8"'
         self._create_stack(tmpl=tmpl)
 
         self.assertRaises(exception.ResourcePropertyConflict,
                           self.sg_rule.validate)
 
     def test_validate_max_port_less_than_min_port(self):
+        self.patchobject(security_group_rule.SecurityGroupRule,
+                         'is_service_available',
+                         return_value=(True, None))
+
         tmpl = inline_templates.SECURITY_GROUP_RULE_TEMPLATE
         tmpl += '      port_range_max: 50'
         self._create_stack(tmpl=tmpl)

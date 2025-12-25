@@ -11,14 +11,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import copy
-import mock
-import mox
+from unittest import mock
+
 from neutronclient.common import exceptions as qe
 from neutronclient.neutron import v2_0 as neutronV20
 from neutronclient.v2_0 import client as neutronclient
 from oslo_serialization import jsonutils
-import six
 
 from heat.common import exception
 from heat.common import template_format
@@ -53,10 +51,21 @@ resources:
     properties:
       network: abcd1234
       allowed_address_pairs:
-        - ip_address: 10.0.3.21
+        - ip_address: 10.0.3.21/8
           mac_address: 00-B0-D0-86-BB-F7
 '''
 
+
+neutron_port_with_no_fixed_ips_template = '''
+heat_template_version: 2015-04-30
+description: Template to test port Neutron resource
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: abcd1234
+      no_fixed_ips: true
+'''
 
 neutron_port_security_template = '''
 heat_template_version: 2015-04-30
@@ -70,201 +79,245 @@ resources:
 '''
 
 
+neutron_port_propagate_ul_status_template = '''
+heat_template_version: 2015-04-30
+description: Template to test port Neutron resource
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: abcd1234
+      propagate_uplink_status: True
+'''
+
+
 class NeutronPortTest(common.HeatTestCase):
 
     def setUp(self):
         super(NeutronPortTest, self).setUp()
-        self.m.StubOutWithMock(neutronclient.Client, 'create_port')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_port')
-        self.m.StubOutWithMock(neutronclient.Client, 'update_port')
-        self.m.StubOutWithMock(neutronclient.Client, 'show_subnet')
-        self.m.StubOutWithMock(neutronV20, 'find_resourceid_by_name_or_id')
+        self.create_mock = self.patchobject(
+            neutronclient.Client, 'create_port')
+        self.port_show_mock = self.patchobject(
+            neutronclient.Client, 'show_port')
+        self.update_mock = self.patchobject(
+            neutronclient.Client, 'update_port')
+        self.subnet_show_mock = self.patchobject(
+            neutronclient.Client, 'show_subnet')
+        self.network_show_mock = self.patchobject(
+            neutronclient.Client, 'show_network')
+        self.find_mock = self.patchobject(
+            neutronV20, 'find_resourceid_by_name_or_id')
+
+    def test_missing_network(self):
+        t = template_format.parse(neutron_port_template)
+        t['resources']['port']['properties'] = {}
+        stack = utils.parse_stack(t)
+        port = stack['port']
+        self.assertRaises(exception.StackValidationFailed, port.validate)
 
     def test_missing_subnet_id(self):
         t = template_format.parse(neutron_port_template)
         t['resources']['port']['properties']['fixed_ips'][0].pop('subnet')
         stack = utils.parse_stack(t)
-
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'net1234',
-            'fixed_ips': [
-                {'ip_address': u'10.0.3.21'}
-            ],
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True,
-            'device_owner': u'network:dhcp'}}
-        ).AndReturn({'port': {
-            "status": "BUILD",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        self.m.ReplayAll()
+        self.find_mock.return_value = 'net1234'
+        self.create_mock.return_value = {
+            'port': {
+                "status": "BUILD",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}}
+        self.port_show_mock.return_value = {
+            'port': {
+                "status": "ACTIVE",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-
-        self.m.VerifyAll()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'net1234',
+            'fixed_ips': [
+                {'ip_address': '10.0.3.21'}
+            ],
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }})
+        self.port_show_mock.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
 
     def test_missing_ip_address(self):
         t = template_format.parse(neutron_port_template)
         t['resources']['port']['properties']['fixed_ips'][0].pop('ip_address')
         stack = utils.parse_stack(t)
-
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('sub1234')
-
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'net1234',
-            'fixed_ips': [
-                {'subnet_id': u'sub1234'}
-            ],
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True,
-            'device_owner': u'network:dhcp'}}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'net_or_sub'
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        self.m.ReplayAll()
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-        self.m.VerifyAll()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'net_or_sub',
+            'fixed_ips': [
+                {'subnet_id': 'net_or_sub'}
+            ],
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }})
+        self.port_show_mock.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766')
 
     def test_missing_fixed_ips(self):
         t = template_format.parse(neutron_port_template)
         t['resources']['port']['properties'].pop('fixed_ips')
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'net1234',
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True,
-            'device_owner': u'network:dhcp'}}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'net1234'
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
             "fixed_ips": {
                 "subnet_id": "d0e971a6-a6b4-4f4c-8c88-b75e9c120b7e",
                 "ip_address": "10.0.0.2"
             }
-        }})
-
-        self.m.ReplayAll()
+        }}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-        self.m.VerifyAll()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'net1234',
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }})
 
     def test_allowed_address_pair(self):
         t = template_format.parse(neutron_port_with_address_pair_template)
+        t['resources']['port']['properties'][
+            'allowed_address_pairs'][0]['ip_address'] = '10.0.3.21'
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'abcd1234',
-            'allowed_address_pairs': [{
-                'ip_address': u'10.0.3.21',
-                'mac_address': u'00-B0-D0-86-BB-F7'
-            }],
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True}}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'abcd1234'
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+        }}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        self.m.ReplayAll()
+        }}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-        self.m.VerifyAll()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'abcd1234',
+            'allowed_address_pairs': [{
+                'ip_address': '10.0.3.21',
+                'mac_address': '00-B0-D0-86-BB-F7'
+            }],
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'binding:vnic_type': 'normal',
+            'device_id': '',
+            'device_owner': ''
+        }})
+
+    def test_no_fixed_ips(self):
+        t = template_format.parse(neutron_port_with_no_fixed_ips_template)
+        stack = utils.parse_stack(t)
+
+        self.find_mock.return_value = 'abcd1234'
+
+        self.create_mock.return_value = {'port': {
+            "status": "BUILD",
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+        }}
+
+        self.port_show_mock.return_value = {'port': {
+            "status": "ACTIVE",
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
+        }}
+
+        port = stack['port']
+        scheduler.TaskRunner(port.create)()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'abcd1234',
+            'name': utils.PhysName(stack.name, 'port'),
+            'fixed_ips': [],
+            'admin_state_up': True,
+            'binding:vnic_type': 'normal',
+            'device_id': '',
+            'device_owner': ''
+        }})
 
     def test_port_security_enabled(self):
         t = template_format.parse(neutron_port_security_template)
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
+        self.find_mock.return_value = 'abcd1234'
 
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'abcd1234',
-            'port_security_enabled': False,
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True}}
-        ).AndReturn({'port': {
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
+        }}
 
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
-        }})
-
-        self.m.ReplayAll()
+        }}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-        self.m.VerifyAll()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'abcd1234',
+            'port_security_enabled': False,
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'binding:vnic_type': 'normal',
+            'device_id': '',
+            'device_owner': ''
+            }})
+
+    def test_port_propagate_uplink_status(self):
+        t = template_format.parse(neutron_port_propagate_ul_status_template)
+        stack = utils.parse_stack(t)
+
+        self.find_mock.return_value = 'abcd1234'
+
+        self.create_mock.return_value = {'port': {
+            "status": "BUILD",
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+        }}
+
+        self.port_show_mock.return_value = {'port': {
+            "status": "ACTIVE",
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
+        }}
+
+        port = stack['port']
+        scheduler.TaskRunner(port.create)()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'abcd1234',
+            'propagate_uplink_status': True,
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'binding:vnic_type': 'normal',
+            'device_id': '',
+            'device_owner': ''
+            }})
 
     def test_missing_mac_address(self):
         t = template_format.parse(neutron_port_with_address_pair_template)
@@ -273,35 +326,28 @@ class NeutronPortTest(common.HeatTestCase):
         )
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'abcd1234',
-            'allowed_address_pairs': [{
-                'ip_address': u'10.0.3.21',
-            }],
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True}}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'abcd1234'
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+        }}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        self.m.ReplayAll()
+        }}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-        self.m.VerifyAll()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'abcd1234',
+            'allowed_address_pairs': [{
+                'ip_address': '10.0.3.21/8',
+            }],
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'binding:vnic_type': 'normal',
+            'device_owner': '',
+            'device_id': ''}})
 
     def test_ip_address_is_cidr(self):
         t = template_format.parse(neutron_port_with_address_pair_template)
@@ -309,57 +355,37 @@ class NeutronPortTest(common.HeatTestCase):
             'allowed_address_pairs'][0]['ip_address'] = '10.0.3.0/24'
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'abcd1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('abcd1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'abcd1234',
-            'allowed_address_pairs': [{
-                'ip_address': u'10.0.3.0/24',
-                'mac_address': u'00-B0-D0-86-BB-F7'
-            }],
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True}}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'abcd1234'
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
             "id": "2e00180a-ff9d-42c4-b701-a0606b243447"
-        }})
-        neutronclient.Client.show_port(
-            '2e00180a-ff9d-42c4-b701-a0606b243447'
-        ).AndReturn({'port': {
+        }}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "2e00180a-ff9d-42c4-b701-a0606b243447"
-        }})
-
-        self.m.ReplayAll()
+        }}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-        self.m.VerifyAll()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'abcd1234',
+            'allowed_address_pairs': [{
+                'ip_address': '10.0.3.0/24',
+                'mac_address': '00-B0-D0-86-BB-F7'
+            }],
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'binding:vnic_type': 'normal',
+            'device_owner': '',
+            'device_id': ''
+        }})
 
-    def _mock_create_with_props(self, port_prop):
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'subnet',
-            'sub1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('sub1234')
-        neutronclient.Client.create_port({'port': port_prop}).AndReturn(
-            {'port': {
-                "status": "BUILD",
-                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).MultipleTimes().AndReturn({'port': {
+    def _mock_create_with_props(self):
+        self.find_mock.return_value = 'net_or_sub'
+        self.create_mock.return_value = {'port': {
+            "status": "BUILD",
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"}}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
             "dns_assignment": {
@@ -367,9 +393,34 @@ class NeutronPortTest(common.HeatTestCase):
                 "ip_address": "10.0.0.15",
                 "fqdn": "my-vm.openstack.org."}
 
-        }})
+        }}
 
-        self.m.ReplayAll()
+    def test_create_with_tags(self):
+        t = template_format.parse(neutron_port_template)
+        t['resources']['port']['properties']['tags'] = ['tag1', 'tag2']
+        stack = utils.parse_stack(t)
+
+        port_prop = {
+            'network_id': 'net_or_sub',
+            'fixed_ips': [
+                {'subnet_id': 'net_or_sub', 'ip_address': '10.0.3.21'}
+            ],
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }
+
+        set_tag_mock = self.patchobject(neutronclient.Client, 'replace_tag')
+        self._mock_create_with_props()
+
+        port = stack['port']
+        scheduler.TaskRunner(port.create)()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': port_prop})
+        set_tag_mock.assert_called_with('ports', port.resource_id,
+                                        {'tags': ['tag1', 'tag2']})
 
     def test_security_groups(self):
         t = template_format.parse(neutron_port_template)
@@ -379,22 +430,25 @@ class NeutronPortTest(common.HeatTestCase):
         stack = utils.parse_stack(t)
 
         port_prop = {
-            'network_id': u'net1234',
+            'network_id': 'net_or_sub',
             'security_groups': ['8a2f582a-e1cd-480f-b85d-b02631c10656',
                                 '024613dc-b489-4478-b46f-ada462738740'],
             'fixed_ips': [
-                {'subnet_id': u'sub1234', 'ip_address': u'10.0.3.21'}
+                {'subnet_id': 'net_or_sub', 'ip_address': '10.0.3.21'}
             ],
             'name': utils.PhysName(stack.name, 'port'),
             'admin_state_up': True,
-            'device_owner': u'network:dhcp'}
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }
 
-        self._mock_create_with_props(port_prop)
+        self._mock_create_with_props()
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
-
-        self.m.VerifyAll()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': port_prop})
 
     def test_port_with_dns_name(self):
         t = template_format.parse(neutron_port_template)
@@ -402,21 +456,25 @@ class NeutronPortTest(common.HeatTestCase):
         stack = utils.parse_stack(t)
 
         port_prop = {
-            'network_id': u'net1234',
+            'network_id': 'net_or_sub',
             'dns_name': 'myvm',
             'fixed_ips': [
-                {'subnet_id': u'sub1234', 'ip_address': u'10.0.3.21'}
+                {'subnet_id': 'net_or_sub', 'ip_address': '10.0.3.21'}
             ],
             'name': utils.PhysName(stack.name, 'port'),
             'admin_state_up': True,
-            'device_owner': u'network:dhcp'}
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }
 
-        self._mock_create_with_props(port_prop)
+        self._mock_create_with_props()
         port = stack['port']
         scheduler.TaskRunner(port.create)()
         self.assertEqual('my-vm.openstack.org.',
                          port.FnGetAtt('dns_assignment')['fqdn'])
-        self.m.VerifyAll()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': port_prop})
 
     def test_security_groups_empty_list(self):
         t = template_format.parse(neutron_port_template)
@@ -424,64 +482,78 @@ class NeutronPortTest(common.HeatTestCase):
         stack = utils.parse_stack(t)
 
         port_prop = {
-            'network_id': u'net1234',
+            'network_id': 'net_or_sub',
             'security_groups': [],
             'fixed_ips': [
-                {'subnet_id': u'sub1234', 'ip_address': u'10.0.3.21'}
+                {'subnet_id': 'net_or_sub', 'ip_address': '10.0.3.21'}
             ],
             'name': utils.PhysName(stack.name, 'port'),
             'admin_state_up': True,
-            'device_owner': u'network:dhcp'
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
         }
 
-        self._mock_create_with_props(port_prop)
+        self._mock_create_with_props()
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': port_prop})
 
-        self.m.VerifyAll()
+    def test_update_failed_port_no_replace(self):
+        t = template_format.parse(neutron_port_template)
+        stack = utils.parse_stack(t)
+        port = stack['port']
+        port.resource_id = 'r_id'
+        port.state_set(port.CREATE, port.FAILED)
+        new_props = port.properties.data.copy()
+        new_props['name'] = 'new_one'
+        self.find_mock.return_value = 'net_or_sub'
+        self.port_show_mock.return_value = {'port': {
+            "status": "ACTIVE",
+            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
+            "fixed_ips": {
+                "subnet_id": "d0e971a6-a6b4-4f4c-8c88-b75e9c120b7e",
+                "ip_address": "10.0.3.21"}}}
+        update_snippet = rsrc_defn.ResourceDefinition(port.name, port.type(),
+                                                      new_props)
+        scheduler.TaskRunner(port.update, update_snippet)()
+        self.assertEqual((port.UPDATE, port.COMPLETE), port.state)
+        self.assertEqual(1, self.update_mock.call_count)
 
     def test_port_needs_update(self):
         t = template_format.parse(neutron_port_template)
         t['resources']['port']['properties'].pop('fixed_ips')
         stack = utils.parse_stack(t)
 
-        props = {'network_id': u'net1234',
+        props = {'network_id': 'net1234',
                  'name': utils.PhysName(stack.name, 'port'),
                  'admin_state_up': True,
-                 'device_owner': u'network:dhcp'}
+                 'device_owner': 'network:dhcp',
+                 'device_id': '',
+                 'binding:vnic_type': 'normal'}
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronclient.Client.create_port(
-            {'port': props}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'net1234'
+        self.create_mock.return_value = {'port': {
             "status": "BUILD",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+        }}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
             "fixed_ips": {
                 "subnet_id": "d0e971a6-a6b4-4f4c-8c88-b75e9c120b7e",
                 "ip_address": "10.0.0.2"
             }
-        }})
-
-        self.m.ReplayAll()
+        }}
 
         # create port
         port = stack['port']
         scheduler.TaskRunner(port.create)()
+        self.create_mock.assert_called_once_with({'port': props})
 
         new_props = props.copy()
-
         # test always replace
         new_props['replacement_policy'] = 'REPLACE_ALWAYS'
         new_props['network'] = new_props.pop('network_id')
@@ -499,116 +571,72 @@ class NeutronPortTest(common.HeatTestCase):
                                            port.frozen_definition(),
                                            new_props, port.properties, None))
 
-        self.m.VerifyAll()
-
     def test_port_needs_update_network(self):
-        props = {'network_id': u'net1234',
+        net1 = '9cfe6c74-c105-4906-9a1f-81d9064e9bca'
+        net2 = '0064eec9-5681-4ba7-a745-6f8e32db9503'
+        props = {'network_id': net1,
                  'name': 'test_port',
-                 'admin_state_up': True,
-                 'device_owner': u'network:dhcp'}
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
+                 'device_owner': 'network:dhcp',
+                 'binding:vnic_type': 'normal',
+                 'device_id': ''
+                 }
+        create_kwargs = props.copy()
+        create_kwargs['admin_state_up'] = True
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'old_network',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'new_network',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net5678')
-
-        create_props = props.copy()
-        neutronclient.Client.create_port(
-            {'port': create_props}
-        ).AndReturn({'port': {
-            "status": "BUILD",
+        self.find_mock.side_effect = [net1] * 8 + [net2] * 2 + [net1]
+        self.create_mock.return_value = {'port': {
+            "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
+        }}
+        self.port_show_mock.return_value = {'port': {
             "status": "ACTIVE",
             "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
             "fixed_ips": {
                 "subnet_id": "d0e971a6-a6b4-4f4c-8c88-b75e9c120b7e",
                 "ip_address": "10.0.0.2"
             }
-        }})
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net5678',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net5678')
+        }}
 
-        call_dict = copy.deepcopy(props)
-        call_dict['security_groups'] = [
-            '0389f747-7785-4757-b7bb-2ab07e4b09c3']
-        del call_dict['network_id']
-
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).AndReturn({'port': {
-            "status": "ACTIVE",
-            "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
-        }})
-
-        neutronclient.Client.update_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766',
-            {'port': {'fixed_ips': []}}
-        ).AndReturn(None)
-
-        self.m.ReplayAll()
-
-        # create port
-        t = template_format.parse(neutron_port_template)
+        # create port with network_id
+        tmpl = neutron_port_template.replace(
+            'network: net1234',
+            'network_id: 9cfe6c74-c105-4906-9a1f-81d9064e9bca')
+        t = template_format.parse(tmpl)
         t['resources']['port']['properties'].pop('fixed_ips')
         t['resources']['port']['properties']['name'] = 'test_port'
         stack = utils.parse_stack(t)
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
+        self.assertEqual((port.CREATE, port.COMPLETE), port.state)
+        self.create_mock.assert_called_once_with({'port': create_kwargs})
 
         # Switch from network_id=ID to network=ID (no replace)
         new_props = props.copy()
         new_props['network'] = new_props.pop('network_id')
         update_snippet = rsrc_defn.ResourceDefinition(port.name, port.type(),
                                                       new_props)
+
         scheduler.TaskRunner(port.update, update_snippet)()
         self.assertEqual((port.UPDATE, port.COMPLETE), port.state)
+        self.assertEqual(0, self.update_mock.call_count)
 
         # Switch from network=ID to network=NAME (no replace)
-        new_props['network'] = 'old_network'
+        new_props['network'] = 'net1234'
         update_snippet = rsrc_defn.ResourceDefinition(port.name, port.type(),
                                                       new_props)
 
         scheduler.TaskRunner(port.update, update_snippet)()
         self.assertEqual((port.UPDATE, port.COMPLETE), port.state)
+        self.assertEqual(0, self.update_mock.call_count)
 
         # Switch to a different network (replace)
-        new_props['network'] = 'new_network'
+        new_props['network'] = 'net5678'
         update_snippet = rsrc_defn.ResourceDefinition(port.name, port.type(),
                                                       new_props)
         updater = scheduler.TaskRunner(port.update, update_snippet)
         self.assertRaises(resource.UpdateReplace, updater)
-
-        self.m.VerifyAll()
+        self.assertEqual(11, self.find_mock.call_count)
 
     def test_get_port_attributes(self):
         t = template_format.parse(neutron_port_template)
@@ -620,31 +648,31 @@ class NeutronPortTest(common.HeatTestCase):
                        'tenant_id': '58a61fc3992944ce971404a2ece6ff98',
                        'ipv6_ra_mode': None, 'cidr': '10.0.0.0/24',
                        'allocation_pools': [{'start': '10.0.0.2',
-                                             'end': u'10.0.0.254'}],
+                                             'end': '10.0.0.254'}],
                        'gateway_ip': '10.0.0.1', 'ipv6_address_mode': None,
                        'ip_version': 4, 'host_routes': [],
-                       'id': '6dd609ad-d52a-4587-b1a0-b335f76062a5'}
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'net1234',
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True,
-            'device_owner': u'network:dhcp'}}
-        ).AndReturn({'port': {
+                       'id': 'd0e971a6-a6b4-4f4c-8c88-b75e9c120b7e'}
+        network_dict = {'name': 'test-network', 'status': 'ACTIVE',
+                        'router:external': False,
+                        'availability_zone_hints': [],
+                        'availability_zones': ['nova'],
+                        'ipv4_address_scope': None, 'description': '',
+                        'subnets': [subnet_dict['id']],
+                        'port_security_enabled': True,
+                        'propagate_uplink_status': True,
+                        'tenant_id': '58a61fc3992944ce971404a2ece6ff98',
+                        'tags': [], 'ipv6_address_scope': None,
+                        'project_id': '58a61fc3992944ce971404a2ece6ff98',
+                        'revision_number': 4, 'admin_state_up': True,
+                        'shared': False, 'mtu': 1450, 'id': 'net1234'}
+        self.find_mock.return_value = 'net1234'
+        self.create_mock.return_value = {'port': {
             'status': 'BUILD',
             'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        }})
-        neutronclient.Client.show_subnet(
-            'd0e971a6-a6b4-4f4c-8c88-b75e9c120b7e'
-        ).AndReturn({'subnet': subnet_dict})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).MultipleTimes().AndReturn({'port': {
+        }}
+        self.subnet_show_mock.return_value = {'subnet': subnet_dict}
+        self.network_show_mock.return_value = {'network': network_dict}
+        self.port_show_mock.return_value = {'port': {
             'status': 'DOWN',
             'name': utils.PhysName(stack.name, 'port'),
             'allowed_address_pairs': [],
@@ -656,11 +684,18 @@ class NeutronPortTest(common.HeatTestCase):
             'security_groups': ['5b15d80c-6b70-4a1c-89c9-253538c5ade6'],
             'fixed_ips': [{'subnet_id': 'd0e971a6-a6b4-4f4c-8c88-b75e9c120b7e',
                            'ip_address': '10.0.0.2'}]
-        }})
-        self.m.ReplayAll()
+        }}
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'net1234',
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''
+        }})
         self.assertEqual('DOWN', port.FnGetAtt('status'))
         self.assertEqual([], port.FnGetAtt('allowed_address_pairs'))
         self.assertTrue(port.FnGetAtt('admin_state_up'))
@@ -678,33 +713,21 @@ class NeutronPortTest(common.HeatTestCase):
                            'ip_address': '10.0.0.2'}],
                          port.FnGetAtt('fixed_ips'))
         self.assertEqual([subnet_dict], port.FnGetAtt('subnets'))
+        self.assertEqual(network_dict, port.FnGetAtt('network'))
         self.assertRaises(exception.InvalidTemplateAttribute,
                           port.FnGetAtt, 'Foo')
-        self.m.VerifyAll()
 
     def test_subnet_attribute_exception(self):
         t = template_format.parse(neutron_port_template)
         t['resources']['port']['properties'].pop('fixed_ips')
         stack = utils.parse_stack(t)
 
-        neutronV20.find_resourceid_by_name_or_id(
-            mox.IsA(neutronclient.Client),
-            'network',
-            'net1234',
-            cmd_resource=None,
-        ).MultipleTimes().AndReturn('net1234')
-        neutronclient.Client.create_port({'port': {
-            'network_id': u'net1234',
-            'name': utils.PhysName(stack.name, 'port'),
-            'admin_state_up': True,
-            'device_owner': u'network:dhcp'}}
-        ).AndReturn({'port': {
+        self.find_mock.return_value = 'net1234'
+        self.create_mock.return_value = {'port': {
             'status': 'BUILD',
             'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        }})
-        neutronclient.Client.show_port(
-            'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
-        ).MultipleTimes().AndReturn({'port': {
+        }}
+        self.port_show_mock.return_value = {'port': {
             'status': 'DOWN',
             'name': utils.PhysName(stack.name, 'port'),
             'allowed_address_pairs': [],
@@ -716,13 +739,10 @@ class NeutronPortTest(common.HeatTestCase):
             'security_groups': ['5b15d80c-6b70-4a1c-89c9-253538c5ade6'],
             'fixed_ips': [{'subnet_id': 'd0e971a6-a6b4-4f4c-8c88-b75e9c120b7e',
                            'ip_address': '10.0.0.2'}]
-        }})
-        neutronclient.Client.show_subnet(
-            'd0e971a6-a6b4-4f4c-8c88-b75e9c120b7e'
-        ).AndRaise(qe.NeutronClientException('ConnectionFailed: Connection '
-                                             'to neutron failed: Maximum '
-                                             'attempts reached'))
-        self.m.ReplayAll()
+        }}
+        self.subnet_show_mock.side_effect = (qe.NeutronClientException(
+            'ConnectionFailed: Connection to neutron failed: Maximum '
+            'attempts reached'))
 
         port = stack['port']
         scheduler.TaskRunner(port.create)()
@@ -730,7 +750,56 @@ class NeutronPortTest(common.HeatTestCase):
         log_msg = ('Failed to fetch resource attributes: ConnectionFailed: '
                    'Connection to neutron failed: Maximum attempts reached')
         self.assertIn(log_msg, self.LOG.output)
-        self.m.VerifyAll()
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'net1234',
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''}}
+        )
+
+    def test_network_attribute_exception(self):
+        t = template_format.parse(neutron_port_template)
+        t['resources']['port']['properties'].pop('fixed_ips')
+        stack = utils.parse_stack(t)
+
+        self.find_mock.return_value = 'net1234'
+        self.create_mock.return_value = {'port': {
+            'status': 'BUILD',
+            'id': 'fc68ea2c-b60b-4b4f-bd82-94ec81110766'
+        }}
+        self.port_show_mock.return_value = {'port': {
+            'status': 'DOWN',
+            'name': utils.PhysName(stack.name, 'port'),
+            'allowed_address_pairs': [],
+            'admin_state_up': True,
+            'network_id': 'net1234',
+            'device_id': 'dc68eg2c-b60g-4b3f-bd82-67ec87650532',
+            'mac_address': 'fa:16:3e:75:67:60',
+            'tenant_id': '58a61fc3992944ce971404a2ece6ff98',
+            'security_groups': ['5b15d80c-6b70-4a1c-89c9-253538c5ade6'],
+            'fixed_ips': [{'subnet_id': 'd0e971a6-a6b4-4f4c-8c88-b75e9c120b7e',
+                           'ip_address': '10.0.0.2'}]
+        }}
+        self.network_show_mock.side_effect = (qe.NeutronClientException(
+            'ConnectionFailed: Connection to neutron failed: Maximum '
+            'attempts reached'))
+
+        port = stack['port']
+        scheduler.TaskRunner(port.create)()
+        self.assertIsNone(port.FnGetAtt('network'))
+        log_msg = ('Failed to fetch resource attributes: ConnectionFailed: '
+                   'Connection to neutron failed: Maximum attempts reached')
+        self.assertIn(log_msg, self.LOG.output)
+        self.create_mock.assert_called_once_with({'port': {
+            'network_id': 'net1234',
+            'name': utils.PhysName(stack.name, 'port'),
+            'admin_state_up': True,
+            'device_owner': 'network:dhcp',
+            'binding:vnic_type': 'normal',
+            'device_id': ''}}
+        )
 
     def test_prepare_for_replace_port_not_created(self):
         t = template_format.parse(neutron_port_template)
@@ -749,6 +818,25 @@ class NeutronPortTest(common.HeatTestCase):
         # check, if the port is not created, do nothing in
         # prepare_for_replace()
         self.assertFalse(port._show_resource.called)
+        self.assertFalse(port.data_set.called)
+        self.assertFalse(n_client.update_port.called)
+
+    def test_prepare_for_replace_port_not_found(self):
+        t = template_format.parse(neutron_port_template)
+        stack = utils.parse_stack(t)
+        port = stack['port']
+        port.resource_id = 'test_res_id'
+        port._show_resource = mock.Mock(side_effect=qe.NotFound)
+        port.data_set = mock.Mock()
+        n_client = mock.Mock()
+        port.client = mock.Mock(return_value=n_client)
+
+        # execute prepare_for_replace
+        port.prepare_for_replace()
+
+        # check, if the port is not found, do nothing in
+        # prepare_for_replace()
+        self.assertTrue(port._show_resource.called)
         self.assertFalse(port.data_set.called)
         self.assertFalse(n_client.update_port.called)
 
@@ -848,6 +936,69 @@ class NeutronPortTest(common.HeatTestCase):
             mock.call(existing_rsrc.resource_id, expected_existing_props),
             mock.call(prev_rsrc.resource_id, expected_prev_props)])
 
+    def test_port_get_live_state(self):
+        t = template_format.parse(neutron_port_template)
+        t['resources']['port']['properties']['value_specs'] = {
+            'binding:vif_type': 'test'}
+
+        stack = utils.parse_stack(t)
+
+        port = stack['port']
+
+        resp = {'port': {
+            'status': 'DOWN',
+            'binding:host_id': '',
+            'name': 'flip-port-xjbal77qope3',
+            'allowed_address_pairs': [],
+            'admin_state_up': True,
+            'network_id': 'd6859535-efef-4184-b236-e5fcae856e0f',
+            'dns_name': '',
+            'extra_dhcp_opts': [],
+            'mac_address': 'fa:16:3e:fe:64:79',
+            'qos_policy_id': 'some',
+            'dns_assignment': [],
+            'binding:vif_details': {},
+            'binding:vif_type': 'unbound',
+            'device_owner': '',
+            'tenant_id': '30f466e3d14b4251853899f9c26e2b66',
+            'binding:profile': {},
+            'port_security_enabled': True,
+            'propagate_uplink_status': True,
+            'binding:vnic_type': 'normal',
+            'fixed_ips': [
+                {'subnet_id': '02d9608f-8f30-4611-ad02-69855c82457f',
+                 'ip_address': '10.0.3.4'}],
+            'id': '829bf5c1-b59c-40ad-80e3-ea15a93879f3',
+            'security_groups': ['c276247f-50fd-4289-862a-80fb81a55de1'],
+            'device_id': ''}
+        }
+        port.client().show_port = mock.MagicMock(return_value=resp)
+        port.resource_id = '1234'
+        port._data = {}
+        port.data_set = mock.Mock()
+
+        reality = port.get_live_state(port.properties)
+        expected = {
+            'allowed_address_pairs': [],
+            'admin_state_up': True,
+            'device_owner': '',
+            'port_security_enabled': True,
+            'propagate_uplink_status': True,
+            'binding:vnic_type': 'normal',
+            'fixed_ips': [
+                {'subnet': '02d9608f-8f30-4611-ad02-69855c82457f',
+                 'ip_address': '10.0.3.4'}],
+            'security_groups': ['c276247f-50fd-4289-862a-80fb81a55de1'],
+            'device_id': '',
+            'dns_name': '',
+            'qos_policy': 'some',
+            'value_specs': {'binding:vif_type': 'unbound'}
+        }
+
+        self.assertEqual(set(expected.keys()), set(reality.keys()))
+        for key in expected:
+            self.assertEqual(expected[key], reality[key])
+
 
 class UpdatePortTest(common.HeatTestCase):
     scenarios = [
@@ -858,6 +1009,7 @@ class UpdatePortTest(common.HeatTestCase):
                              addr_pair=None,
                              vnic_type=None)),
         ('with_no_name', dict(secgrp=['8a2f582a-e1cd-480f-b85d-b02631c10656'],
+                              orig_name='original',
                               name=None,
                               value_specs={},
                               fixed_ips=None,
@@ -898,6 +1050,26 @@ class UpdatePortTest(common.HeatTestCase):
                              fixed_ips=None,
                              addr_pair=None,
                              vnic_type='direct')),
+        ('physical_direct_vnic', dict(secgrp=None,
+                                      value_specs={},
+                                      fixed_ips=None,
+                                      addr_pair=None,
+                                      vnic_type='direct-physical')),
+        ('baremetal_vnic', dict(secgrp=None,
+                                value_specs={},
+                                fixed_ips=None,
+                                addr_pair=None,
+                                vnic_type='baremetal')),
+        ('virtio_forwarder_vnic', dict(secgrp=None,
+                                       value_specs={},
+                                       fixed_ips=None,
+                                       addr_pair=None,
+                                       vnic_type='virtio-forwarder')),
+        ('smart_nic_vnic', dict(secgrp=None,
+                                value_specs={},
+                                fixed_ips=None,
+                                addr_pair=None,
+                                vnic_type='smart-nic')),
         ('with_all', dict(secgrp=['8a2f582a-e1cd-480f-b85d-b02631c10656'],
                           value_specs={},
                           fixed_ips=[
@@ -911,13 +1083,43 @@ class UpdatePortTest(common.HeatTestCase):
 
     def test_update_port(self):
         t = template_format.parse(neutron_port_template)
-        t['resources']['port']['properties'].pop('fixed_ips')
+        create_name = getattr(self, 'orig_name', None)
+        if create_name is not None:
+            t['resources']['port']['properties']['name'] = create_name
         stack = utils.parse_stack(t)
 
+        def res_id(client, resource, name_or_id, cmd_resource=None):
+            return {
+                'network': 'net1234',
+                'subnet': 'sub1234',
+            }[resource]
+
         self.patchobject(neutronV20, 'find_resourceid_by_name_or_id',
-                         return_value='net1234')
-        create_port = self.patchobject(neutronclient.Client, 'create_port')
+                         side_effect=res_id)
+
+        create_port_result = {
+            'port': {
+                "status": "BUILD",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766"
+            }
+        }
+        show_port_result = {
+            'port': {
+                "status": "ACTIVE",
+                "id": "fc68ea2c-b60b-4b4f-bd82-94ec81110766",
+                "fixed_ips": {
+                    "subnet_id": "d0e971a6-a6b4-4f4c-8c88-b75e9c120b7e",
+                    "ip_address": "10.0.0.2"
+                }
+            }
+        }
+
+        create_port = self.patchobject(neutronclient.Client, 'create_port',
+                                       return_value=create_port_result)
         update_port = self.patchobject(neutronclient.Client, 'update_port')
+        show_port = self.patchobject(neutronclient.Client, 'show_port',
+                                     return_value=show_port_result)
+
         fake_groups_list = {
             'security_groups': [
                 {
@@ -931,15 +1133,23 @@ class UpdatePortTest(common.HeatTestCase):
         }
         self.patchobject(neutronclient.Client, 'list_security_groups',
                          return_value=fake_groups_list)
+        set_tag_mock = self.patchobject(neutronclient.Client, 'replace_tag')
 
-        props = {'network_id': u'net1234',
-                 'name': utils.PhysName(stack.name, 'port'),
+        props = {'network_id': 'net1234',
+                 'fixed_ips': [{'subnet_id': 'sub1234',
+                                'ip_address': '10.0.3.21'}],
+                 'name': (create_name if create_name is not None else
+                          utils.PhysName(stack.name, 'port')),
                  'admin_state_up': True,
-                 'device_owner': u'network:dhcp'}
+                 'device_owner': 'network:dhcp',
+                 'device_id': '',
+                 'binding:vnic_type': 'normal'}
 
         update_props = props.copy()
+        update_props['name'] = getattr(self, 'name', create_name)
         update_props['security_groups'] = self.secgrp
         update_props['value_specs'] = self.value_specs
+        update_props['tags'] = ['test_tag']
         if self.fixed_ips:
             update_props['fixed_ips'] = self.fixed_ips
         update_props['allowed_address_pairs'] = self.addr_pair
@@ -947,21 +1157,28 @@ class UpdatePortTest(common.HeatTestCase):
 
         update_dict = update_props.copy()
 
+        if update_props['allowed_address_pairs'] is None:
+            update_dict['allowed_address_pairs'] = []
+
         if update_props['security_groups'] is None:
-            update_dict['security_groups'] = ['default']
+            update_dict['security_groups'] = [
+                '0389f747-7785-4757-b7bb-2ab07e4b09c3',
+            ]
 
         if update_props['name'] is None:
-            update_dict['name'] = utils.PhysName(stack.name, 'test_subnet')
+            update_dict['name'] = utils.PhysName(stack.name, 'port')
 
         value_specs = update_dict.pop('value_specs')
         if value_specs:
-            for value_spec in six.iteritems(value_specs):
+            for value_spec in value_specs.items():
                 update_dict[value_spec[0]] = value_spec[1]
+
+        tags = update_dict.pop('tags')
 
         # create port
         port = stack['port']
-        self.assertIsNone(scheduler.TaskRunner(port.handle_create)())
-        create_port.assset_called_once_with(props)
+        self.assertIsNone(scheduler.TaskRunner(port.create)())
+        create_port.assert_called_once_with({'port': props})
         # update port
         update_snippet = rsrc_defn.ResourceDefinition(port.name, port.type(),
                                                       update_props)
@@ -969,7 +1186,23 @@ class UpdatePortTest(common.HeatTestCase):
                                                update_snippet, {},
                                                update_props)())
 
-        update_port.assset_called_once_with(update_dict)
+        update_port.assert_called_once_with(
+            'fc68ea2c-b60b-4b4f-bd82-94ec81110766', {'port': update_dict})
+        set_tag_mock.assert_called_with('ports', port.resource_id,
+                                        {'tags': tags})
+        # check, that update does not cause of Update Replace
+        create_snippet = rsrc_defn.ResourceDefinition(port.name, port.type(),
+                                                      props)
+        after_props, before_props = port._prepare_update_props(update_snippet,
+                                                               create_snippet)
+        self.assertIsNotNone(
+            port.update_template_diff_properties(after_props, before_props))
+
+        # With fixed_ips removed
+        scheduler.TaskRunner(port.handle_update, update_snippet,
+                             {}, {'fixed_ips': None})()
+
         # update with empty prop_diff
         scheduler.TaskRunner(port.handle_update, update_snippet, {}, {})()
         self.assertEqual(1, update_port.call_count)
+        show_port.assert_called_with('fc68ea2c-b60b-4b4f-bd82-94ec81110766')

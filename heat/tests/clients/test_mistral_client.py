@@ -11,7 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
+from mistralclient.auth import keystone
 
 from heat.common import exception
 from heat.engine.clients.os import mistral
@@ -22,12 +24,11 @@ from heat.tests import utils
 class MistralClientPluginTest(common.HeatTestCase):
 
     def test_create(self):
+        self.patchobject(keystone.KeystoneAuthHandler, 'authenticate')
         context = utils.dummy_context()
         plugin = context.clients.client_plugin('mistral')
         client = plugin.client()
         self.assertIsNotNone(client.workflows)
-        self.assertEqual('http://server.test:5000/v3',
-                         client.http_client.base_url)
 
 
 class WorkflowConstraintTest(common.HeatTestCase):

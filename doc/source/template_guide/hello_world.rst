@@ -51,10 +51,10 @@ could be used to deploy a single compute instance:
         image: ubuntu-trusty-x86_64
         flavor: m1.small
 
-Each HOT template must include the ``heat_template_version`` key with
-the HOT version value, for example, ``2013-05-23``. A list of HOT template
-versions can be found at `Heat Template Version
-file <http://docs.openstack.org/developer/heat/template_guide/hot_spec.html#heat-template-version>`__
+Each HOT template must include the ``heat_template_version`` key with the HOT
+version value, for example, ``2013-05-23``. Consult the :ref:`Heat template
+version list <hot_spec_template_version>` for allowed values and their
+features.
 
 The ``description`` key is optional, however it is good practice to include
 some useful text that describes what users can do with the template.
@@ -137,7 +137,7 @@ following example defines a default value ``m1.small`` for the
        type: string
        label: Instance Type
        description: Flavor to be used
-      default: m1.small
+       default: m1.small
 
 .. note::
    If a template doesn't define a default value for a parameter, then the user

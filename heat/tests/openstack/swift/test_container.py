@@ -11,13 +11,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
 
-import mock
-import six
 import swiftclient.client as sc
 
 from heat.common import exception
 from heat.common import template_format
+from heat.engine import node_data
 from heat.engine.resources.openstack.swift import container as swift_c
 from heat.engine import scheduler
 from heat.tests import common
@@ -137,6 +137,11 @@ class SwiftTest(common.HeatTestCase):
         # Test
         container = self._create_container(stack)
 
+        # call this to populate the url of swiftclient. This is actually
+        # set in head_container/put_container, but we're patching them in
+        # this test.
+        container.client().get_auth()
+
         # Verify Attributes
         self.assertEqual(container_name, container.FnGetRefId())
         self.assertEqual('82', container.FnGetAtt('ObjectCount'))
@@ -153,7 +158,7 @@ class SwiftTest(common.HeatTestCase):
 
         # Verify Expected Calls
         mock_put.assert_called_once_with(container_name, {})
-        self.assertTrue(mock_head.call_count > 0)
+        self.assertGreater(mock_head.call_count, 0)
 
     @mock.patch('swiftclient.client.Connection.put_container')
     def test_public_read(self, mock_put):
@@ -298,7 +303,7 @@ class SwiftTest(common.HeatTestCase):
                          container.state)
         self.assertIn('ResourceActionNotSupported: resources.test_resource: '
                       'Deleting non-empty container',
-                      six.text_type(ex))
+                      str(ex))
         mock_put.assert_called_once_with(container_name, {})
         mock_get.assert_called_once_with(container_name)
 
@@ -447,7 +452,7 @@ class SwiftTest(common.HeatTestCase):
         ex = self.assertRaises(exception.ResourceFailure, runner)
 
         # Verify
-        self.assertIn('boom', six.text_type(ex))
+        self.assertIn('boom', str(ex))
         self.assertEqual((container.CHECK, container.FAILED),
                          container.state)
 
@@ -458,15 +463,15 @@ class SwiftTest(common.HeatTestCase):
         self.assertEqual('xyz', rsrc.FnGetRefId())
 
     def test_refid_convergence_cache_data(self):
-        cache_data = {'SwiftContainer': {
+        cache_data = {'SwiftContainer': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'reference_id': 'xyz_convg'
-        }}
+        })}
         stack = utils.parse_stack(self.t, cache_data=cache_data)
-        rsrc = stack['SwiftContainer']
+        rsrc = stack.defn['SwiftContainer']
         self.assertEqual('xyz_convg', rsrc.FnGetRefId())
 
     @mock.patch('swiftclient.client.Connection.head_account')

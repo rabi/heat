@@ -25,6 +25,9 @@ class ProviderNet(net.Net):
 
     Provider networks specify details of physical realisation of the existing
     network.
+
+    The default policy usage of this resource is limited to
+    administrators only.
     """
 
     required_service_extension = 'provider'
@@ -34,17 +37,25 @@ class ProviderNet(net.Net):
     PROPERTIES = (
         NAME, PROVIDER_NETWORK_TYPE, PROVIDER_PHYSICAL_NETWORK,
         PROVIDER_SEGMENTATION_ID, ADMIN_STATE_UP, SHARED,
-        ROUTER_EXTERNAL,
+        PORT_SECURITY_ENABLED, ROUTER_EXTERNAL, DNS_DOMAIN,
+        AVAILABILITY_ZONE_HINTS, TAGS, TENANT_ID,
     ) = (
         'name', 'network_type', 'physical_network',
         'segmentation_id', 'admin_state_up', 'shared',
-        'router_external',
+        'port_security_enabled', 'router_external', 'dns_domain',
+        'availability_zone_hints', 'tags', 'tenant_id',
     )
 
     ATTRIBUTES = (
-        STATUS, SUBNETS,
+        STATUS, SUBNETS, SEGMENTS,
     ) = (
-        'status', 'subnets',
+        'status', 'subnets', 'segments',
+    )
+
+    NETWORK_TYPES = (
+        LOCAL, VLAN, VXLAN, GRE, GENEVE, FLAT
+    ) = (
+        'local', 'vlan', 'vxlan', 'gre', 'geneve', 'flat'
     )
 
     properties_schema = {
@@ -56,7 +67,7 @@ class ProviderNet(net.Net):
             update_allowed=True,
             required=True,
             constraints=[
-                constraints.AllowedValues(['vlan', 'flat']),
+                constraints.AllowedValues(NETWORK_TYPES),
             ]
         ),
         PROVIDER_PHYSICAL_NETWORK: properties.Schema(
@@ -78,12 +89,50 @@ class ProviderNet(net.Net):
             default=True,
             update_allowed=True
         ),
+        PORT_SECURITY_ENABLED: properties.Schema(
+            properties.Schema.BOOLEAN,
+            _('Flag to enable/disable port security on the network. It '
+              'provides the default value for the attribute of the ports '
+              'created on this network.'),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='8.0.0')
+        ),
         ROUTER_EXTERNAL: properties.Schema(
             properties.Schema.BOOLEAN,
             _('Whether the network contains an external router.'),
             default=False,
             update_allowed=True,
             support_status=support.SupportStatus(version='6.0.0')
+        ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('The tags to be added to the provider network.'),
+            schema=properties.Schema(properties.Schema.STRING),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='12.0.0')
+        ),
+        DNS_DOMAIN: properties.Schema(
+            properties.Schema.STRING,
+            _('DNS domain associated with this network.'),
+            constraints=[
+                constraints.CustomConstraint('dns_domain')
+            ],
+            update_allowed=True,
+            support_status=support.SupportStatus(version='15.0.0')
+        ),
+        AVAILABILITY_ZONE_HINTS: properties.Schema(
+            properties.Schema.LIST,
+            _('Availability zone candidates for the network. It requires the '
+              'availability_zone extension to be available.'),
+            update_allowed=True,
+            support_status=support.SupportStatus(version='19.0.0')
+        ),
+        TENANT_ID: properties.Schema(
+            properties.Schema.STRING,
+            _('The ID of the tenant which will own the provider network. Only '
+              'administrative users can set the tenant identifier; this '
+              'cannot be changed using authorization policies.'),
+            support_status=support.SupportStatus(version='24.0.0')
         ),
     }
 
@@ -96,6 +145,11 @@ class ProviderNet(net.Net):
             _("Subnets of this network."),
             type=attributes.Schema.LIST
         ),
+        SEGMENTS: attributes.Schema(
+            _("The segments of this network."),
+            type=attributes.Schema.LIST,
+            support_status=support.SupportStatus(version='16.0.0'),
+        ),
     }
 
     def validate(self):
@@ -107,8 +161,18 @@ class ProviderNet(net.Net):
         super(ProviderNet, self).validate()
 
         if (self.properties[self.PROVIDER_SEGMENTATION_ID] and
-                self.properties[self.PROVIDER_NETWORK_TYPE] != 'vlan'):
-            msg = _('segmentation_id not allowed for flat network type.')
+                self.properties[self.PROVIDER_NETWORK_TYPE] in (
+                    self.LOCAL, self.FLAT)):
+            msg = _(
+                'segmentation_id not allowed for network types: local, flat')
+            raise exception.StackValidationFailed(message=msg)
+
+        if (self.properties[self.PROVIDER_PHYSICAL_NETWORK] and
+                self.properties[self.PROVIDER_NETWORK_TYPE] in (
+                    self.VXLAN, self.GRE, self.GENEVE, self.LOCAL)):
+            msg = _(
+                'physical_network not allowed for network types: '
+                'vxlan, gre, geneve, flat')
             raise exception.StackValidationFailed(message=msg)
 
     @staticmethod
@@ -143,9 +207,13 @@ class ProviderNet(net.Net):
             self.physical_resource_name())
 
         ProviderNet.prepare_provider_properties(props)
+        tags = props.pop(self.TAGS, [])
 
         prov_net = self.client().create_network({'network': props})['network']
         self.resource_id_set(prov_net['id'])
+
+        if tags:
+            self.set_tags(tags)
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         """Updates the resource with provided properties.
@@ -155,8 +223,29 @@ class ProviderNet(net.Net):
         if prop_diff:
             ProviderNet.prepare_provider_properties(prop_diff)
             self.prepare_update_properties(prop_diff)
+            if self.TAGS in prop_diff:
+                self.set_tags(prop_diff.pop(self.TAGS))
+        if prop_diff:
             self.client().update_network(self.resource_id,
                                          {'network': prop_diff})
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        # this resource should not have super in case of we don't need to
+        # parse Net resource properties.
+        result = {}
+        provider_keys = [self.PROVIDER_NETWORK_TYPE,
+                         self.PROVIDER_PHYSICAL_NETWORK,
+                         self.PROVIDER_SEGMENTATION_ID]
+        for key in provider_keys:
+            result[key] = resource_data.get('provider:%s' % key)
+        result[self.ROUTER_EXTERNAL] = resource_data.get('router:external')
+        provider_keys.append(self.ROUTER_EXTERNAL)
+
+        provider_keys.append(self.SHARED)
+        for key in set(self.PROPERTIES) - set(provider_keys):
+            if key in resource_data:
+                result[key] = resource_data.get(key)
+        return result
 
 
 def resource_mapping():

@@ -12,10 +12,9 @@
 #    under the License.
 
 import os
+from unittest import mock
 
-import mock
 import re
-import six
 import yaml
 
 from heat.common import config
@@ -47,21 +46,22 @@ class JsonToYamlTest(common.HeatTestCase):
             if template_test_count >= self.expected_test_count:
                 break
 
-        self.assertTrue(template_test_count >= self.expected_test_count,
-                        'Expected at least %d templates to be tested, not %d' %
-                        (self.expected_test_count, template_test_count))
+        self.assertGreaterEqual(
+            template_test_count, self.expected_test_count,
+            'Expected at least %d templates to be tested, not %d' %
+            (self.expected_test_count, template_test_count))
 
     def compare_json_vs_yaml(self, json_str, yml_str):
         yml = template_format.parse(yml_str)
 
-        self.assertEqual(u'2012-12-12', yml[u'HeatTemplateFormatVersion'])
-        self.assertNotIn(u'AWSTemplateFormatVersion', yml)
-        del(yml[u'HeatTemplateFormatVersion'])
+        self.assertEqual('2012-12-12', yml['HeatTemplateFormatVersion'])
+        self.assertNotIn('AWSTemplateFormatVersion', yml)
+        del yml['HeatTemplateFormatVersion']
 
         jsn = template_format.parse(json_str)
 
-        if u'AWSTemplateFormatVersion' in jsn:
-            del(jsn[u'AWSTemplateFormatVersion'])
+        if 'AWSTemplateFormatVersion' in jsn:
+            del jsn['AWSTemplateFormatVersion']
 
         self.assertEqual(yml, jsn)
 
@@ -81,7 +81,7 @@ class JsonToYamlTest(common.HeatTestCase):
         with open(path, 'r') as f:
             json_str = f.read()
             yml_str = template_format.convert_json_to_yaml(json_str)
-            match = re.search('[\s,{]\d+\s*:', yml_str)
+            match = re.search(r'[\s,{]\d+\s*:', yml_str)
             # Check that there are no matches of integer-only keys
             # lacking explicit quotes
             self.assertIsNone(match)
@@ -93,24 +93,23 @@ class YamlMinimalTest(common.HeatTestCase):
         parse_ex = self.assertRaises(ValueError,
                                      template_format.parse,
                                      tmpl_str)
-        self.assertIn(msg_str, six.text_type(parse_ex))
+        self.assertIn(msg_str, str(parse_ex))
 
     def test_long_yaml(self):
         template = {'HeatTemplateFormatVersion': '2012-12-12'}
-        config.cfg.CONF.set_override('max_template_size', 10,
-                                     enforce_type=True)
+        config.cfg.CONF.set_override('max_template_size', 10)
         template['Resources'] = ['a'] * int(
             config.cfg.CONF.max_template_size / 3)
         limit = config.cfg.CONF.max_template_size
         long_yaml = yaml.safe_dump(template)
-        self.assertTrue(len(long_yaml) > limit)
+        self.assertGreater(len(long_yaml), limit)
         ex = self.assertRaises(exception.RequestLimitExceeded,
                                template_format.parse, long_yaml)
         msg = ('Request limit exceeded: Template size (%(actual_len)s '
                'bytes) exceeds maximum allowed size (%(limit)s bytes).') % {
                    'actual_len': len(str(long_yaml)),
                    'limit': config.cfg.CONF.max_template_size}
-        self.assertEqual(msg, six.text_type(ex))
+        self.assertEqual(msg, str(ex))
 
     def test_parse_no_version_format(self):
         yaml = ''
@@ -155,7 +154,7 @@ class YamlParseExceptions(common.HeatTestCase):
         ('parser', dict(raised_exception=yaml.parser.ParserError())),
         ('reader',
          dict(raised_exception=yaml.reader.ReaderError(
-             '', 42, six.b('x'), '', ''))),
+             '', 42, 'x'.encode('latin-1'), '', ''))),
     ]
 
     def test_parse_to_value_exception(self):
@@ -165,9 +164,11 @@ class YamlParseExceptions(common.HeatTestCase):
             yaml_loader.side_effect = self.raised_exception
 
             err = self.assertRaises(ValueError,
-                                    template_format.parse, text)
+                                    template_format.parse, text,
+                                    'file://test.yaml')
 
-            self.assertIn('Error parsing template: ', six.text_type(err))
+            self.assertIn('Error parsing template file://test.yaml',
+                          str(err))
 
 
 class JsonYamlResolvedCompareTest(common.HeatTestCase):
@@ -188,18 +189,18 @@ class JsonYamlResolvedCompareTest(common.HeatTestCase):
     def compare_stacks(self, json_file, yaml_file, parameters):
         t1 = self.load_template(json_file)
         t2 = self.load_template(yaml_file)
-        del(t1[u'AWSTemplateFormatVersion'])
-        t1[u'HeatTemplateFormatVersion'] = t2[u'HeatTemplateFormatVersion']
+        del t1['AWSTemplateFormatVersion']
+        t1['HeatTemplateFormatVersion'] = t2['HeatTemplateFormatVersion']
         stack1 = utils.parse_stack(t1, parameters)
         stack2 = utils.parse_stack(t2, parameters)
 
         # compare resources separately so that resolved static data
         # is compared
         t1nr = dict(stack1.t.t)
-        del(t1nr['Resources'])
+        del t1nr['Resources']
 
         t2nr = dict(stack2.t.t)
-        del(t2nr['Resources'])
+        del t2nr['Resources']
         self.assertEqual(t1nr, t2nr)
 
         self.assertEqual(set(stack1), set(stack2))

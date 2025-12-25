@@ -13,16 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import six
-
-import eventlet.queue
 import functools
+import queue
 
 from oslo_log import log as logging
+from oslo_utils import excutils
 
 from heat.common import exception
-from heat.common.i18n import _LE
-from heat.common.i18n import _LI
 from heat.engine import resource
 from heat.engine import scheduler
 from heat.engine import stack as parser
@@ -49,140 +46,167 @@ class CheckResource(object):
                  engine_id,
                  rpc_client,
                  thread_group_mgr,
-                 msg_queue):
+                 msg_queue,
+                 input_data):
         self.engine_id = engine_id
         self._rpc_client = rpc_client
         self.thread_group_mgr = thread_group_mgr
         self.msg_queue = msg_queue
+        self.input_data = input_data
 
-    def _try_steal_engine_lock(self, cnxt, resource_id):
+    def _stale_resource_needs_retry(self, cnxt, rsrc, prev_template_id):
+        """Determine whether a resource needs retrying after failure to lock.
+
+        Return True if we need to retry the check operation because of a
+        failure to acquire the lock. This can be either because the engine
+        holding the lock is no longer working, or because no other engine had
+        locked the resource and the data was just out of date.
+
+        In the former case, the lock will be stolen and the resource status
+        changed to FAILED.
+        """
+        fields = {'current_template_id', 'engine_id'}
         rs_obj = resource_objects.Resource.get_obj(cnxt,
-                                                   resource_id)
+                                                   rsrc.id,
+                                                   refresh=True,
+                                                   fields=fields)
         if rs_obj.engine_id not in (None, self.engine_id):
             if not listener_client.EngineListenerClient(
                     rs_obj.engine_id).is_alive(cnxt):
                 # steal the lock.
                 rs_obj.update_and_save({'engine_id': None})
-                return True
-        return False
 
-    def _trigger_rollback(self, stack):
-        LOG.info(_LI("Triggering rollback of %(stack_name)s %(action)s "),
-                 {'action': stack.action, 'stack_name': stack.name})
-        stack.rollback()
-
-    def _handle_failure(self, cnxt, stack, failure_reason):
-        updated = stack.state_set(stack.action, stack.FAILED, failure_reason)
-        if not updated:
-            return False
-
-        if (not stack.disable_rollback and
-                stack.action in (stack.CREATE, stack.ADOPT, stack.UPDATE)):
-            self._trigger_rollback(stack)
-        else:
-            stack.purge_db()
-        return True
-
-    def _handle_resource_failure(self, cnxt, is_update, rsrc_id,
-                                 stack, failure_reason):
-        failure_handled = self._handle_failure(cnxt, stack, failure_reason)
-        if not failure_handled:
-            # Another concurrent update has taken over. But there is a
-            # possibility for that update to be waiting for this rsrc to
-            # complete, hence retrigger current rsrc for latest traversal.
-            traversal = stack.current_traversal
-            latest_stack = parser.Stack.load(cnxt, stack_id=stack.id,
-                                             force_reload=True)
-            if traversal != latest_stack.current_traversal:
-                self._retrigger_check_resource(cnxt, is_update, rsrc_id,
-                                               latest_stack)
-
-    def _handle_stack_timeout(self, cnxt, stack):
-        failure_reason = u'Timed out'
-        self._handle_failure(cnxt, stack, failure_reason)
-
-    def _do_check_resource(self, cnxt, current_traversal, tmpl, resource_data,
-                           is_update, rsrc, stack, adopt_stack_data):
-        try:
-            if is_update:
-                try:
-                    check_resource_update(rsrc, tmpl.id, resource_data,
-                                          self.engine_id,
-                                          stack, self.msg_queue)
-                except resource.UpdateReplace:
-                    new_res_id = rsrc.make_replacement(tmpl.id)
-                    LOG.info(_LI("Replacing resource with new id %s"),
-                             new_res_id)
-                    rpc_data = sync_point.serialize_input_data(resource_data)
-                    self._rpc_client.check_resource(cnxt,
-                                                    new_res_id,
-                                                    current_traversal,
-                                                    rpc_data, is_update,
-                                                    adopt_stack_data)
-                    return False
-
-            else:
-                check_resource_cleanup(rsrc, tmpl.id, resource_data,
-                                       self.engine_id,
-                                       stack.time_remaining(), self.msg_queue)
-
-            return True
-        except exception.UpdateInProgress:
-            if self._try_steal_engine_lock(cnxt, rsrc.id):
-                rpc_data = sync_point.serialize_input_data(resource_data)
                 # set the resource state as failed
                 status_reason = ('Worker went down '
                                  'during resource %s' % rsrc.action)
                 rsrc.state_set(rsrc.action,
                                rsrc.FAILED,
-                               six.text_type(status_reason))
+                               str(status_reason))
+                return True
+        elif (rs_obj.engine_id is None and
+              rs_obj.current_template_id == prev_template_id):
+            LOG.debug('Resource id=%d stale; retrying check', rsrc.id)
+            return True
+        LOG.debug('Resource id=%d modified by another traversal', rsrc.id)
+        return False
+
+    def _handle_resource_failure(self, cnxt, is_update, rsrc_id,
+                                 stack, failure_reason):
+        failure_handled = stack.mark_failed(failure_reason)
+        if not failure_handled:
+            # Another concurrent update has taken over. But there is a
+            # possibility for that update to be waiting for this rsrc to
+            # complete, hence retrigger current rsrc for latest traversal.
+            self._retrigger_new_traversal(cnxt, stack.current_traversal,
+                                          is_update,
+                                          stack.id, rsrc_id)
+
+    def _retrigger_new_traversal(self, cnxt, current_traversal, is_update,
+                                 stack_id, rsrc_id):
+        latest_stack = parser.Stack.load(cnxt, stack_id=stack_id,
+                                         force_reload=True)
+        if current_traversal != latest_stack.current_traversal:
+            self.retrigger_check_resource(cnxt, rsrc_id, latest_stack)
+
+    def _handle_stack_timeout(self, cnxt, stack):
+        failure_reason = 'Timed out'
+        stack.mark_failed(failure_reason)
+
+    def _handle_resource_replacement(self, cnxt,
+                                     current_traversal, new_tmpl_id, requires,
+                                     rsrc, stack, adopt_stack_data):
+        """Create a replacement resource and trigger a check on it."""
+        try:
+            new_res_id = rsrc.make_replacement(new_tmpl_id, requires)
+        except exception.UpdateInProgress:
+            LOG.info("No replacement created - "
+                     "resource already locked by new traversal")
+            return
+        if new_res_id is None:
+            LOG.info("No replacement created - "
+                     "new traversal already in progress")
+            self._retrigger_new_traversal(cnxt, current_traversal, True,
+                                          stack.id, rsrc.id)
+            return
+        LOG.info("Replacing resource with new id %s", new_res_id)
+        rpc_data = sync_point.serialize_input_data(self.input_data)
+        self._rpc_client.check_resource(cnxt,
+                                        new_res_id,
+                                        current_traversal,
+                                        rpc_data, True,
+                                        adopt_stack_data)
+
+    def _do_check_resource(self, cnxt, current_traversal, tmpl, resource_data,
+                           is_update, rsrc, stack, adopt_stack_data):
+        prev_template_id = rsrc.current_template_id
+        try:
+            if is_update:
+                requires = set(d.primary_key for d in resource_data.values()
+                               if d is not None)
+                try:
+                    check_resource_update(rsrc, tmpl.id, requires,
+                                          self.engine_id,
+                                          stack, self.msg_queue)
+                except resource.UpdateReplace:
+                    self._handle_resource_replacement(cnxt, current_traversal,
+                                                      tmpl.id, requires,
+                                                      rsrc, stack,
+                                                      adopt_stack_data)
+                    return False
+
+            else:
+                check_resource_cleanup(rsrc, tmpl.id, self.engine_id,
+                                       stack.time_remaining(), self.msg_queue)
+
+            return True
+        except exception.UpdateInProgress:
+            LOG.debug('Waiting for existing update to unlock resource %s',
+                      rsrc.id)
+            if self._stale_resource_needs_retry(cnxt, rsrc, prev_template_id):
+                rpc_data = sync_point.serialize_input_data(self.input_data)
                 self._rpc_client.check_resource(cnxt,
                                                 rsrc.id,
                                                 current_traversal,
                                                 rpc_data, is_update,
                                                 adopt_stack_data)
+            else:
+                rsrc.handle_preempt()
         except exception.ResourceFailure as ex:
             action = ex.action or rsrc.action
             reason = 'Resource %s failed: %s' % (action,
-                                                 six.text_type(ex))
+                                                 str(ex))
             self._handle_resource_failure(cnxt, is_update, rsrc.id,
                                           stack, reason)
         except scheduler.Timeout:
-            # reload the stack to verify current traversal
-            stack = parser.Stack.load(cnxt, stack_id=stack.id)
-            if stack.current_traversal != current_traversal:
-                return
-            self._handle_stack_timeout(cnxt, stack)
+            self._handle_resource_failure(cnxt, is_update, rsrc.id,
+                                          stack, 'Timed out')
         except CancelOperation:
-            pass
+            # Stack is already marked FAILED, so we just need to retrigger
+            # in case a new traversal has started and is waiting on us.
+            self._retrigger_new_traversal(cnxt, current_traversal, is_update,
+                                          stack.id, rsrc.id)
 
         return False
 
-    def _retrigger_check_resource(self, cnxt, is_update, resource_id, stack):
+    def retrigger_check_resource(self, cnxt, resource_id, stack):
         current_traversal = stack.current_traversal
         graph = stack.convergence_dependencies.graph()
-        key = (resource_id, is_update)
-        if is_update:
-            # When re-trigger received for update in latest traversal, first
-            # check if update key is available in graph.
-            # if No, then latest traversal is waiting for delete.
-            if (resource_id, is_update) not in graph:
-                key = (resource_id, not is_update)
-        else:
-            # When re-trigger received for delete in latest traversal, first
-            # check if update key is available in graph,
-            # if yes, then latest traversal is waiting for update.
-            if (resource_id, True) in graph:
-                # not is_update evaluates to True below, which means update
-                key = (resource_id, not is_update)
-        LOG.info(_LI('Re-trigger resource: (%(key1)s, %(key2)s)'),
-                 {'key1': key[0], 'key2': key[1]})
+
+        # When re-trigger received for latest traversal, first check if update
+        # key is available in graph. If yes, the latest traversal is waiting
+        # for update, otherwise it is waiting for delete. This is the case
+        # regardless of which action (update or cleanup) from the previous
+        # traversal was blocking it.
+        update_key = parser.ConvergenceNode(resource_id, True)
+        key = parser.ConvergenceNode(resource_id, update_key in graph)
+
+        LOG.info('Re-trigger resource: %s', key)
         predecessors = set(graph[key])
 
         try:
             propagate_check_resource(cnxt, self._rpc_client, resource_id,
                                      current_traversal, predecessors, key,
-                                     None, key[1], None)
+                                     None, key.is_update, None)
         except exception.EntityNotFound as e:
             if e.entity != "Sync Point":
                 raise
@@ -192,7 +216,7 @@ class CheckResource(object):
                                      stack):
         deps = stack.convergence_dependencies
         graph = deps.graph()
-        graph_key = (resource_id, is_update)
+        graph_key = parser.ConvergenceNode(resource_id, is_update)
 
         if graph_key not in graph and rsrc.replaces is not None:
             # If we are a replacement, impersonate the replaced resource for
@@ -201,15 +225,19 @@ class CheckResource(object):
             # graph. Our real resource ID is sent in the input_data, so the
             # dependencies will get updated to point to this resource in time
             # for the next traversal.
-            graph_key = (rsrc.replaces, is_update)
+            graph_key = parser.ConvergenceNode(rsrc.replaces, is_update)
 
-        def _get_input_data(req, fwd):
-            if fwd:
-                return construct_input_data(rsrc, stack)
+        def _get_input_data(req_node, input_forward_data=None):
+            if req_node.is_update:
+                if input_forward_data is None:
+                    return rsrc.node_data().as_dict()
+                else:
+                    # do not re-resolve attrs
+                    return input_forward_data
             else:
                 # Don't send data if initiating clean-up for self i.e.
                 # initiating delete of a replaced resource
-                if req not in graph_key:
+                if req_node.rsrc_id != graph_key.rsrc_id:
                     # send replaced resource as needed_by if it exists
                     return (rsrc.replaced_by
                             if rsrc.replaced_by is not None
@@ -217,15 +245,26 @@ class CheckResource(object):
             return None
 
         try:
-            for req, fwd in deps.required_by(graph_key):
-                input_data = _get_input_data(req, fwd)
+            input_forward_data = None
+            for req_node in sorted(deps.required_by(graph_key),
+                                   key=lambda n: n.is_update):
+                input_data = _get_input_data(req_node, input_forward_data)
+                if req_node.is_update:
+                    input_forward_data = input_data
                 propagate_check_resource(
-                    cnxt, self._rpc_client, req, current_traversal,
-                    set(graph[(req, fwd)]), graph_key, input_data, fwd,
+                    cnxt, self._rpc_client, req_node.rsrc_id,
+                    current_traversal, set(graph[req_node]),
+                    graph_key, input_data, req_node.is_update,
                     stack.adopt_stack_data)
-
+            if is_update:
+                if input_forward_data is None:
+                    # we haven't resolved attribute data for the resource,
+                    # so clear any old attributes so they may be re-resolved
+                    rsrc.clear_stored_attributes()
+                else:
+                    rsrc.store_attributes()
             check_stack_complete(cnxt, stack, current_traversal,
-                                 graph_key[0], deps, graph_key[1])
+                                 graph_key.rsrc_id, deps, graph_key.is_update)
         except exception.EntityNotFound as e:
             if e.entity == "Sync Point":
                 # Reload the stack to determine the current traversal, and
@@ -239,8 +278,7 @@ class CheckResource(object):
                               current_traversal)
                     return
 
-                self._retrigger_check_resource(cnxt, is_update,
-                                               resource_id, stack)
+                self.retrigger_check_resource(cnxt, resource_id, stack)
             else:
                 raise
 
@@ -260,68 +298,35 @@ class CheckResource(object):
         stack.adopt_stack_data = adopt_stack_data
         stack.thread_group_mgr = self.thread_group_mgr
 
-        if is_update:
-            if (rsrc.replaced_by is not None and
-                    rsrc.current_template_id != tmpl.id):
-                return
+        try:
+            check_resource_done = self._do_check_resource(cnxt,
+                                                          current_traversal,
+                                                          tmpl, resource_data,
+                                                          is_update,
+                                                          rsrc, stack,
+                                                          adopt_stack_data)
 
-        check_resource_done = self._do_check_resource(cnxt, current_traversal,
-                                                      tmpl, resource_data,
-                                                      is_update,
-                                                      rsrc, stack,
-                                                      adopt_stack_data)
+            if check_resource_done:
+                # initiate check on next set of resources from graph
+                self._initiate_propagate_resource(cnxt, resource_id,
+                                                  current_traversal, is_update,
+                                                  rsrc, stack)
+        except BaseException as exc:
+            with excutils.save_and_reraise_exception():
+                msg = str(exc)
+                LOG.exception("Unexpected exception in resource check.")
+                self._handle_resource_failure(cnxt, is_update, rsrc.id,
+                                              stack, msg)
 
-        if check_resource_done:
-            # initiate check on next set of resources from graph
-            self._initiate_propagate_resource(cnxt, resource_id,
-                                              current_traversal, is_update,
-                                              rsrc, stack)
 
-
-def load_resource(cnxt, resource_id, resource_data, is_update):
-    if is_update:
-        cache_data = {in_data.get(
-            'name'): in_data for in_data in resource_data.values()
-            if in_data is not None}
-    else:
-        # no data to resolve in cleanup phase
-        cache_data = {}
-
+def load_resource(cnxt, resource_id, resource_data,
+                  current_traversal, is_update):
     try:
-        return resource.Resource.load(cnxt, resource_id,
-                                      is_update, cache_data)
+        return resource.Resource.load(cnxt, resource_id, current_traversal,
+                                      is_update, resource_data)
     except (exception.ResourceNotFound, exception.NotFound):
         # can be ignored
         return None, None, None
-
-
-def _resolve_attributes(dep_attrs, rsrc):
-    resolved_attributes = {}
-    for attr in dep_attrs:
-        try:
-            if isinstance(attr, six.string_types):
-                resolved_attributes[attr] = rsrc.get_attribute(attr)
-            else:
-                resolved_attributes[attr] = rsrc.get_attribute(*attr)
-        except exception.InvalidTemplateAttribute as ita:
-            LOG.info(six.text_type(ita))
-    return resolved_attributes
-
-
-def construct_input_data(rsrc, curr_stack):
-    dep_attrs = curr_stack.get_dep_attrs(
-        six.itervalues(curr_stack.resources),
-        curr_stack.outputs,
-        rsrc.name,
-        curr_stack.t.OUTPUT_VALUE)
-    input_data = {'id': rsrc.id,
-                  'name': rsrc.name,
-                  'reference_id': rsrc.get_reference_id(),
-                  'attrs': _resolve_attributes(dep_attrs, rsrc),
-                  'status': rsrc.status,
-                  'action': rsrc.action,
-                  'uuid': rsrc.uuid}
-    return input_data
 
 
 def check_stack_complete(cnxt, stack, current_traversal, sender_id, deps,
@@ -339,7 +344,7 @@ def check_stack_complete(cnxt, stack, current_traversal, sender_id, deps,
     def mark_complete(stack_id, data):
         stack.mark_complete()
 
-    sender_key = (sender_id, is_update)
+    sender_key = parser.ConvergenceNode(sender_id, is_update)
     sync_point.sync(cnxt, stack.id, current_traversal, True,
                     mark_complete, roots, {sender_key: None})
 
@@ -362,31 +367,31 @@ def _check_for_message(msg_queue):
         return
     try:
         message = msg_queue.get_nowait()
-    except eventlet.queue.Empty:
+    except queue.Empty:
         return
 
     if message == rpc_api.THREAD_CANCEL:
         raise CancelOperation
 
-    LOG.error(_LE('Unknown message "%s" received'), message)
+    LOG.error('Unknown message "%s" received', message)
 
 
-def check_resource_update(rsrc, template_id, resource_data, engine_id,
+def check_resource_update(rsrc, template_id, requires, engine_id,
                           stack, msg_queue):
     """Create or update the Resource if appropriate."""
     check_message = functools.partial(_check_for_message, msg_queue)
     if rsrc.action == resource.Resource.INIT:
-        rsrc.create_convergence(template_id, resource_data, engine_id,
+        rsrc.create_convergence(template_id, requires, engine_id,
                                 stack.time_remaining(), check_message)
     else:
-        rsrc.update_convergence(template_id, resource_data, engine_id,
+        rsrc.update_convergence(template_id, requires, engine_id,
                                 stack.time_remaining(), stack,
                                 check_message)
 
 
-def check_resource_cleanup(rsrc, template_id, resource_data, engine_id,
+def check_resource_cleanup(rsrc, template_id, engine_id,
                            timeout, msg_queue):
     """Delete the Resource if appropriate."""
     check_message = functools.partial(_check_for_message, msg_queue)
-    rsrc.delete_convergence(template_id, resource_data, engine_id, timeout,
+    rsrc.delete_convergence(template_id, engine_id, timeout,
                             check_message)

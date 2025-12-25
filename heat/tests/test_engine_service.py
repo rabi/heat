@@ -11,19 +11,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
 import uuid
 
-import mock
-import mox
 from oslo_config import cfg
 from oslo_messaging.rpc import dispatcher
 from oslo_serialization import jsonutils as json
-import six
 
 from heat.common import context
 from heat.common import environment_util as env_util
 from heat.common import exception
 from heat.common import identifier
+from heat.common import policy
 from heat.common import template_format
 from heat.engine.cfn import template as cfntemplate
 from heat.engine import environment
@@ -34,6 +33,7 @@ from heat.engine import service
 from heat.engine import stack as parser
 from heat.engine import template as templatem
 from heat.objects import stack as stack_object
+from heat.rpc import api as rpc_api
 from heat.tests import common
 from heat.tests.engine import tools
 from heat.tests import generic_resource as generic_rsrc
@@ -113,19 +113,16 @@ resources:
 
 
 class StackCreateTest(common.HeatTestCase):
-    def setUp(self):
-        super(StackCreateTest, self).setUp()
-
     def test_wordpress_single_instance_stack_create(self):
         stack = tools.get_stack('test_stack', utils.dummy_context())
-        tools.setup_mocks(self.m, stack)
-        self.m.ReplayAll()
+        fc = tools.setup_mocks_with_mock(self, stack)
         stack.store()
         stack.create()
 
         self.assertIsNotNone(stack['WebServer'])
-        self.assertTrue(int(stack['WebServer'].resource_id) > 0)
+        self.assertGreater(int(stack['WebServer'].resource_id), 0)
         self.assertNotEqual(stack['WebServer'].ipaddress, '0.0.0.0')
+        tools.validate_setup_mocks_with_mock(stack, fc)
 
     def test_wordpress_single_instance_stack_adopt(self):
         t = template_format.parse(tools.wp_template)
@@ -143,14 +140,16 @@ class StackCreateTest(common.HeatTestCase):
                              template,
                              adopt_stack_data=adopt_data)
 
-        tools.setup_mocks(self.m, stack)
-        self.m.ReplayAll()
+        fc = tools.setup_mocks_with_mock(self, stack,
+                                         mock_image_constraint=False)
         stack.store()
         stack.adopt()
 
         self.assertIsNotNone(stack['WebServer'])
         self.assertEqual('test-res-id', stack['WebServer'].resource_id)
         self.assertEqual((stack.ADOPT, stack.COMPLETE), stack.state)
+        tools.validate_setup_mocks_with_mock(
+            stack, fc, mock_image_constraint=False, validate_create=False)
 
     def test_wordpress_single_instance_stack_adopt_fail(self):
         t = template_format.parse(tools.wp_template)
@@ -168,8 +167,8 @@ class StackCreateTest(common.HeatTestCase):
                              template,
                              adopt_stack_data=adopt_data)
 
-        tools.setup_mocks(self.m, stack)
-        self.m.ReplayAll()
+        fc = tools.setup_mocks_with_mock(self, stack,
+                                         mock_image_constraint=False)
         stack.store()
         stack.adopt()
         self.assertIsNotNone(stack['WebServer'])
@@ -177,12 +176,13 @@ class StackCreateTest(common.HeatTestCase):
                     'Resource ID was not provided.')
         self.assertEqual(expected, stack.status_reason)
         self.assertEqual((stack.ADOPT, stack.FAILED), stack.state)
+        tools.validate_setup_mocks_with_mock(
+            stack, fc, mock_image_constraint=False, validate_create=False)
 
     def test_wordpress_single_instance_stack_delete(self):
         ctx = utils.dummy_context()
         stack = tools.get_stack('test_stack', ctx)
-        fc = tools.setup_mocks(self.m, stack, mock_keystone=False)
-        self.m.ReplayAll()
+        fc = tools.setup_mocks_with_mock(self, stack, mock_keystone=False)
         stack_id = stack.store()
         stack.create()
 
@@ -190,7 +190,7 @@ class StackCreateTest(common.HeatTestCase):
         self.assertIsNotNone(db_s)
 
         self.assertIsNotNone(stack['WebServer'])
-        self.assertTrue(int(stack['WebServer'].resource_id) > 0)
+        self.assertGreater(int(stack['WebServer'].resource_id), 0)
 
         self.patchobject(fc.servers, 'delete',
                          side_effect=fakes_nova.fake_exception())
@@ -203,25 +203,25 @@ class StackCreateTest(common.HeatTestCase):
 
         db_s.refresh()
         self.assertEqual('DELETE', db_s.action)
-        self.assertEqual('COMPLETE', db_s.status, )
+        self.assertEqual('COMPLETE', db_s.status)
+        tools.validate_setup_mocks_with_mock(stack, fc)
 
 
 class StackConvergenceServiceCreateUpdateTest(common.HeatTestCase):
 
     def setUp(self):
         super(StackConvergenceServiceCreateUpdateTest, self).setUp()
-        cfg.CONF.set_override('convergence_engine', True, enforce_type=True)
+        cfg.CONF.set_override('convergence_engine', True)
         self.ctx = utils.dummy_context()
         self.man = service.EngineService('a-host', 'a-topic')
+        self.man.thread_group_mgr = tools.DummyThreadGroupManager()
 
-    def _stub_update_mocks(self, stack_to_load, stack_to_return):
-        self.m.StubOutWithMock(parser, 'Stack')
-        self.m.StubOutWithMock(parser.Stack, 'load')
-        parser.Stack.load(self.ctx, stack=stack_to_load
-                          ).AndReturn(stack_to_return)
+    def _stub_update_mocks(self, stack_to_return):
+        self.patchobject(parser, 'Stack')
+        parser.Stack.load.return_value = stack_to_return
 
-        self.m.StubOutWithMock(templatem, 'Template')
-        self.m.StubOutWithMock(environment, 'Environment')
+        self.patchobject(templatem, 'Template')
+        self.patchobject(environment, 'Environment')
 
     def _test_stack_create_convergence(self, stack_name):
         params = {'foo': 'bar'}
@@ -231,32 +231,29 @@ class StackConvergenceServiceCreateUpdateTest(common.HeatTestCase):
                                 template=tools.string_template_five,
                                 convergence=True)
 
-        self.m.StubOutWithMock(templatem, 'Template')
-        self.m.StubOutWithMock(environment, 'Environment')
-        self.m.StubOutWithMock(parser, 'Stack')
+        stack.converge = None
+        self.patchobject(templatem, 'Template', return_value=stack.t)
+        self.patchobject(environment, 'Environment', return_value=stack.env)
+        self.patchobject(parser, 'Stack', return_value=stack)
+        self.patchobject(stack, 'validate', return_value=None)
 
-        templatem.Template(template, files=None).AndReturn(stack.t)
-        environment.Environment(params).AndReturn(stack.env)
-        parser.Stack(self.ctx, stack.name,
-                     stack.t, owner_id=None,
-                     parent_resource=None,
-                     nested_depth=0, user_creds_id=None,
-                     stack_user_project_id=None,
-                     timeout_mins=60,
-                     disable_rollback=False,
-                     convergence=True).AndReturn(stack)
-
-        self.m.StubOutWithMock(stack, 'validate')
-        stack.validate().AndReturn(None)
-
-        self.m.ReplayAll()
         api_args = {'timeout_mins': 60, 'disable_rollback': False}
         result = self.man.create_stack(self.ctx, 'service_create_test_stack',
                                        template, params, None, api_args)
         db_stack = stack_object.Stack.get_by_id(self.ctx, result['stack_id'])
         self.assertTrue(db_stack.convergence)
         self.assertEqual(result['stack_id'], db_stack.id)
-        self.m.VerifyAll()
+        templatem.Template.assert_called_once_with(template, files=None)
+        environment.Environment.assert_called_once_with(params)
+        parser.Stack.assert_called_once_with(
+            self.ctx, stack.name,
+            stack.t, owner_id=None,
+            parent_resource=None,
+            nested_depth=0, user_creds_id=None,
+            stack_user_project_id=None,
+            timeout_mins=60,
+            disable_rollback=False,
+            convergence=True)
 
     def test_stack_create_enabled_convergence_engine(self):
         stack_name = 'service_create_test_stack'
@@ -270,47 +267,31 @@ class StackConvergenceServiceCreateUpdateTest(common.HeatTestCase):
                                     template=tools.string_template_five,
                                     convergence=True)
         old_stack.timeout_mins = 1
-        sid = old_stack.store()
-        s = stack_object.Stack.get_by_id(self.ctx, sid)
-
+        old_stack.store()
         stack = tools.get_stack(stack_name, self.ctx,
                                 template=tools.string_template_five_update,
                                 convergence=True)
 
-        self._stub_update_mocks(s, old_stack)
+        self._stub_update_mocks(old_stack)
 
-        templatem.Template(template, files=None).AndReturn(stack.t)
-        environment.Environment(params).AndReturn(stack.env)
-        parser.Stack(self.ctx, stack.name,
-                     stack.t,
-                     owner_id=old_stack.owner_id,
-                     nested_depth=old_stack.nested_depth,
-                     user_creds_id=old_stack.user_creds_id,
-                     stack_user_project_id=old_stack.stack_user_project_id,
-                     timeout_mins=60,
-                     disable_rollback=False,
-                     parent_resource=None,
-                     strict_validate=True,
-                     tenant_id=old_stack.tenant_id,
-                     username=old_stack.username,
-                     convergence=old_stack.convergence,
-                     current_traversal=old_stack.current_traversal,
-                     prev_raw_template_id=old_stack.prev_raw_template_id,
-                     current_deps=old_stack.current_deps).AndReturn(stack)
+        templatem.Template.return_value = stack.t
+        environment.Environment.return_value = stack.env
+        parser.Stack.return_value = stack
 
-        self.m.StubOutWithMock(stack, 'validate')
-        stack.validate().AndReturn(None)
+        self.patchobject(stack, 'validate', return_value=None)
 
-        self.m.ReplayAll()
-
-        api_args = {'timeout_mins': 60, 'disable_rollback': False}
+        api_args = {'timeout_mins': 60, 'disable_rollback': False,
+                    rpc_api.PARAM_CONVERGE: False}
         result = self.man.update_stack(self.ctx, old_stack.identifier(),
                                        template, params, None, api_args)
         self.assertTrue(old_stack.convergence)
         self.assertEqual(old_stack.identifier(), result)
         self.assertIsInstance(result, dict)
         self.assertTrue(result['stack_id'])
-        self.m.VerifyAll()
+        parser.Stack.load.assert_called_once_with(
+            self.ctx, stack=mock.ANY, check_refresh_cred=True)
+        templatem.Template.assert_called_once_with(template, files=None)
+        environment.Environment.assert_called_once_with(params)
 
 
 class StackServiceAuthorizeTest(common.HeatTestCase):
@@ -330,25 +311,19 @@ class StackServiceAuthorizeTest(common.HeatTestCase):
 
     @tools.stack_context('service_authorize_user_attribute_error_test_stack')
     def test_stack_authorize_stack_user_attribute_error(self):
-        self.m.StubOutWithMock(json, 'loads')
-        json.loads(None).AndRaise(AttributeError)
-        self.m.ReplayAll()
+        self.patchobject(json, 'loads', side_effect=AttributeError)
         self.assertFalse(self.eng._authorize_stack_user(self.ctx,
                                                         self.stack,
                                                         'foo'))
-        self.m.VerifyAll()
+        json.loads.assert_called_once_with(None)
 
     @tools.stack_context('service_authorize_stack_user_type_error_test_stack')
     def test_stack_authorize_stack_user_type_error(self):
-        self.m.StubOutWithMock(json, 'loads')
-        json.loads(mox.IgnoreArg()).AndRaise(TypeError)
-        self.m.ReplayAll()
-
+        self.patchobject(json, 'loads', side_effect=TypeError)
         self.assertFalse(self.eng._authorize_stack_user(self.ctx,
                                                         self.stack,
                                                         'foo'))
-
-        self.m.VerifyAll()
+        json.loads.assert_called_once_with(None)
 
     def test_stack_authorize_stack_user(self):
         self.ctx = utils.dummy_context()
@@ -356,11 +331,10 @@ class StackServiceAuthorizeTest(common.HeatTestCase):
         stack_name = 'stack_authorize_stack_user'
         stack = tools.get_stack(stack_name, self.ctx, user_policy_template)
         self.stack = stack
-        fc = tools.setup_mocks(self.m, stack)
+        fc = tools.setup_mocks_with_mock(self, stack)
         self.patchobject(fc.servers, 'delete',
                          side_effect=fakes_nova.fake_exception())
 
-        self.m.ReplayAll()
         stack.store()
         stack.create()
 
@@ -372,8 +346,7 @@ class StackServiceAuthorizeTest(common.HeatTestCase):
 
         self.assertFalse(self.eng._authorize_stack_user(
             self.ctx, self.stack, 'NoSuchResource'))
-
-        self.m.VerifyAll()
+        tools.validate_setup_mocks_with_mock(stack, fc)
 
     def test_stack_authorize_stack_user_user_id(self):
         self.ctx = utils.dummy_context(user_id=str(uuid.uuid4()))
@@ -395,7 +368,7 @@ class StackServiceAuthorizeTest(common.HeatTestCase):
             self.ctx, self.stack, 'NoSuchResource'))
 
         # not matching credential_id
-        self.ctx.user = str(uuid.uuid4())
+        self.ctx.user_id = str(uuid.uuid4())
         self.assertFalse(self.eng._authorize_stack_user(
             self.ctx, self.stack, 'WebServer'))
 
@@ -711,21 +684,18 @@ class StackServiceTest(common.HeatTestCase):
 
     @tools.stack_context('service_export_stack')
     def test_export_stack(self):
-        cfg.CONF.set_override('enable_stack_abandon', True, enforce_type=True)
-        self.m.StubOutWithMock(parser.Stack, 'load')
-        parser.Stack.load(self.ctx,
-                          stack=mox.IgnoreArg()).AndReturn(self.stack)
+        cfg.CONF.set_override('enable_stack_abandon', True)
+        self.patchobject(parser.Stack, 'load', return_value=self.stack)
         expected_res = {
-            u'WebServer': {
+            'WebServer': {
                 'action': 'CREATE',
                 'metadata': {},
-                'name': u'WebServer',
+                'name': 'WebServer',
                 'resource_data': {},
                 'resource_id': '9999',
                 'status': 'COMPLETE',
-                'type': u'AWS::EC2::Instance'}}
+                'type': 'AWS::EC2::Instance'}}
         self.stack.tags = ['tag1', 'tag2']
-        self.m.ReplayAll()
         ret = self.eng.export_stack(self.ctx, self.stack.identifier())
         self.assertEqual(11, len(ret))
         self.assertEqual('CREATE', ret['action'])
@@ -740,42 +710,36 @@ class StackServiceTest(common.HeatTestCase):
         self.assertIn('environment', ret)
         self.assertIn('files', ret)
         self.assertEqual(['tag1', 'tag2'], ret['tags'])
-        self.m.VerifyAll()
 
     @tools.stack_context('service_abandon_stack')
     def test_abandon_stack(self):
-        cfg.CONF.set_override('enable_stack_abandon', True, enforce_type=True)
-        self.m.StubOutWithMock(parser.Stack, 'load')
-        parser.Stack.load(self.ctx,
-                          stack=mox.IgnoreArg()).AndReturn(self.stack)
-        self.m.ReplayAll()
+        cfg.CONF.set_override('enable_stack_abandon', True)
+        self.patchobject(parser.Stack, 'load', return_value=self.stack)
         self.eng.abandon_stack(self.ctx, self.stack.identifier())
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.eng.show_stack,
                                self.ctx, self.stack.identifier(),
                                resolve_outputs=True)
         self.assertEqual(exception.EntityNotFound, ex.exc_info[0])
-        self.m.VerifyAll()
 
     def test_stack_describe_nonexistent(self):
         non_exist_identifier = identifier.HeatIdentifier(
-            self.ctx.tenant_id, 'wibble',
+            self.ctx.project_id, 'wibble',
             '18d06e2e-44d3-4bef-9fbf-52480d604b02')
 
         stack_not_found_exc = exception.EntityNotFound(
             entity='Stack', name='test')
-        self.m.StubOutWithMock(service.EngineService, '_get_stack')
-        service.EngineService._get_stack(
-            self.ctx, non_exist_identifier,
-            show_deleted=True).AndRaise(stack_not_found_exc)
-        self.m.ReplayAll()
+        self.patchobject(service.EngineService, '_get_stack',
+                         side_effect=stack_not_found_exc)
 
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.eng.show_stack,
                                self.ctx, non_exist_identifier,
                                resolve_outputs=True)
         self.assertEqual(exception.EntityNotFound, ex.exc_info[0])
-        self.m.VerifyAll()
+        service.EngineService._get_stack.assert_called_once_with(
+            self.ctx, non_exist_identifier,
+            show_deleted=True)
 
     def test_stack_describe_bad_tenant(self):
         non_exist_identifier = identifier.HeatIdentifier(
@@ -784,28 +748,22 @@ class StackServiceTest(common.HeatTestCase):
 
         invalid_tenant_exc = exception.InvalidTenant(target='test',
                                                      actual='test')
-        self.m.StubOutWithMock(service.EngineService, '_get_stack')
-        service.EngineService._get_stack(
-            self.ctx, non_exist_identifier,
-            show_deleted=True).AndRaise(invalid_tenant_exc)
-        self.m.ReplayAll()
+        self.patchobject(service.EngineService, '_get_stack',
+                         side_effect=invalid_tenant_exc)
 
         ex = self.assertRaises(dispatcher.ExpectedException,
                                self.eng.show_stack,
                                self.ctx, non_exist_identifier,
                                resolve_outputs=True)
         self.assertEqual(exception.InvalidTenant, ex.exc_info[0])
-
-        self.m.VerifyAll()
+        service.EngineService._get_stack.assert_called_once_with(
+            self.ctx, non_exist_identifier,
+            show_deleted=True)
 
     @tools.stack_context('service_describe_test_stack', False)
     def test_stack_describe(self):
-        self.m.StubOutWithMock(service.EngineService, '_get_stack')
         s = stack_object.Stack.get_by_id(self.ctx, self.stack.id)
-        service.EngineService._get_stack(self.ctx,
-                                         self.stack.identifier(),
-                                         show_deleted=True).AndReturn(s)
-        self.m.ReplayAll()
+        self.patchobject(service.EngineService, '_get_stack', return_value=s)
 
         sl = self.eng.show_stack(self.ctx, self.stack.identifier(),
                                  resolve_outputs=True)
@@ -826,8 +784,10 @@ class StackServiceTest(common.HeatTestCase):
         self.assertIn('description', s)
         self.assertIn('WordPress', s['description'])
         self.assertIn('parameters', s)
-
-        self.m.VerifyAll()
+        service.EngineService._get_stack.assert_called_once_with(
+            self.ctx,
+            self.stack.identifier(),
+            show_deleted=True)
 
     @tools.stack_context('service_describe_all_test_stack', False)
     def test_stack_describe_all(self):
@@ -891,7 +851,7 @@ class StackServiceTest(common.HeatTestCase):
         ret = self.assertRaises(exception.InvalidTemplateVersions,
                                 self.eng.list_template_versions, self.ctx)
         self.assertIn('A template version alias c.something was added',
-                      six.text_type(ret))
+                      str(ret))
 
     @mock.patch('heat.engine.template._get_template_extension_manager')
     def test_list_template_functions(self, templ_mock):
@@ -908,10 +868,17 @@ class StackServiceTest(common.HeatTestCase):
             Dummy Func2 Long Description.
             """
 
+        class DummyConditionFunc(object):
+            """Dummy Condition Func.
+
+            Dummy Condition Func Long Description.
+            """
+
         plugin_mock = mock.Mock(
             functions={'dummy1': DummyFunc1,
                        'dummy2': DummyFunc2,
-                       'removed': hot_functions.Removed})
+                       'removed': hot_functions.Removed},
+            condition_functions={'condition_dummy': DummyConditionFunc})
         dummy_tmpl = mock.Mock(plugin=plugin_mock)
 
         class DummyMgr(object):
@@ -924,6 +891,18 @@ class StackServiceTest(common.HeatTestCase):
                      'description': 'Dummy Func1.'},
                     {'functions': 'dummy2',
                      'description': 'Dummy Func2.'}]
+        self.assertEqual(sorted(expected, key=lambda k: k['functions']),
+                         sorted(functions, key=lambda k: k['functions']))
+
+        # test with_condition
+        functions = self.eng.list_template_functions(self.ctx, 'dummytemplate',
+                                                     with_condition=True)
+        expected = [{'functions': 'dummy1',
+                     'description': 'Dummy Func1.'},
+                    {'functions': 'dummy2',
+                     'description': 'Dummy Func2.'},
+                    {'functions': 'condition_dummy',
+                     'description': 'Dummy Condition Func.'}]
         self.assertEqual(sorted(expected, key=lambda k: k['functions']),
                          sorted(functions, key=lambda k: k['functions']))
 
@@ -940,7 +919,7 @@ class StackServiceTest(common.HeatTestCase):
                                self.ctx,
                                version)
         msg = "Template with version %s not found" % version
-        self.assertEqual(msg, six.text_type(ex))
+        self.assertEqual(msg, str(ex))
 
     def test_stack_list_outputs(self):
         t = template_format.parse(tools.wp_template)
@@ -975,22 +954,91 @@ class StackServiceTest(common.HeatTestCase):
         outputs = self.eng.list_outputs(self.ctx, mock.ANY)
         self.assertEqual([], outputs)
 
+    def test_stack_delete_complete_is_not_found(self):
+        t = template_format.parse(tools.wp_template)
+        tmpl = templatem.Template(t)
+        stack = parser.Stack(self.ctx, 'delete_complete_stack', tmpl)
+        self.patchobject(self.eng, '_get_stack')
+        self.patchobject(parser.Stack, 'load', return_value=stack)
+        stack.status = stack.COMPLETE
+        stack.action = stack.DELETE
+        stack.convergence = True
+        self.eng.thread_group_mgr.start = mock.MagicMock()
+        ex = self.assertRaises(dispatcher.ExpectedException,
+                               self.eng.delete_stack,
+                               'irrelevant',
+                               'irrelevant')
+        self.assertEqual(exception.EntityNotFound, ex.exc_info[0])
+        self.eng.thread_group_mgr.start.assert_called_once_with(
+            None, stack.purge_db)
+
     def test_get_environment(self):
         # Setup
         t = template_format.parse(tools.wp_template)
         env = {'parameters': {'KeyName': 'EnvKey'}}
         tmpl = templatem.Template(t)
         stack = parser.Stack(self.ctx, 'get_env_stack', tmpl)
+        stack.store()
 
         mock_get_stack = self.patchobject(self.eng, '_get_stack')
         mock_get_stack.return_value = mock.MagicMock()
         mock_get_stack.return_value.raw_template.environment = env
-        self.patchobject(parser.Stack, 'load', return_value=stack)
+        self.patchobject(templatem.Template, 'load', return_value=tmpl)
 
         # Test
         found = self.eng.get_environment(self.ctx, stack.identifier())
 
         # Verify
+        self.assertEqual(env, found)
+
+    def test_get_environment_hidden_param(self):
+        # Setup
+        env = {
+            'parameters': {
+                'admin': 'testuser',
+                'pass': 'pa55w0rd'
+            },
+            'parameter_defaults': {
+                'secret': 'dummy'
+            },
+            'resource_registry': {
+                'res': 'resource.yaml'
+            }
+        }
+        t = {
+            'heat_template_version': '2018-08-31',
+            'parameters': {
+                'admin': {'type': 'string'},
+                'pass': {'type': 'string', 'hidden': True}
+            },
+            'resources': {
+                'res1': {'type': 'res'}
+            }
+        }
+        files = {
+            'resource.yaml': '''
+                heat_template_version: 2018-08-31
+                parameters:
+                    secret:
+                        type: string
+                        hidden: true
+            '''
+        }
+        tmpl = templatem.Template(t, files=files)
+        stack = parser.Stack(self.ctx, 'get_env_stack', tmpl)
+        stack.store()
+
+        mock_get_stack = self.patchobject(self.eng, '_get_stack')
+        mock_get_stack.return_value = mock.MagicMock()
+        mock_get_stack.return_value.raw_template.environment = env
+        self.patchobject(templatem.Template, 'load', return_value=tmpl)
+
+        # Test
+        found = self.eng.get_environment(self.ctx, stack.identifier())
+
+        # Verify
+        env['parameters']['pass'] = '******'
+        env['parameter_defaults']['secret'] = '******'
         self.assertEqual(env, found)
 
     def test_get_environment_no_env(self):
@@ -1043,7 +1091,7 @@ class StackServiceTest(common.HeatTestCase):
                                self.ctx, mock.ANY, 'bunny')
         self.assertEqual(exception.NotFound, ex.exc_info[0])
         self.assertEqual('Specified output key bunny not found.',
-                         six.text_type(ex.exc_info[1]))
+                         str(ex.exc_info[1]))
 
     def test_stack_show_output_error(self):
         t = template_format.parse(tools.wp_template)
@@ -1154,6 +1202,7 @@ class StackServiceTest(common.HeatTestCase):
     @mock.patch.object(service.api, 'format_stack_preview', new=mock.Mock())
     @mock.patch.object(service.parser, 'Stack')
     def test_preview_stack_checks_stack_validity(self, mock_parser):
+        self.patchobject(policy.ResourceEnforcer, 'enforce_stack')
         exc = exception.StackValidationFailed(message='Validation Failed')
         mock_parsed_stack = mock.Mock()
         mock_parsed_stack.validate.side_effect = exc
@@ -1183,7 +1232,7 @@ class StackServiceTest(common.HeatTestCase):
 
     @mock.patch.object(stack_object.Stack, 'count_all')
     def test_validate_new_stack_checks_stack_limit(self, mock_db_count):
-        cfg.CONF.set_override('max_stacks_per_tenant', 99, enforce_type=True)
+        cfg.CONF.set_override('max_stacks_per_tenant', 99)
         mock_db_count.return_value = 99
         template = templatem.Template(
             {'HeatTemplateFormatVersion': '2012-12-12'})
@@ -1200,10 +1249,10 @@ class StackServiceTest(common.HeatTestCase):
                                self.eng._validate_new_stack,
                                self.ctx, 'test_existing_stack',
                                parsed_template)
-        msg = (u'"Type" is not a valid keyword '
+        msg = ('"Type" is not a valid keyword '
                'inside a resource definition')
 
-        self.assertEqual(msg, six.text_type(ex))
+        self.assertEqual(msg, str(ex))
 
     def test_validate_new_stack_checks_incorrect_sections(self):
         template = {'heat_template_version': '2013-05-23',
@@ -1214,11 +1263,11 @@ class StackServiceTest(common.HeatTestCase):
                                self.eng._validate_new_stack,
                                self.ctx, 'test_existing_stack',
                                parsed_template)
-        msg = u'The template section is invalid: unknown_section'
-        self.assertEqual(msg, six.text_type(ex))
+        msg = 'The template section is invalid: unknown_section'
+        self.assertEqual(msg, str(ex))
 
     def test_validate_new_stack_checks_resource_limit(self):
-        cfg.CONF.set_override('max_resources_per_stack', 5, enforce_type=True)
+        cfg.CONF.set_override('max_resources_per_stack', 5)
         template = {'HeatTemplateFormatVersion': '2012-12-12',
                     'Resources': {
                         'Res1': {'Type': 'GenericResource1'},
@@ -1238,7 +1287,7 @@ class StackServiceTest(common.HeatTestCase):
         tmpl.validate.side_effect = AssertionError(expected_message)
         exc = self.assertRaises(AssertionError, self.eng._validate_new_stack,
                                 self.ctx, 'stack_name', tmpl)
-        self.assertEqual(expected_message, six.text_type(exc))
+        self.assertEqual(expected_message, str(exc))
 
     @mock.patch('heat.engine.service.ThreadGroupManager',
                 return_value=mock.Mock())
@@ -1294,7 +1343,7 @@ class StackServiceTest(common.HeatTestCase):
 
         self.eng.reset_stack_status()
 
-        mock_admin_context.assert_called_once_with()
+        mock_admin_context.assert_called()
         filters = {
             'status': parser.Stack.IN_PROGRESS,
             'convergence': False
@@ -1307,65 +1356,16 @@ class StackServiceTest(common.HeatTestCase):
             mock.call(self.ctx, 'bar'),
         ])
         mock_stack_load.assert_called_once_with(self.ctx,
-                                                stack=db_stack,
-                                                service_check_defer=True,
-                                                resource_validate=False)
+                                                stack=db_stack)
         self.assertTrue(lock2.release.called)
+        reason = ('Engine went down during stack %s' % fake_stack.action)
         mock_thread.start_with_acquired_lock.assert_called_once_with(
             fake_stack, lock1,
-            self.eng.set_stack_and_resource_to_failed, fake_stack
+            fake_stack.reset_stack_and_resources_in_progress, reason
         )
 
-    def test_set_stack_and_resource_to_failed(self):
-
-        def fake_stack():
-            stk = mock.MagicMock()
-            stk.action = 'CREATE'
-            stk.id = 'foo'
-            stk.status = 'IN_PROGRESS'
-            stk.FAILED = 'FAILED'
-
-            def mock_stack_state_set(a, s, reason):
-                stk.status = s
-                stk.action = a
-                stk.status_reason = reason
-
-            stk.state_set = mock_stack_state_set
-
-            return stk
-
-        def fake_stack_resource(name, action, status):
-            rs = mock.MagicMock()
-            rs.name = name
-            rs.action = action
-            rs.status = status
-            rs.IN_PROGRESS = 'IN_PROGRESS'
-            rs.FAILED = 'FAILED'
-
-            def mock_resource_state_set(a, s, reason='engine_down'):
-                rs.status = s
-                rs.action = a
-                rs.status_reason = reason
-
-            rs.state_set = mock_resource_state_set
-
-            return rs
-
-        test_stack = fake_stack()
-
-        test_stack.resources = {
-            'r1': fake_stack_resource('r1', 'UPDATE', 'COMPLETE'),
-            'r2': fake_stack_resource('r2', 'UPDATE', 'IN_PROGRESS'),
-            'r3': fake_stack_resource('r3', 'UPDATE', 'FAILED')}
-
-        self.eng.set_stack_and_resource_to_failed(test_stack)
-        self.assertEqual('FAILED', test_stack.status)
-        self.assertEqual('COMPLETE', test_stack.resources.get('r1').status)
-        self.assertEqual('FAILED', test_stack.resources.get('r2').status)
-        self.assertEqual('FAILED', test_stack.resources.get('r3').status)
-
     def test_parse_adopt_stack_data_without_parameters(self):
-        cfg.CONF.set_override('enable_stack_adopt', True, enforce_type=True)
+        cfg.CONF.set_override('enable_stack_adopt', True)
         template = {"heat_template_version": "2015-04-30",
                     "resources": {
                         "myres": {
@@ -1381,16 +1381,18 @@ class StackServiceTest(common.HeatTestCase):
         # get parameters from adopt stack data which doesn't have it.
         args = {"adopt_stack_data": '''{}'''}
         self.eng._parse_template_and_validate_stack(
-            self.ctx, 'stack_name', template, {}, {}, None, args)
+            self.ctx, 'stack_name', template, {}, {},
+            None, None, args)
 
         args = {"adopt_stack_data": '''{
             "environment": {}
         }'''}
         self.eng._parse_template_and_validate_stack(
-            self.ctx, 'stack_name', template, {}, {}, None, args)
+            self.ctx, 'stack_name', template, {}, {},
+            None, None, args)
 
     def test_parse_adopt_stack_data_with_parameters(self):
-        cfg.CONF.set_override('enable_stack_adopt', True, enforce_type=True)
+        cfg.CONF.set_override('enable_stack_adopt', True)
         template = {"heat_template_version": "2015-04-30",
                     "parameters": {
                         "volsize": {"type": "number"}
@@ -1412,7 +1414,8 @@ class StackServiceTest(common.HeatTestCase):
                 }
             }}'''}
         stack = self.eng._parse_template_and_validate_stack(
-            self.ctx, 'stack_name', template, {}, {}, None, args)
+            self.ctx, 'stack_name', template, {}, {},
+            None, None, args)
         self.assertEqual(1, stack.parameters['volsize'])
 
     @mock.patch('heat.engine.service.ThreadGroupManager',

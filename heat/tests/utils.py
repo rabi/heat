@@ -14,17 +14,20 @@
 import random
 import string
 import uuid
+import warnings
 
-import mox
+import fixtures
 from oslo_config import cfg
 from oslo_db import options
 from oslo_serialization import jsonutils
 import sqlalchemy
+from sqlalchemy import exc as sqla_exc
 
 from heat.common import context
 from heat.db import api as db_api
-from heat.db.sqlalchemy import models
+from heat.db import models
 from heat.engine import environment
+from heat.engine import node_data
 from heat.engine import resource
 from heat.engine import stack
 from heat.engine import template
@@ -55,24 +58,27 @@ def setup_dummy_db():
     # options.cfg.set_defaults(options.database_opts, connection_debug=100)
     options.set_defaults(cfg.CONF, connection="sqlite://")
     engine = get_engine()
+    engine.dispose()
     models.BASE.metadata.create_all(engine)
     engine.connect()
 
 
 def reset_dummy_db():
     engine = get_engine()
+    engine.dispose()
     meta = sqlalchemy.MetaData()
     meta.reflect(bind=engine)
 
     for table in reversed(meta.sorted_tables):
         if table.name == 'migrate_version':
             continue
-        engine.execute(table.delete())
+        with engine.connect() as conn, conn.begin():
+            conn.execute(table.delete())
 
 
 def dummy_context(user='test_username', tenant_id='test_tenant_id',
-                  password='password', roles=None, user_id=None,
-                  trust_id=None, region_name=None):
+                  password='', roles=None, user_id=None,
+                  trust_id=None, region_name=None, is_admin=False):
     roles = roles or []
     return context.RequestContext.from_dict({
         'tenant_id': tenant_id,
@@ -81,7 +87,7 @@ def dummy_context(user='test_username', tenant_id='test_tenant_id',
         'user_id': user_id,
         'password': password,
         'roles': roles,
-        'is_admin': False,
+        'is_admin': is_admin,
         'auth_url': 'http://server.test:5000/v2.0',
         'auth_token': 'abcd1234',
         'trust_id': trust_id,
@@ -89,8 +95,35 @@ def dummy_context(user='test_username', tenant_id='test_tenant_id',
     })
 
 
+def dummy_system_admin_context():
+    """Return a heat.common.context.RequestContext for system-admin.
+
+    :returns: an instance of heat.common.context.RequestContext
+
+    """
+    ctx = dummy_context(roles=['admin', 'member', 'reader'])
+    ctx.system_scope = 'all'
+    ctx.project_id = None
+    ctx.project_id = None
+    return ctx
+
+
+def dummy_system_reader_context():
+    """Return a heat.common.context.RequestContext for system-reader.
+
+    :returns: an instance of heat.common.context.RequestContext
+
+    """
+    ctx = dummy_context(roles=['reader'])
+    ctx.system_scope = 'all'
+    ctx.project_id = None
+    ctx.project_id = None
+    return ctx
+
+
 def parse_stack(t, params=None, files=None, stack_name=None,
-                stack_id=None, timeout_mins=None, cache_data=None):
+                stack_id=None, timeout_mins=None,
+                cache_data=None, tags=None):
     params = params or {}
     files = files or {}
     ctx = dummy_context()
@@ -99,8 +132,12 @@ def parse_stack(t, params=None, files=None, stack_name=None,
     templ.store(ctx)
     if stack_name is None:
         stack_name = random_name()
+    if cache_data is not None:
+        cache_data = {n: node_data.NodeData.from_dict(d)
+                      for n, d in cache_data.items()}
     stk = stack.Stack(ctx, stack_name, templ, stack_id=stack_id,
-                      timeout_mins=timeout_mins, cache_data=cache_data)
+                      timeout_mins=timeout_mins,
+                      cache_data=cache_data, tags=tags)
     stk.store()
     return stk
 
@@ -166,18 +203,94 @@ def recursive_sort(obj):
     return obj
 
 
-class JsonEquals(mox.Comparator):
-    """Comparison class used to check if two json strings equal.
+class JsonRepr(object):
+    """Comparison class used to check the deserialisation of a JSON string.
 
     If a dict is dumped to json, the order is undecided, so load the string
-    back to an object for comparison
+    back to an object for comparison.
     """
 
-    def __init__(self, other_json):
-        self.other_json = other_json
+    def __init__(self, data):
+        """Initialise with the unserialised data."""
+        self._data = data
 
-    def equals(self, rhs):
-        return jsonutils.loads(self.other_json) == jsonutils.loads(rhs)
+    def __eq__(self, json_data):
+        return self._data == jsonutils.loads(json_data)
+
+    def __ne__(self, json_data):
+        return not self.__eq__(json_data)
 
     def __repr__(self):
-        return "<equals to json '%s'>" % self.other_json
+        return jsonutils.dumps(self._data)
+
+
+class ForeignKeyConstraintFixture(fixtures.Fixture):
+
+    def __init__(self):
+        self.engine = get_engine()
+
+    def _setUp(self):
+        if self.engine.name == 'sqlite':
+
+            with self.engine.connect() as conn:
+                conn.connection.execute("PRAGMA foreign_keys = ON")
+
+            def disable_fks():
+                with self.engine.connect() as conn:
+                    conn.connection.rollback()
+                    conn.connection.execute("PRAGMA foreign_keys = OFF")
+
+            self.addCleanup(disable_fks)
+
+
+class WarningsFixture(fixtures.Fixture):
+    """Filters out warnings during test runs."""
+
+    def setUp(self):
+        super().setUp()
+
+        self._original_warning_filters = warnings.filters[:]
+
+        warnings.simplefilter("once", DeprecationWarning)
+
+        # Enable deprecation warnings for heat itself to capture upcoming
+        # SQLAlchemy changes
+
+        warnings.filterwarnings(
+            'ignore',
+            category=sqla_exc.SADeprecationWarning,
+        )
+
+        warnings.filterwarnings(
+            'error',
+            module='heat',
+            category=sqla_exc.SADeprecationWarning,
+        )
+
+        # Enable general SQLAlchemy warnings also to ensure we're not doing
+        # silly stuff. It's possible that we'll need to filter things out here
+        # with future SQLAlchemy versions, but that's a good thing
+
+        warnings.filterwarnings(
+            'error',
+            module='heat',
+            category=sqla_exc.SAWarning,
+        )
+
+        self.addCleanup(self._reset_warning_filters)
+
+    def _reset_warning_filters(self):
+        warnings.filters[:] = self._original_warning_filters
+
+
+class AnyInstance(object):
+    """Comparator for validating allowed instance type."""
+
+    def __init__(self, allowed_type):
+        self._allowed_type = allowed_type
+
+    def __eq__(self, other):
+        return isinstance(other, self._allowed_type)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)

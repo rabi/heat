@@ -11,28 +11,40 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
+import functools
+
 from webob import exc
 
 from heat.common.i18n import _
 from heat.common import identifier
 
 
-def policy_enforce(handler):
+def registered_policy_enforce(handler):
     """Decorator that enforces policies.
 
     Checks the path matches the request context and enforce policy defined in
-    policy.json.
+    policies.
 
     This is a handler method decorator.
     """
-    @six.wraps(handler)
+    @functools.wraps(handler)
     def handle_stack_method(controller, req, tenant_id, **kwargs):
-        if req.context.tenant_id != tenant_id and not req.context.is_admin:
+        # NOTE(tkajinam): Heat uses stack owner's project id in redirect URI.
+        # So admin might be redirected to different project id when accessing
+        # resources in a different project. Use project id in context to
+        # bypass project_id check, because admin should have access to all
+        # projects.
+        if req.context.is_admin and req.context.project_id:
+            tenant_id = req.context.project_id
+        _target = {"project_id": tenant_id}
+        if req.context.project_id != tenant_id:
             raise exc.HTTPForbidden()
-        allowed = req.context.policy.enforce(context=req.context,
-                                             action=handler.__name__,
-                                             scope=controller.REQUEST_SCOPE)
+        allowed = req.context.policy.enforce(
+            context=req.context,
+            action=handler.__name__,
+            scope=controller.REQUEST_SCOPE,
+            target=_target,
+            is_registered_policy=True)
         if not allowed:
             raise exc.HTTPForbidden()
         return handler(controller, req, **kwargs)
@@ -40,15 +52,35 @@ def policy_enforce(handler):
     return handle_stack_method
 
 
-def identified_stack(handler):
-    """Decorator that passes a stack identifier instead of path components.
+def no_policy_enforce(handler):
+    """Decorator that does *not* enforce policies.
+
+    Checks the path matches the request context.
 
     This is a handler method decorator.
     """
-    @policy_enforce
-    @six.wraps(handler)
+    @functools.wraps(handler)
+    def handle_stack_method(controller, req, tenant_id, **kwargs):
+        if req.context.project_id != tenant_id and not req.context.is_admin:
+            raise exc.HTTPForbidden()
+        return handler(controller, req, **kwargs)
+
+    return handle_stack_method
+
+
+def registered_identified_stack(handler):
+    """Decorator that passes a stack identifier instead of path components.
+
+    This is a handler method decorator. Policy is enforced using a registered
+    policy name.
+    """
+    return registered_policy_enforce(_identified_stack(handler))
+
+
+def _identified_stack(handler):
+    @functools.wraps(handler)
     def handle_stack_method(controller, req, stack_name, stack_id, **kwargs):
-        stack_identity = identifier.HeatIdentifier(req.context.tenant_id,
+        stack_identity = identifier.HeatIdentifier(req.context.project_id,
                                                    stack_name,
                                                    stack_id)
         return handler(controller, req, dict(stack_identity), **kwargs)
@@ -79,22 +111,22 @@ PARAM_TYPES = (
 )
 
 
-def get_allowed_params(params, whitelist):
-    """Extract from ``params`` all entries listed in ``whitelist``.
+def get_allowed_params(params, param_types):
+    """Extract from ``params`` all entries listed in ``param_types``.
 
     The returning dict will contain an entry for a key if, and only if,
-    there's an entry in ``whitelist`` for that key and at least one entry in
+    there's an entry in ``param_types`` for that key and at least one entry in
     ``params``. If ``params`` contains multiple entries for the same key, it
     will yield an array of values: ``{key: [v1, v2,...]}``
 
     :param params: a NestedMultiDict from webob.Request.params
-    :param whitelist: an array of strings to whitelist
+    :param param_types: an dict of allowed parameters and their types
 
     :returns: a dict with {key: value} pairs
     """
     allowed_params = {}
 
-    for key, get_type in six.iteritems(whitelist):
+    for key, get_type in param_types.items():
         assert get_type in PARAM_TYPES
 
         value = None

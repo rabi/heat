@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
+import itertools
 
 from heat.common import template_format
 from heat.engine import stack
@@ -145,6 +145,8 @@ outputs:
     value: [{get_attr: [AResource, flat_dict, key2]},
             {get_attr: [AResource, nested_dict, string]},
             {get_attr: [BResource, attr_B3]}]
+  out2:
+    value: {get_resource: BResource}
 """
 
 tmpl7 = """
@@ -192,8 +194,7 @@ class DepAttrsTest(common.HeatTestCase):
         ('one_res_several_attrs',
             dict(tmpl=tmpl3,
                  expected={'AResource': {'attr_A1', 'attr_A2', 'attr_A3',
-                                         'meta_A1', 'meta_A2', 'out_A1',
-                                         'out_A2'},
+                                         'meta_A1', 'meta_A2'},
                            'BResource': set()})),
         ('several_res_one_attr',
             dict(tmpl=tmpl4,
@@ -203,42 +204,101 @@ class DepAttrsTest(common.HeatTestCase):
                            'DResource': set()})),
         ('several_res_several_attrs',
             dict(tmpl=tmpl5,
-                 expected={'AResource': {'attr_A1', 'attr_A2', 'meta_A1',
-                                         'attr_A3', 'attr_A4'},
-                           'BResource': {'attr_B1', 'attr_B2', 'meta_B2',
-                                         'attr_B3'},
+                 expected={'AResource': {'attr_A1', 'attr_A2', 'meta_A1'},
+                           'BResource': {'attr_B1', 'attr_B2', 'meta_B2'},
                            'CResource': set()})),
         ('nested_attr',
             dict(tmpl=tmpl6,
-                 expected={'AResource': set([(u'flat_dict', u'key2'),
-                                             (u'list', 1),
-                                             (u'nested_dict', u'dict', u'b'),
-                                             (u'nested_dict', u'string')]),
-                           'BResource': set(['attr_B3'])})),
+                 expected={'AResource': set([('list', 1),
+                                             ('nested_dict', 'dict', 'b')]),
+                           'BResource': set([])})),
         ('several_res_several_attrs_and_all_attrs',
             dict(tmpl=tmpl7,
-                 expected={'AResource': {'attr_A1', 'attr_A2', 'meta_A1',
-                                         'attr_A3', 'attr_A4'},
-                           'BResource': {'attr_B1', 'attr_B2', 'meta_B2',
-                                         'attr_B3'},
-                           'CResource': {'foo', 'Foo', 'show'}}))
+                 expected={'AResource': {'attr_A1', 'attr_A2', 'meta_A1'},
+                           'BResource': {'attr_B1', 'attr_B2', 'meta_B2'},
+                           'CResource': set()}))
     ]
 
     def setUp(self):
         super(DepAttrsTest, self).setUp()
         self.ctx = utils.dummy_context()
 
-    def test_dep_attrs(self):
-        parsed_tmpl = template_format.parse(self.tmpl)
+        self.parsed_tmpl = template_format.parse(self.tmpl)
         self.stack = stack.Stack(self.ctx, 'test_stack',
-                                 template.Template(parsed_tmpl))
+                                 template.Template(self.parsed_tmpl))
 
-        for res in six.itervalues(self.stack):
-            outputs = self.stack.outputs
-            resources = six.itervalues(self.stack.resources)
+    def test_dep_attrs(self):
+        for res in self.stack.values():
+            definitions = (self.stack.defn.resource_definition(n)
+                           for n in self.parsed_tmpl['resources'])
             self.assertEqual(self.expected[res.name],
-                             self.stack.get_dep_attrs(
-                                 resources,
-                                 outputs,
-                                 res.name,
-                                 self.stack.t.OUTPUT_VALUE))
+                             set(itertools.chain.from_iterable(
+                                 d.dep_attrs(res.name) for d in definitions)))
+
+    def test_all_dep_attrs(self):
+        for res in self.stack.values():
+            definitions = (self.stack.defn.resource_definition(n)
+                           for n in self.parsed_tmpl['resources'])
+            attrs = set(itertools.chain.from_iterable(
+                d.dep_attrs(res.name, load_all=True) for d in definitions))
+            self.assertEqual(self.expected[res.name], attrs)
+
+
+class ReferencedAttrsTest(common.HeatTestCase):
+    def setUp(self):
+        super(ReferencedAttrsTest, self).setUp()
+        parsed_tmpl = template_format.parse(tmpl6)
+        self.stack = stack.Stack(utils.dummy_context(), 'test_stack',
+                                 template.Template(parsed_tmpl))
+        self.resA = self.stack['AResource']
+        self.resB = self.stack['BResource']
+
+    def test_referenced_attrs_resources(self):
+        self.assertEqual(self.resA.referenced_attrs(in_resources=True,
+                                                    in_outputs=False),
+                         {('list', 1), ('nested_dict', 'dict', 'b')})
+        self.assertEqual(self.resB.referenced_attrs(in_resources=True,
+                                                    in_outputs=False),
+                         set())
+
+    def test_referenced_attrs_outputs(self):
+        self.assertEqual(self.resA.referenced_attrs(in_resources=False,
+                                                    in_outputs=True),
+                         {('flat_dict', 'key2'), ('nested_dict', 'string')})
+        self.assertEqual(self.resB.referenced_attrs(in_resources=False,
+                                                    in_outputs=True),
+                         {'attr_B3'})
+
+    def test_referenced_attrs_single_output(self):
+        self.assertEqual(self.resA.referenced_attrs(in_resources=False,
+                                                    in_outputs={'out1'}),
+                         {('flat_dict', 'key2'), ('nested_dict', 'string')})
+        self.assertEqual(self.resB.referenced_attrs(in_resources=False,
+                                                    in_outputs={'out1'}),
+                         {'attr_B3'})
+
+        self.assertEqual(self.resA.referenced_attrs(in_resources=False,
+                                                    in_outputs={'out2'}),
+                         set())
+        self.assertEqual(self.resB.referenced_attrs(in_resources=False,
+                                                    in_outputs={'out2'}),
+                         set())
+
+    def test_referenced_attrs_outputs_list(self):
+        self.assertEqual(self.resA.referenced_attrs(in_resources=False,
+                                                    in_outputs={'out1',
+                                                                'out2'}),
+                         {('flat_dict', 'key2'), ('nested_dict', 'string')})
+        self.assertEqual(self.resB.referenced_attrs(in_resources=False,
+                                                    in_outputs={'out1',
+                                                                'out2'}),
+                         {'attr_B3'})
+
+    def test_referenced_attrs_both(self):
+        self.assertEqual(self.resA.referenced_attrs(in_resources=True,
+                                                    in_outputs=True),
+                         {('list', 1), ('nested_dict', 'dict', 'b'),
+                          ('flat_dict', 'key2'), ('nested_dict', 'string')})
+        self.assertEqual(self.resB.referenced_attrs(in_resources=True,
+                                                    in_outputs=True),
+                         {'attr_B3'})

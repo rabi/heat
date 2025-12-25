@@ -12,16 +12,12 @@
 #    under the License.
 
 
-import sys
-
-from mox3 import mox
 import oslo_i18n as i18n
-
-sys.modules['mox'] = mox
 
 
 def fake_translate_msgid(msgid, domain, desired_locale=None):
     return msgid
+
 
 i18n.enable_lazy()
 

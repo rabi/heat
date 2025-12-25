@@ -12,11 +12,11 @@
 #    under the License.
 
 import datetime
-import eventlet
-from oslo_utils import timeutils
-import six
+import time
 
-from heat.common.i18n import _, _LI
+from oslo_utils import timeutils
+
+from heat.common.i18n import _
 from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
@@ -161,7 +161,7 @@ class TestResource(resource.Resource):
             secs = self.properties[self.ACTION_WAIT_SECS][self.action.lower()]
         if secs is None:
             secs = self.properties[self.WAIT_SECS]
-        LOG.info(_LI('%(name)s wait_secs:%(wait)s, action:%(action)s'),
+        LOG.info('%(name)s wait_secs:%(wait)s, action:%(action)s',
                  {'name': self.name,
                   'wait': secs,
                   'action': self.action.lower()})
@@ -178,8 +178,8 @@ class TestResource(resource.Resource):
 
     def needs_replace_with_prop_diff(self, changed_properties_set,
                                      after_props, before_props):
-        if self.UPDATE_REPLACE in changed_properties_set:
-            return bool(after_props.get(self.UPDATE_REPLACE))
+        if self.VALUE in changed_properties_set:
+            return after_props[self.UPDATE_REPLACE]
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         self.properties = json_snippet.properties(self.properties_schema,
@@ -217,18 +217,18 @@ class TestResource(resource.Resource):
                     obj = getattr(self.client(name=client_name), self.entity)
                     obj.get(entity_id)
                 except Exception as exc:
-                    LOG.debug('%s.%s(%s) %s' % (client_name, self.entity,
-                                                entity_id, six.text_type(exc)))
+                    LOG.debug('%s.%s(%s) %s', client_name, self.entity,
+                              entity_id, str(exc))
             else:
                 # just sleep some more
-                eventlet.sleep(1)
+                time.sleep(1)
 
-        if isinstance(started_at, six.string_types):
+        if isinstance(started_at, str):
             started_at = timeutils.parse_isotime(started_at)
 
         started_at = timeutils.normalize_time(started_at)
         waited = timeutils.utcnow() - started_at
-        LOG.info(_LI("Resource %(name)s waited %(waited)s/%(sec)s seconds"),
+        LOG.info("Resource %(name)s waited %(waited)s/%(sec)s seconds",
                  {'name': self.name,
                   'waited': waited,
                   'sec': wait_secs})
@@ -244,7 +244,7 @@ class TestResource(resource.Resource):
         return False
 
     def _resolve_attribute(self, name):
-        eventlet.sleep(self.properties[self.ATTR_WAIT_SECS])
+        time.sleep(self.properties[self.ATTR_WAIT_SECS])
         if name == self.OUTPUT:
             return self.data().get('value')
 

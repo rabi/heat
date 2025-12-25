@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import ast
-import eventlet
-import random
-import six
+import tenacity
 
 from oslo_log import log as logging
 
@@ -73,8 +71,8 @@ def update_input_data(context, entity_id, current_traversal,
     return rows_updated
 
 
-def _str_pack_tuple(t):
-    return u'tuple:' + str(t)
+def str_pack_tuple(t):
+    return 'tuple:' + str(tuple(t))
 
 
 def _str_unpack_tuple(s):
@@ -85,7 +83,7 @@ def _str_unpack_tuple(s):
 def _deserialize(d):
     d2 = {}
     for k, v in d.items():
-        if isinstance(k, six.string_types) and k.startswith(u'tuple:('):
+        if isinstance(k, str) and k.startswith('tuple:('):
             k = _str_unpack_tuple(k)
         if isinstance(v, dict):
             v = _deserialize(v)
@@ -97,7 +95,7 @@ def _serialize(d):
     d2 = {}
     for k, v in d.items():
         if isinstance(k, tuple):
-            k = _str_pack_tuple(k)
+            k = str_pack_tuple(k)
         if isinstance(v, dict):
             v = _serialize(v)
         d2[k] = v
@@ -118,23 +116,30 @@ def serialize_input_data(input_data):
 
 def sync(cnxt, entity_id, current_traversal, is_update, propagate,
          predecessors, new_data):
-    rows_updated = None
-    sync_point = None
-    input_data = None
-    nconflicts = max(0, len(predecessors) - 2)
-    # limit to 10 seconds
-    max_wt = min(nconflicts * 0.01, 10)
-    while not rows_updated:
+    # Retry waits up to 60 seconds at most, with exponentially increasing
+    # amounts of jitter per resource still outstanding
+    wait_strategy = tenacity.wait_random_exponential(max=60)
+
+    def init_jitter(existing_input_data):
+        nconflicts = max(0, len(predecessors) - len(existing_input_data) - 1)
+        # 10ms per potential conflict, up to a max of 10s in total
+        return min(nconflicts, 1000) * 0.01
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_result(lambda r: r is None),
+        wait=wait_strategy
+    )
+    def _sync():
         sync_point = get(cnxt, entity_id, current_traversal, is_update)
         input_data = deserialize_input_data(sync_point.input_data)
+        wait_strategy.multiplier = init_jitter(input_data)
         input_data.update(new_data)
         rows_updated = update_input_data(
             cnxt, entity_id, current_traversal, is_update,
             sync_point.atomic_key, serialize_input_data(input_data))
-        # don't aggressively spin; induce some sleep
-        if not rows_updated:
-            eventlet.sleep(random.uniform(0, max_wt))
+        return input_data if rows_updated else None
 
+    input_data = _sync()
     waiting = predecessors - set(input_data)
     key = make_key(entity_id, current_traversal, is_update)
     if waiting:

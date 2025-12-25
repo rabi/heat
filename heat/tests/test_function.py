@@ -14,7 +14,6 @@
 import copy
 import uuid
 
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -24,6 +23,7 @@ from heat.engine import function
 from heat.engine import resource
 from heat.engine import rsrc_defn
 from heat.engine import stack
+from heat.engine import stk_defn
 from heat.engine import template
 from heat.tests import common
 from heat.tests import utils
@@ -39,6 +39,11 @@ class TestFunction(function.Function):
 
     def result(self):
         return 'wibble'
+
+
+class NullFunction(function.Function):
+    def result(self):
+        return Ellipsis
 
 
 class TestFunctionKeyError(function.Function):
@@ -59,24 +64,24 @@ class TestFunctionResult(function.Function):
 class FunctionTest(common.HeatTestCase):
     def test_equal(self):
         func = TestFunction(None, 'foo', ['bar', 'baz'])
-        self.assertTrue(func == 'wibble')
-        self.assertTrue('wibble' == func)
+        self.assertTrue(func == 'wibble')  # noqa: H204
+        self.assertTrue('wibble' == func)  # noqa: H204
 
     def test_not_equal(self):
         func = TestFunction(None, 'foo', ['bar', 'baz'])
-        self.assertTrue(func != 'foo')
-        self.assertTrue('foo' != func)
+        self.assertTrue(func != 'foo')  # noqa: H204
+        self.assertTrue('foo' != func)  # noqa: H204
 
     def test_equal_func(self):
         func1 = TestFunction(None, 'foo', ['bar', 'baz'])
         func2 = TestFunction(None, 'blarg', ['wibble', 'quux'])
-        self.assertTrue(func1 == func2)
+        self.assertTrue(func1 == func2)  # noqa: H204
 
     def test_function_str_value(self):
         func1 = TestFunction(None, 'foo', ['bar', 'baz'])
         expected = '%s %s' % ("<heat.tests.test_function.TestFunction",
                               "{foo: ['bar', 'baz']} -> 'wibble'>")
-        self.assertEqual(expected, six.text_type(func1))
+        self.assertEqual(expected, str(func1))
 
     def test_function_stack_reference_none(self):
         func1 = TestFunction(None, 'foo', ['bar', 'baz'])
@@ -86,7 +91,7 @@ class FunctionTest(common.HeatTestCase):
         func1 = TestFunctionKeyError(None, 'foo', ['bar', 'baz'])
         expected = '%s %s' % ("<heat.tests.test_function.TestFunctionKeyError",
                               "{foo: ['bar', 'baz']} -> ???>")
-        self.assertEqual(expected, six.text_type(func1))
+        self.assertEqual(expected, str(func1))
 
     def test_function_eq_exception_key_error(self):
         func1 = TestFunctionKeyError(None, 'foo', ['bar', 'baz'])
@@ -105,7 +110,7 @@ class FunctionTest(common.HeatTestCase):
         expected = '%s %s' % (
             "<heat.tests.test_function.TestFunctionValueError",
             "{foo: ['bar', 'baz']} -> ???>")
-        self.assertEqual(expected, six.text_type(func1))
+        self.assertEqual(expected, str(func1))
 
     def test_function_eq_exception_value_error(self):
         func1 = TestFunctionValueError(None, 'foo', ['bar', 'baz'])
@@ -125,7 +130,7 @@ class FunctionTest(common.HeatTestCase):
             "<heat.tests.test_function.TestFunctionResult",
             "{foo: ['bar', 'baz']}",
             "{'foo': ['bar', 'baz']}>")
-        self.assertEqual(expected, six.text_type(func1))
+        self.assertEqual(expected, str(func1))
 
     def test_copy(self):
         func = TestFunction(None, 'foo', ['bar', 'baz'])
@@ -169,6 +174,28 @@ class ResolveTest(common.HeatTestCase):
                          result)
         self.assertIsNot(result, snippet)
 
+    def test_resolve_func_with_null(self):
+        func = NullFunction(None, 'foo', ['bar', 'baz'])
+
+        self.assertIsNone(function.resolve(func))
+        self.assertIs(Ellipsis, function.resolve(func, nullable=True))
+
+    def test_resolve_dict_with_null(self):
+        func = NullFunction(None, 'foo', ['bar', 'baz'])
+        snippet = {'foo': 'bar', 'baz': func, 'blarg': 'wibble'}
+
+        result = function.resolve(snippet)
+
+        self.assertEqual({'foo': 'bar', 'blarg': 'wibble'}, result)
+
+    def test_resolve_list_with_null(self):
+        func = NullFunction(None, 'foo', ['bar', 'baz'])
+        snippet = ['foo', func, 'bar']
+
+        result = function.resolve(snippet)
+
+        self.assertEqual(['foo', 'bar'], result)
+
 
 class ValidateTest(common.HeatTestCase):
     def setUp(self):
@@ -178,8 +205,9 @@ class ValidateTest(common.HeatTestCase):
     def test_validate_func(self):
         self.assertIsNone(function.validate(self.func))
         self.func = TestFunction(None, 'foo', ['bar'])
-        ex = self.assertRaises(TypeError, function.validate, self.func)
-        self.assertEqual('Need more arguments', six.text_type(ex))
+        self.assertRaisesRegex(exception.StackValidationFailed,
+                               'foo: Need more arguments',
+                               function.validate, self.func)
 
     def test_validate_dict(self):
         snippet = {'foo': 'bar', 'blarg': self.func}
@@ -187,8 +215,9 @@ class ValidateTest(common.HeatTestCase):
 
         self.func = TestFunction(None, 'foo', ['bar'])
         snippet = {'foo': 'bar', 'blarg': self.func}
-        ex = self.assertRaises(TypeError, function.validate, snippet)
-        self.assertEqual('Need more arguments', six.text_type(ex))
+        self.assertRaisesRegex(exception.StackValidationFailed,
+                               'blarg.foo: Need more arguments',
+                               function.validate, snippet)
 
     def test_validate_list(self):
         snippet = ['foo', 'bar', 'baz', 'blarg', self.func]
@@ -196,8 +225,9 @@ class ValidateTest(common.HeatTestCase):
 
         self.func = TestFunction(None, 'foo', ['bar'])
         snippet = {'foo': 'bar', 'blarg': self.func}
-        ex = self.assertRaises(TypeError, function.validate, snippet)
-        self.assertEqual('Need more arguments', six.text_type(ex))
+        self.assertRaisesRegex(exception.StackValidationFailed,
+                               'blarg.foo: Need more arguments',
+                               function.validate, snippet)
 
     def test_validate_all(self):
         snippet = ['foo', {'bar': ['baz', {'blarg': self.func}]}]
@@ -205,8 +235,9 @@ class ValidateTest(common.HeatTestCase):
 
         self.func = TestFunction(None, 'foo', ['bar'])
         snippet = {'foo': 'bar', 'blarg': self.func}
-        ex = self.assertRaises(TypeError, function.validate, snippet)
-        self.assertEqual('Need more arguments', six.text_type(ex))
+        self.assertRaisesRegex(exception.StackValidationFailed,
+                               'blarg.foo: Need more arguments',
+                               function.validate, snippet)
 
 
 class DependenciesTest(common.HeatTestCase):
@@ -231,59 +262,83 @@ class ValidateGetAttTest(common.HeatTestCase):
         super(ValidateGetAttTest, self).setUp()
 
         env = environment.Environment()
-        env.load({u'resource_registry':
-                  {u'OS::Test::GenericResource': u'GenericResourceType'}})
+        env.load({'resource_registry':
+                  {'OS::Test::GenericResource': 'GenericResourceType'}})
 
-        env.load({u'resource_registry':
-                  {u'OS::Test::FakeResource': u'OverwrittenFnGetAttType'}})
+        env.load({'resource_registry':
+                  {'OS::Test::FakeResource': 'OverwrittenFnGetAttType'}})
 
+        tmpl = template.Template({"HeatTemplateFormatVersion": "2012-12-12",
+                                  "Resources": {
+                                      "test_rsrc": {
+                                          "Type": "OS::Test::GenericResource"
+                                      },
+                                      "get_att_rsrc": {
+                                          "Type": "OS::Heat::Value",
+                                          "Properties": {
+                                              "value": {
+                                                  "Fn::GetAtt": ["test_rsrc",
+                                                                 "Foo"]
+                                              }
+                                          }
+                                      }
+                                  }},
+                                 env=env)
         self.stack = stack.Stack(
             utils.dummy_context(), 'test_stack',
-            template.Template({"HeatTemplateFormatVersion": "2012-12-12"},
-                              env=env),
+            tmpl,
             stack_id=str(uuid.uuid4()))
-        res_defn = rsrc_defn.ResourceDefinition('test_rsrc',
-                                                'OS::Test::GenericResource')
-        self.rsrc = resource.Resource('test_rsrc', res_defn, self.stack)
-        self.stack.add_resource(self.rsrc)
+        self.rsrc = self.stack['test_rsrc']
+        self.stack.validate()
 
     def test_resource_is_appear_in_stack(self):
-        func = functions.GetAtt(self.stack, 'Fn::GetAtt',
+        func = functions.GetAtt(self.stack.defn, 'Fn::GetAtt',
                                 [self.rsrc.name, 'Foo'])
         self.assertIsNone(func.validate())
 
     def test_resource_is_not_appear_in_stack(self):
         self.stack.remove_resource(self.rsrc.name)
 
-        func = functions.GetAtt(self.stack, 'Fn::GetAtt',
+        func = functions.GetAtt(self.stack.defn, 'Fn::GetAtt',
                                 [self.rsrc.name, 'Foo'])
         ex = self.assertRaises(exception.InvalidTemplateReference,
                                func.validate)
         self.assertEqual('The specified reference "test_rsrc" (in unknown) '
-                         'is incorrect.', six.text_type(ex))
+                         'is incorrect.', str(ex))
 
     def test_resource_no_attribute_with_default_fn_get_att(self):
-        func = functions.GetAtt(self.stack, 'Fn::GetAtt',
+        res_defn = rsrc_defn.ResourceDefinition('test_rsrc',
+                                                'ResWithStringPropAndAttr')
+        self.rsrc = resource.Resource('test_rsrc', res_defn, self.stack)
+        self.stack.add_resource(self.rsrc)
+        stk_defn.update_resource_data(self.stack.defn, self.rsrc.name,
+                                      self.rsrc.node_data())
+        self.stack.validate()
+
+        func = functions.GetAtt(self.stack.defn, 'Fn::GetAtt',
                                 [self.rsrc.name, 'Bar'])
         ex = self.assertRaises(exception.InvalidTemplateAttribute,
                                func.validate)
         self.assertEqual('The Referenced Attribute (test_rsrc Bar) '
-                         'is incorrect.', six.text_type(ex))
+                         'is incorrect.', str(ex))
 
     def test_resource_no_attribute_with_overwritten_fn_get_att(self):
         res_defn = rsrc_defn.ResourceDefinition('test_rsrc',
                                                 'OS::Test::FakeResource')
         self.rsrc = resource.Resource('test_rsrc', res_defn, self.stack)
-        self.stack.add_resource(self.rsrc)
         self.rsrc.attributes_schema = {}
+        self.stack.add_resource(self.rsrc)
+        stk_defn.update_resource_data(self.stack.defn, self.rsrc.name,
+                                      self.rsrc.node_data())
+        self.stack.validate()
 
-        func = functions.GetAtt(self.stack, 'Fn::GetAtt',
+        func = functions.GetAtt(self.stack.defn, 'Fn::GetAtt',
                                 [self.rsrc.name, 'Foo'])
         self.assertIsNone(func.validate())
 
     def test_get_attr_without_attribute_name(self):
         ex = self.assertRaises(ValueError, functions.GetAtt,
-                               self.stack, 'Fn::GetAtt', [self.rsrc.name])
+                               self.stack.defn, 'Fn::GetAtt', [self.rsrc.name])
         self.assertEqual('Arguments to "Fn::GetAtt" must be '
                          'of the form [resource_name, attribute]',
-                         six.text_type(ex))
+                         str(ex))

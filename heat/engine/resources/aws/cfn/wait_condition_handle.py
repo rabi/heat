@@ -11,8 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from heat.engine.resources import signal_responder
 from heat.engine.resources import wait_condition as wc_base
 from heat.engine import support
@@ -39,9 +37,9 @@ class WaitConditionHandle(wc_base.BaseWaitConditionHandle):
     def get_reference_id(self):
         if self.resource_id:
             wc = signal_responder.WAITCONDITION
-            return six.text_type(self._get_ec2_signed_url(signal_type=wc))
+            return str(self._get_ec2_signed_url(signal_type=wc))
         else:
-            return six.text_type(self.name)
+            return str(self.name)
 
     def metadata_update(self, new_metadata=None):
         """DEPRECATED. Should use handle_signal instead."""
@@ -50,13 +48,14 @@ class WaitConditionHandle(wc_base.BaseWaitConditionHandle):
     def handle_signal(self, details=None):
         """Validate and update the resource metadata.
 
-        metadata must use the following format:
-        {
-            "Status" : "Status (must be SUCCESS or FAILURE)",
-            "UniqueId" : "Some ID, should be unique for Count>1",
-            "Data" : "Arbitrary Data",
-            "Reason" : "Reason String"
-        }
+        metadata must use the following format::
+
+            {
+                "Status" : "Status (must be SUCCESS or FAILURE)",
+                "UniqueId" : "Some ID, should be unique for Count>1",
+                "Data" : "Arbitrary Data",
+                "Reason" : "Reason String"
+            }
         """
         if details is None:
             return

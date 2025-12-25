@@ -13,7 +13,6 @@
 
 
 from heat.common.i18n import _
-from heat.engine import constraints
 from heat.engine import properties
 from heat.engine.resources import alarm_base
 from heat.engine import support
@@ -27,15 +26,11 @@ COMMON_GNOCCHI_PROPERTIES = (
     'aggregation_method', 'threshold',
 )
 
-
 common_gnocchi_properties_schema = {
     COMPARISON_OPERATOR: properties.Schema(
         properties.Schema.STRING,
         _('Operator used to compare specified statistic with threshold.'),
-        constraints=[
-            constraints.AllowedValues(['ge', 'gt', 'eq', 'ne', 'lt',
-                                       'le']),
-        ],
+        constraints=[alarm_base.BaseAlarm.QF_OP_VALS],
         update_allowed=True
     ),
     EVALUATION_PERIODS: properties.Schema(
@@ -46,10 +41,6 @@ common_gnocchi_properties_schema = {
     AGGREGATION_METHOD: properties.Schema(
         properties.Schema.STRING,
         _('The aggregation method to compare to the threshold.'),
-        constraints=[
-            constraints.AllowedValues(['mean', 'sum', 'last', 'max', 'min',
-                                       'std', 'median', 'first', 'count']),
-        ],
         update_allowed=True
     ),
     GRANULARITY: properties.Schema(
@@ -122,9 +113,9 @@ class AodhGnocchiResourcesAlarm(alarm_base.BaseAlarm):
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         if prop_diff:
-            kwargs = {}
-            kwargs.update(prop_diff)
-            props = self.get_alarm_props(kwargs)
+            new_props = json_snippet.properties(self.properties_schema,
+                                                self.context)
+            props = self.get_alarm_props(new_props)
             self.client().alarm.update(self.resource_id, props)
 
     def parse_live_resource_data(self, resource_properties,
@@ -134,12 +125,11 @@ class AodhGnocchiResourcesAlarm(alarm_base.BaseAlarm):
         threshold_data = resource_data.get(rule).copy()
         threshold_data.update(resource_data)
         for key in self.properties_schema.keys():
+            if key in alarm_base.INTERNAL_PROPERTIES:
+                continue
             if self.properties_schema[key].update_allowed:
                 record_reality.update({key: threshold_data.get(key)})
         return record_reality
-
-    def _show_resource(self):
-        return self.client().alarm.get(self.resource_id)
 
 
 class AodhGnocchiAggregationByMetricsAlarm(

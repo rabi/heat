@@ -12,6 +12,7 @@
 #    under the License.
 
 import collections
+import json
 import numbers
 import re
 
@@ -20,12 +21,10 @@ from oslo_config import cfg
 from oslo_log import log
 from oslo_utils import reflection
 from oslo_utils import strutils
-import six
 
 from heat.common import cache
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LW
 from heat.engine import resources
 
 # decorator that allows to cache the value
@@ -37,7 +36,7 @@ MEMOIZE = core.get_memoization_decorator(conf=cfg.CONF,
 LOG = log.getLogger(__name__)
 
 
-class Schema(collections.Mapping):
+class Schema(collections.abc.Mapping):
     """Schema base class for validating properties or parameters.
 
     Schema objects are serializable to dictionaries following a superset of
@@ -101,8 +100,8 @@ class Schema(collections.Mapping):
                 message=_('Invalid type (%s)') % self.type)
 
         if required and default is not None:
-            LOG.warning(_LW("Option 'required=True' should not be used with "
-                            "any 'default' value (%s)") % default)
+            LOG.warning("Option 'required=True' should not be used with "
+                        "any 'default' value (%s)", default)
 
         self.description = description
         self.required = required
@@ -149,7 +148,7 @@ class Schema(collections.Mapping):
             if isinstance(self.schema, AnyIndexDict):
                 self.schema.value.validate(context)
             else:
-                for nested_schema in six.itervalues(self.schema):
+                for nested_schema in self.schema.values():
                     nested_schema.validate(context)
 
     def _validate_default(self, context):
@@ -195,9 +194,10 @@ class Schema(collections.Mapping):
             elif self.type == self.NUMBER:
                 return Schema.str_to_num(value)
             elif self.type == self.STRING:
-                return six.text_type(value)
+                return str(value)
             elif self.type == self.BOOLEAN:
-                return strutils.bool_from_string(str(value), strict=True)
+                return strutils.bool_from_string(str(value),
+                                                 strict=True)
         except ValueError:
             raise ValueError(_('Value "%(val)s" is invalid for data type '
                                '"%(type)s".')
@@ -205,17 +205,16 @@ class Schema(collections.Mapping):
 
         return value
 
-    def validate_constraints(self, value, context=None, skipped=None,
-                             template=None):
+    def validate_constraints(self, value, context=None, skipped=None):
         if not skipped:
             skipped = []
 
         try:
             for constraint in self.constraints:
                 if type(constraint) not in skipped:
-                    constraint.validate(value, self, context, template)
+                    constraint.validate(value, self, context)
         except ValueError as ex:
-            raise exception.StackValidationFailed(message=six.text_type(ex))
+            raise exception.StackValidationFailed(message=str(ex))
 
     def __getitem__(self, key):
         if key == self.TYPE:
@@ -252,7 +251,7 @@ class Schema(collections.Mapping):
         return self._len
 
 
-class AnyIndexDict(collections.Mapping):
+class AnyIndexDict(collections.abc.Mapping):
     """A Mapping that returns the same value for any integer index.
 
     Used for storing the schema for a list. When converted to a dictionary,
@@ -265,8 +264,8 @@ class AnyIndexDict(collections.Mapping):
         self.value = value
 
     def __getitem__(self, key):
-        if key != self.ANYTHING and not isinstance(key, six.integer_types):
-            raise KeyError(_('Invalid key %s') % str(key))
+        if key != self.ANYTHING and not isinstance(key, int):
+            raise KeyError(_('Invalid key %s') % key)
 
         return self.value
 
@@ -277,7 +276,7 @@ class AnyIndexDict(collections.Mapping):
         return 1
 
 
-class Constraint(collections.Mapping):
+class Constraint(collections.abc.Mapping):
     """Parent class for constraints on allowable values for a Property.
 
     Constraints are serializable to dictionaries following the HOT input
@@ -297,8 +296,8 @@ class Constraint(collections.Mapping):
 
         return '\n'.join(desc())
 
-    def validate(self, value, schema=None, context=None, template=None):
-        if not self._is_valid(value, schema, context, template):
+    def validate(self, value, schema=None, context=None):
+        if not self._is_valid(value, schema, context):
             if self.description:
                 err_msg = self.description
             else:
@@ -352,7 +351,7 @@ class Range(Constraint):
         self.max = max
 
         for param in (min, max):
-            if not isinstance(param, (float, six.integer_types, type(None))):
+            if not isinstance(param, (float, int, type(None))):
                 raise exception.InvalidSchemaError(
                     message=_('min/max must be numeric'))
 
@@ -371,11 +370,12 @@ class Range(Constraint):
         return fmt % self._constraint()
 
     def _err_msg(self, value):
-        return '%s is out of range (min: %s, max: %s)' % (value,
-                                                          self.min,
-                                                          self.max)
+        return _('%(value)s is out of range '
+                 '(min: %(min)s, max: %(max)s)') % {'value': value,
+                                                    'min': self.min,
+                                                    'max': self.max}
 
-    def _is_valid(self, value, schema, context, template):
+    def _is_valid(self, value, schema, context):
         value = Schema.str_to_num(value)
 
         if self.min is not None:
@@ -420,7 +420,7 @@ class Length(Range):
         super(Length, self).__init__(min, max, description)
 
         for param in (min, max):
-            if not isinstance(param, (six.integer_types, type(None))):
+            if not isinstance(param, (int, type(None))):
                 msg = _('min/max length must be integral')
                 raise exception.InvalidSchemaError(message=msg)
 
@@ -434,13 +434,94 @@ class Length(Range):
         return fmt % self._constraint()
 
     def _err_msg(self, value):
-        return 'length (%d) is out of range (min: %s, max: %s)' % (len(value),
-                                                                   self.min,
-                                                                   self.max)
+        return _('length (%(length)d) is out of range '
+                 '(min: %(min)s, max: %(max)s)') % {'length': len(value),
+                                                    'min': self.min,
+                                                    'max': self.max}
 
-    def _is_valid(self, value, schema, context, template):
-        return super(Length, self)._is_valid(len(value), schema, context,
-                                             template)
+    def _is_valid(self, value, schema, context):
+        return super(Length, self)._is_valid(len(value), schema, context)
+
+
+class Modulo(Constraint):
+    """Constrain values to modulo.
+
+    Serializes to JSON as::
+
+        {
+            'modulo': {'step': <step>, 'offset': <offset>},
+            'description': <description>
+        }
+    """
+
+    (STEP, OFFSET) = ('step', 'offset')
+
+    valid_types = (Schema.INTEGER_TYPE, Schema.NUMBER_TYPE,)
+
+    def __init__(self, step=None, offset=None, description=None):
+        super(Modulo, self).__init__(description)
+        self.step = step
+        self.offset = offset
+
+        if step is None or offset is None:
+            raise exception.InvalidSchemaError(
+                message=_('A modulo constraint must have a step value and '
+                          'an offset value specified.'))
+
+        for param in (step, offset):
+            if not isinstance(param, (float, int, type(None))):
+                raise exception.InvalidSchemaError(
+                    message=_('step/offset must be numeric'))
+
+            if not int(param) == param:
+                raise exception.InvalidSchemaError(
+                    message=_('step/offset must be integer'))
+
+        step, offset = int(step), int(offset)
+
+        if step == 0:
+            raise exception.InvalidSchemaError(message=_('step cannot be 0.'))
+
+        if abs(offset) >= abs(step):
+            raise exception.InvalidSchemaError(
+                message=_('offset must be smaller (by absolute value) '
+                          'than step.'))
+
+        if step * offset < 0:
+            raise exception.InvalidSchemaError(
+                message=_('step and offset must be both positive or both '
+                          'negative.'))
+
+    def _str(self):
+        if self.step is None or self.offset is None:
+            fmt = _('The values must be specified.')
+        else:
+            fmt = _('The value must be a multiple of %(step)s '
+                    'with an offset of %(offset)s.')
+        return fmt % self._constraint()
+
+    def _err_msg(self, value):
+        return _('%(value)s is not a multiple of %(step)s '
+                 'with an offset of %(offset)s') % {'value': value,
+                                                    'step': self.step,
+                                                    'offset': self.offset}
+
+    def _is_valid(self, value, schema, context):
+        value = Schema.str_to_num(value)
+
+        if value % self.step != self.offset:
+            return False
+
+        return True
+
+    def _constraint(self):
+        def constraints():
+            if self.step is not None:
+                yield self.STEP, self.step
+            if self.offset is not None:
+                yield self.OFFSET, self.offset
+
+        return dict(constraints())
 
 
 class AllowedValues(Constraint):
@@ -459,21 +540,23 @@ class AllowedValues(Constraint):
 
     def __init__(self, allowed, description=None):
         super(AllowedValues, self).__init__(description)
-        if (not isinstance(allowed, collections.Sequence) or
-                isinstance(allowed, six.string_types)):
+        if (not isinstance(allowed, collections.abc.Sequence) or
+                isinstance(allowed, str)):
             raise exception.InvalidSchemaError(
                 message=_('AllowedValues must be a list'))
         self.allowed = tuple(allowed)
 
     def _str(self):
-        allowed = ', '.join(str(a) for a in self.allowed)
+        allowed = ', '.join(json.dumps(a) for a in self.allowed)
         return _('Allowed values: %s') % allowed
 
     def _err_msg(self, value):
-        allowed = '[%s]' % ', '.join(str(a) for a in self.allowed)
-        return '"%s" is not an allowed value %s' % (value, allowed)
+        allowed = '[%s]' % ', '.join(json.dumps(a) for a in self.allowed)
+        return _('%(value)s is not an allowed value '
+                 '%(allowed)s') % {'value': json.dumps(value),
+                                   'allowed': allowed}
 
-    def _is_valid(self, value, schema, context, template):
+    def _is_valid(self, value, schema, context):
         # For list values, check if all elements of the list are contained
         # in allowed list.
         if isinstance(value, list):
@@ -504,7 +587,7 @@ class AllowedPattern(Constraint):
 
     def __init__(self, pattern, description=None):
         super(AllowedPattern, self).__init__(description)
-        if not isinstance(pattern, six.string_types):
+        if not isinstance(pattern, str):
             raise exception.InvalidSchemaError(
                 message=_('AllowedPattern must be a string'))
         self.pattern = pattern
@@ -514,9 +597,10 @@ class AllowedPattern(Constraint):
         return _('Value must match pattern: %s') % self.pattern
 
     def _err_msg(self, value):
-        return '"%s" does not match pattern "%s"' % (value, self.pattern)
+        return _('"%(value)s" does not match pattern '
+                 '"%(pattern)s"') % {'value': value, 'pattern': self.pattern}
 
-    def _is_valid(self, value, schema, context, template):
+    def _is_valid(self, value, schema, context):
         match = self.match(value)
         return match is not None and match.end() == len(value)
 
@@ -567,19 +651,11 @@ class CustomConstraint(Constraint):
         return _('"%(value)s" does not validate %(name)s') % {
             "value": value, "name": self.name}
 
-    def _is_valid(self, value, schema, context, template):
+    def _is_valid(self, value, schema, context):
         constraint = self.custom_constraint
         if not constraint:
             return False
-
-        try:
-            result = constraint.validate(value, context,
-                                         template=template)
-        except TypeError:
-            # for backwards compatibility with older service constraints
-            result = constraint.validate(value, context)
-
-        return result
+        return constraint.validate(value, context)
 
 
 class BaseCustomConstraint(object):
@@ -601,7 +677,7 @@ class BaseCustomConstraint(object):
         return _("Error validating value '%(value)s': %(message)s") % {
             "value": value, "message": self._error_message}
 
-    def validate(self, value, context, template=None):
+    def validate(self, value, context):
 
         @MEMOIZE
         def check_cache_or_validate_value(cache_value_prefix,
@@ -629,7 +705,7 @@ class BaseCustomConstraint(object):
                 return True
         class_name = reflection.get_class_name(self, fully_qualified=False)
         cache_value_prefix = "{0}:{1}".format(class_name,
-                                              six.text_type(context.tenant_id))
+                                              str(context.project_id))
         validation_result = check_cache_or_validate_value(
             cache_value_prefix, value)
         # if validation failed we should not store it in cache

@@ -11,18 +11,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import six
+from unittest import mock
 
 from heat.engine import attributes
 from heat.engine import resources
-from heat.engine import rsrc_defn
-from heat.engine import stack
 from heat.engine import support
-from heat.engine import template
 from heat.tests import common
-from heat.tests import generic_resource
-from heat.tests import utils
 
 
 class AttributeSchemaTest(common.HeatTestCase):
@@ -39,9 +33,9 @@ class AttributeSchemaTest(common.HeatTestCase):
 
     def test_all_resource_schemata(self):
         for resource_type in resources.global_env().get_types():
-            for schema in six.itervalues(getattr(resource_type,
-                                                 'attributes_schema',
-                                                 {})):
+            for schema in getattr(resource_type,
+                                  'attributes_schema',
+                                  {}).values():
                 attributes.Schema.from_attribute(schema)
 
     def test_from_attribute_new_schema_format(self):
@@ -83,12 +77,22 @@ class AttributeTest(common.HeatTestCase):
     def test_as_output(self):
         """Test that Attribute looks right when viewed as an Output."""
         expected = {
-            "Value": '{"Fn::GetAtt": ["test_resource", "test1"]}',
+            "Value": {"Fn::GetAtt": ["test_resource", "test1"]},
             "Description": "The first test attribute"
         }
         attr = attributes.Attribute(
             "test1", attributes.Schema("The first test attribute"))
         self.assertEqual(expected, attr.as_output("test_resource"))
+
+    def test_as_output_hot(self):
+        """Test that Attribute looks right when viewed as an Output."""
+        expected = {
+            "value": {"get_attr": ["test_resource", "test1"]},
+            "description": "The first test attribute"
+        }
+        attr = attributes.Attribute(
+            "test1", attributes.Schema("The first test attribute"))
+        self.assertEqual(expected, attr.as_output("test_resource", "hot"))
 
 
 class AttributesTest(common.HeatTestCase):
@@ -152,16 +156,19 @@ class AttributesTest(common.HeatTestCase):
         """Test that Output format works as expected."""
         expected = {
             "test1": {
-                "Value": '{"Fn::GetAtt": ["test_resource", "test1"]}',
+                "Value": {"Fn::GetAtt": ["test_resource", "test1"]},
                 "Description": "Test attrib 1"
             },
             "test2": {
-                "Value": '{"Fn::GetAtt": ["test_resource", "test2"]}',
+                "Value": {"Fn::GetAtt": ["test_resource", "test2"]},
                 "Description": "Test attrib 2"
             },
             "test3": {
-                "Value": '{"Fn::GetAtt": ["test_resource", "test3"]}',
+                "Value": {"Fn::GetAtt": ["test_resource", "test3"]},
                 "Description": "Test attrib 3"
+            },
+            "OS::stack_id": {
+                "Value": {"Ref": "test_resource"},
             }
         }
         MyTestResourceClass = mock.MagicMock()
@@ -177,6 +184,40 @@ class AttributesTest(common.HeatTestCase):
             expected,
             attributes.Attributes.as_outputs("test_resource",
                                              MyTestResourceClass))
+
+    def test_as_outputs_hot(self):
+        """Test that Output format works as expected."""
+        expected = {
+            "test1": {
+                "value": {"get_attr": ["test_resource", "test1"]},
+                "description": "Test attrib 1"
+            },
+            "test2": {
+                "value": {"get_attr": ["test_resource", "test2"]},
+                "description": "Test attrib 2"
+            },
+            "test3": {
+                "value": {"get_attr": ["test_resource", "test3"]},
+                "description": "Test attrib 3"
+            },
+            "OS::stack_id": {
+                "value": {"get_resource": "test_resource"},
+            }
+        }
+        MyTestResourceClass = mock.MagicMock()
+        MyTestResourceClass.attributes_schema = {
+            "test1": attributes.Schema("Test attrib 1"),
+            "test2": attributes.Schema("Test attrib 2"),
+            "test3": attributes.Schema("Test attrib 3"),
+            "test4": attributes.Schema(
+                "Test attrib 4",
+                support_status=support.SupportStatus(status=support.HIDDEN))
+        }
+        self.assertEqual(
+            expected,
+            attributes.Attributes.as_outputs("test_resource",
+                                             MyTestResourceClass,
+                                             "hot"))
 
     def test_caching_local(self):
         self.resolver.side_effect = ["value1", "value1 changed"]
@@ -251,25 +292,3 @@ class AttributesTypeTest(common.HeatTestCase):
         self.assertNotIn(msg, self.LOG.output)
         attribs._validate_type(attr, self.invalid_value)
         self.assertIn(msg, self.LOG.output)
-
-
-class DynamicSchemeAttributeTest(common.HeatTestCase):
-    def setUp(self):
-        super(DynamicSchemeAttributeTest, self).setUp()
-        test_stack = stack.Stack(
-            utils.dummy_context(), 'test_stack',
-            template.Template.create_empty_template())
-        snippet = rsrc_defn.ResourceDefinition('test_resource',
-                                               'DynamicSchemaResource')
-        test_res = generic_resource.DynamicSchemaResource(
-            'aresource', snippet, test_stack)
-        self.attrs = test_res.attributes
-
-    def test_get_static_attribute(self):
-        self.assertEqual("static_attribute", self.attrs["stat_attr"])
-
-    def test_get_dynamic_attribute(self):
-        self.assertEqual("dynamic_attribute", self.attrs["dynamic_attr"])
-
-    def test_get_non_existing_attribute(self):
-        self.assertRaises(KeyError, self.attrs.__getitem__, "non_existing")

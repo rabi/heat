@@ -12,22 +12,25 @@
 #    under the License.
 
 
-import mock
+from unittest import mock
+
 from oslo_config import cfg
 from requests import exceptions
-import six
 import yaml
 
 from heat.common import exception
 from heat.common import identifier
 from heat.common import template_format
 from heat.common import urlfetch
+from heat.engine import api
+from heat.engine import node_data
 from heat.engine import resource
 from heat.engine.resources.aws.cfn import stack as stack_res
 from heat.engine import rsrc_defn
 from heat.engine import stack as parser
 from heat.engine import template
 from heat.objects import resource_data as resource_data_object
+from heat.objects import stack as stack_object
 from heat.tests import common
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
@@ -162,7 +165,7 @@ Resources:
 
         res = self.assertRaises(exception.StackValidationFailed,
                                 stack.validate)
-        self.assertIn('Recursion depth exceeds', six.text_type(res))
+        self.assertIn('Recursion depth exceeds', str(res))
 
         calls = [mock.call('https://server.test/depth1.template'),
                  mock.call('https://server.test/depth2.template'),
@@ -227,7 +230,7 @@ Resources:
         tr.return_value = 2
         res = self.assertRaises(exception.StackValidationFailed,
                                 stack.validate)
-        self.assertIn('Recursion depth exceeds', six.text_type(res))
+        self.assertIn('Recursion depth exceeds', str(res))
         expected_count = cfg.CONF.get('max_nested_stack_depth') + 1
         self.assertEqual(expected_count, urlfetch.get.call_count)
 
@@ -248,7 +251,8 @@ Resources:
         with mock.patch('heat.common.template_format.parse') as mock_parse:
             mock_parse.return_value = 'child_template'
             self.assertEqual('child_template', nested_stack.child_template())
-            mock_parse.assert_called_once_with('template_file')
+            mock_parse.assert_called_once_with(
+                'template_file', 'https://server.test/the.template')
 
     def test_child_template_when_fetching_file_fails(self):
         urlfetch.get.side_effect = exceptions.RequestException()
@@ -275,15 +279,15 @@ Resources:
         t = template_format.parse(self.test_template)
         tmpl = template.Template(t)
         ctx = utils.dummy_context()
-        cache_data = {'the_nested': {
+        cache_data = {'the_nested': node_data.NodeData.from_dict({
             'uuid': mock.ANY,
             'id': mock.ANY,
             'action': 'CREATE',
             'status': 'COMPLETE',
             'reference_id': 'the_nested_convg_mock'
-        }}
+        })}
         stack = parser.Stack(ctx, 'test_stack', tmpl, cache_data=cache_data)
-        nested_stack = stack['the_nested']
+        nested_stack = stack.defn['the_nested']
         self.assertEqual('the_nested_convg_mock', nested_stack.FnGetRefId())
 
     def test_get_attribute(self):
@@ -294,13 +298,20 @@ Resources:
         stack.store()
 
         stack_res = stack['the_nested']
-        stack_res._store()
+        stack_res.store()
 
         nested_t = template_format.parse(self.nested_template)
-        nested_stack = parser.Stack(ctx, 'test',
+        nested_t['Parameters']['KeyName']['Default'] = 'Key'
+
+        nested_stack = parser.Stack(ctx, 'test_nested',
                                     template.Template(nested_t))
         nested_stack.store()
-        stack_res.nested = mock.Mock(return_value=nested_stack)
+
+        stack_res._rpc_client = mock.MagicMock()
+        stack_res._rpc_client.show_stack.return_value = [
+            api.format_stack(nested_stack)]
+        stack_res.nested_identifier = mock.Mock()
+        stack_res.nested_identifier.return_value = {'foo': 'bar'}
         self.assertEqual('bar', stack_res.FnGetAtt('Outputs.Foo'))
 
 
@@ -375,7 +386,11 @@ Outputs:
         self.res = stack_res.NestedStack('test_t_res',
                                          self.defn, self.stack)
         self.assertIsNone(self.res.validate())
-        self.res._store()
+        self.res.store()
+
+        self.patchobject(stack_object.Stack, 'get_status',
+                         return_value=('CREATE', 'COMPLETE',
+                                       'Created', 'Sometime'))
 
     def test_handle_create(self):
         self.res.create_with_template = mock.Mock(return_value=None)
@@ -405,12 +420,13 @@ Outputs:
     def test_handle_delete(self):
         self.res.rpc_client = mock.MagicMock()
         self.res.action = self.res.CREATE
-        self.res.nested = mock.MagicMock()
+        self.res.nested_identifier = mock.MagicMock()
         stack_identity = identifier.HeatIdentifier(
-            self.ctx.tenant_id,
+            self.ctx.project_id,
             self.res.physical_resource_name(),
             self.res.resource_id)
-        self.res.nested().identifier.return_value = stack_identity
+        self.res.nested_identifier.return_value = stack_identity
+        self.res.resource_id = stack_identity.stack_id
         self.res.handle_delete()
         self.res.rpc_client.return_value.delete_stack.assert_called_once_with(
-            self.ctx, self.res.nested().identifier())
+            self.ctx, stack_identity, cast=False)

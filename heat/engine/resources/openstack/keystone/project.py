@@ -12,10 +12,12 @@
 #    under the License.
 
 from heat.common.i18n import _
+from heat.engine import attributes
 from heat.engine import constraints
 from heat.engine import properties
 from heat.engine import resource
 from heat.engine import support
+from heat.engine import translation
 
 
 class KeystoneProject(resource.Resource):
@@ -37,9 +39,9 @@ class KeystoneProject(resource.Resource):
     entity = 'projects'
 
     PROPERTIES = (
-        NAME, DOMAIN, DESCRIPTION, ENABLED, PARENT,
+        NAME, DOMAIN, DESCRIPTION, ENABLED, PARENT, TAGS,
     ) = (
-        'name', 'domain', 'description', 'enabled', 'parent',
+        'name', 'domain', 'description', 'enabled', 'parent', 'tags',
     )
 
     properties_schema = {
@@ -74,7 +76,71 @@ class KeystoneProject(resource.Resource):
             support_status=support.SupportStatus(version='6.0.0'),
             constraints=[constraints.CustomConstraint('keystone.project')]
         ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            _('A list of tags for labeling and sorting projects.'),
+            support_status=support.SupportStatus(version='10.0.0'),
+            default=[],
+            update_allowed=True
+        ),
     }
+
+    ATTRIBUTES = (
+        NAME_ATTR, PARENT_ATTR, DOMAIN_ATTR, ENABLED_ATTR, IS_DOMAIN_ATTR
+    ) = (
+        'name', 'parent_id', 'domain_id', 'enabled', 'is_domain'
+    )
+    attributes_schema = {
+        NAME_ATTR: attributes.Schema(
+            _('Project name.'),
+            support_status=support.SupportStatus(version='10.0.0'),
+            type=attributes.Schema.STRING
+        ),
+        PARENT_ATTR: attributes.Schema(
+            _('Parent project id.'),
+            support_status=support.SupportStatus(version='10.0.0'),
+            type=attributes.Schema.STRING
+        ),
+        DOMAIN_ATTR: attributes.Schema(
+            _('Domain id for project.'),
+            support_status=support.SupportStatus(version='10.0.0'),
+            type=attributes.Schema.STRING
+        ),
+        ENABLED_ATTR: attributes.Schema(
+            _('Flag of enable project.'),
+            support_status=support.SupportStatus(version='10.0.0'),
+            type=attributes.Schema.BOOLEAN
+        ),
+        IS_DOMAIN_ATTR: attributes.Schema(
+            _('Indicates whether the project also acts as a domain.'),
+            support_status=support.SupportStatus(version='10.0.0'),
+            type=attributes.Schema.BOOLEAN
+        ),
+    }
+
+    def _resolve_attribute(self, name):
+        if self.resource_id is None:
+            return
+        project = self.client().projects.get(self.resource_id)
+        return getattr(project, name, None)
+
+    def translation_rules(self, properties):
+        return [
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                [self.DOMAIN],
+                client_plugin=self.client_plugin(),
+                finder='get_domain_id'
+            ),
+            translation.TranslationRule(
+                properties,
+                translation.TranslationRule.RESOLVE,
+                [self.PARENT],
+                client_plugin=self.client_plugin(),
+                finder='get_project_id'
+            ),
+        ]
 
     def client(self):
         return super(KeystoneProject, self).client().client
@@ -83,18 +149,18 @@ class KeystoneProject(resource.Resource):
         project_name = (self.properties[self.NAME] or
                         self.physical_resource_name())
         description = self.properties[self.DESCRIPTION]
-        domain = self.client_plugin().get_domain_id(
-            self.properties[self.DOMAIN])
+        domain = self.properties[self.DOMAIN]
         enabled = self.properties[self.ENABLED]
-        pp = self.properties[self.PARENT]
-        parent = self.client_plugin().get_project_id(pp)
+        parent = self.properties[self.PARENT]
+        tags = self.properties[self.TAGS]
 
         project = self.client().projects.create(
             name=project_name,
             domain=domain,
             description=description,
             enabled=enabled,
-            parent=parent)
+            parent=parent,
+            tags=tags)
 
         self.resource_id_set(project.id)
 
@@ -107,17 +173,42 @@ class KeystoneProject(resource.Resource):
 
             description = prop_diff.get(self.DESCRIPTION)
             enabled = prop_diff.get(self.ENABLED)
-            domain = (prop_diff.get(self.DOMAIN) or
-                      self.properties[self.DOMAIN])
-            domain_id = self.client_plugin().get_domain_id(domain)
+            domain = prop_diff.get(self.DOMAIN, self.properties[self.DOMAIN])
+            tags = (prop_diff.get(self.TAGS) or
+                    self.properties[self.TAGS])
 
             self.client().projects.update(
                 project=self.resource_id,
                 name=name,
                 description=description,
                 enabled=enabled,
-                domain=domain_id
+                domain=domain,
+                tags=tags
             )
+
+    def parse_live_resource_data(self, resource_properties, resource_data):
+        result = super(KeystoneProject, self).parse_live_resource_data(
+            resource_properties, resource_data)
+        result[self.DOMAIN] = resource_data.get('domain_id')
+        return result
+
+    def handle_delete(self):
+        if self.resource_id:
+            # find and delete the default security group Neutron has created
+            default_sec_group_name = "default"
+            nclient = self.client_plugin("neutron").client()
+            default_sec_groups = nclient.list_security_groups(
+                project_id=self.resource_id,
+                name=default_sec_group_name)["security_groups"]
+            # NOTE(pas-ha) this should always contain a single security group
+            # (if any) as Netron enforces uniqueness of 'default' security
+            # group in a project.
+            # However leaving orphans is bad enough, so we are deleting
+            # any security group with such name w/o uniqueness check.
+            for secgroup in default_sec_groups:
+                with self.client_plugin("neutron").ignore_not_found:
+                    nclient.delete_security_group(secgroup["id"])
+        super(KeystoneProject, self).handle_delete()
 
 
 def resource_mapping():

@@ -15,9 +15,9 @@
 
 """Stack object."""
 
+from oslo_log import log as logging
 from oslo_versionedobjects import base
 from oslo_versionedobjects import fields
-import six
 
 from heat.common import exception
 from heat.common.i18n import _
@@ -27,6 +27,8 @@ from heat.objects import base as heat_base
 from heat.objects import fields as heat_fields
 from heat.objects import raw_template
 from heat.objects import stack_tag
+
+LOG = logging.getLogger(__name__)
 
 
 class Stack(
@@ -53,7 +55,7 @@ class Stack(
         'action': fields.StringField(nullable=True),
         'status': fields.StringField(nullable=True),
         'status_reason': fields.StringField(nullable=True),
-        'raw_template': fields.ObjectField('RawTemplate'),
+        'raw_template_obj': fields.ObjectField('RawTemplate'),
         'convergence': fields.BooleanField(),
         'current_traversal': fields.StringField(),
         'current_deps': heat_fields.JsonField(),
@@ -65,17 +67,38 @@ class Stack(
     @staticmethod
     def _from_db_object(context, stack, db_stack):
         for field in stack.fields:
-            if field == 'raw_template':
-                stack['raw_template'] = (
-                    raw_template.RawTemplate.from_db_object(
-                        context,
-                        raw_template.RawTemplate(),
-                        db_stack['raw_template']))
+            if field == 'raw_template_obj':
+                raw_template_obj = db_stack.__dict__.get('raw_template')
+                if raw_template_obj is not None:
+                    # Object is already lazy loaded
+                    raw_template_obj = (
+                        raw_template.RawTemplate.from_db_object(
+                            context,
+                            raw_template.RawTemplate(),
+                            raw_template_obj))
+                    stack._raw_template = raw_template_obj
             else:
                 stack[field] = db_stack.__dict__.get(field)
         stack._context = context
         stack.obj_reset_changes()
         return stack
+
+    @property
+    def raw_template(self):
+        if hasattr(self, '_raw_template'):
+            return self._raw_template
+
+        LOG.warning('Loading a raw_template that should have been '
+                    'eagerly loaded for stack id %s', self.id)
+        self._raw_template = raw_template.RawTemplate.get_by_id(
+            self._context,
+            self['raw_template_id'])
+        return self._raw_template
+
+    @raw_template.setter
+    def raw_template(self, value):
+        self['raw_template_obj'] = value
+        self._raw_template = value
 
     @classmethod
     def get_root_id(cls, context, stack_id):
@@ -93,7 +116,7 @@ class Stack(
     def get_by_name_and_owner_id(cls, context, stack_name, owner_id):
         db_stack = db_api.stack_get_by_name_and_owner_id(
             context,
-            six.text_type(stack_name),
+            str(stack_name),
             owner_id
         )
         if not db_stack:
@@ -103,7 +126,7 @@ class Stack(
 
     @classmethod
     def get_by_name(cls, context, stack_name):
-        db_stack = db_api.stack_get_by_name(context, six.text_type(stack_name))
+        db_stack = db_api.stack_get_by_name(context, str(stack_name))
         if not db_stack:
             return None
         stack = cls._from_db_object(context, cls(context), db_stack)
@@ -114,7 +137,7 @@ class Stack(
                 sort_dir=None, filters=None,
                 show_deleted=False, show_nested=False, show_hidden=False,
                 tags=None, tags_any=None, not_tags=None,
-                not_tags_any=None):
+                not_tags_any=None, eager_load=False):
         db_stacks = db_api.stack_get_all(
             context,
             limit=limit,
@@ -128,7 +151,8 @@ class Stack(
             tags=tags,
             tags_any=tags_any,
             not_tags=not_tags,
-            not_tags_any=not_tags_any)
+            not_tags_any=not_tags_any,
+            eager_load=eager_load)
         for db_stack in db_stacks:
             try:
                 yield cls._from_db_object(context, cls(context), db_stack)

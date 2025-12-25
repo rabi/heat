@@ -10,12 +10,14 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
+
 from oslo_serialization import jsonutils
 
 from heat.common import identifier
 from heat.common import template_format
 from heat.engine.clients.os import glance
+from heat.engine.clients.os import heat_plugin
 from heat.engine.clients.os import nova
 from heat.engine import environment
 from heat.engine.resources.aws.cfn.wait_condition_handle import (
@@ -25,6 +27,7 @@ from heat.engine.resources.openstack.nova import server
 from heat.engine import scheduler
 from heat.engine import service
 from heat.engine import stack as stk
+from heat.engine import stk_defn
 from heat.engine import template as tmpl
 from heat.tests import common
 from heat.tests import utils
@@ -150,7 +153,7 @@ class MetadataRefreshTest(common.HeatTestCase):
     @mock.patch.object(glance.GlanceClientPlugin, 'find_image_by_name_or_id')
     @mock.patch.object(instance.Instance, 'handle_create')
     @mock.patch.object(instance.Instance, 'check_create_complete')
-    @mock.patch.object(instance.Instance, 'FnGetAtt')
+    @mock.patch.object(instance.Instance, '_resolve_attribute')
     def test_FnGetAtt_metadata_updated(self, mock_get, mock_check,
                                        mock_handle, *args):
         """Tests that metadata gets updated when FnGetAtt return changes."""
@@ -172,6 +175,7 @@ class MetadataRefreshTest(common.HeatTestCase):
 
         # Initial resolution of the metadata
         stack.create()
+        self.assertEqual((stack.CREATE, stack.COMPLETE), stack.state)
 
         # Sanity check on S2
         s2 = stack['S2']
@@ -182,9 +186,18 @@ class MetadataRefreshTest(common.HeatTestCase):
         content = self._get_metadata_content(s1.metadata_get())
         self.assertEqual('s2-ip=10.0.0.1', content)
 
+        # This is not a terribly realistic test - the metadata updates below
+        # happen in run_alarm_action() in service_stack_watch, and actually
+        # operate on a freshly loaded stack so there's no cached attributes.
+        # Clear the attributes cache here to keep it passing.
+        s2.attributes.reset_resolved_values()
+
         # Run metadata update to pick up the new value from S2
-        s1.metadata_update()
+        # (simulating run_alarm_action() in service_stack_watch)
         s2.metadata_update()
+        stk_defn.update_resource_data(stack.defn, s2.name, s2.node_data())
+        s1.metadata_update()
+        stk_defn.update_resource_data(stack.defn, s1.name, s1.node_data())
 
         # Verify the updated value is correct in S1
         content = self._get_metadata_content(s1.metadata_get())
@@ -208,20 +221,19 @@ class WaitConditionMetadataUpdateTest(common.HeatTestCase):
     def setUp(self):
         super(WaitConditionMetadataUpdateTest, self).setUp()
         self.man = service.EngineService('a-host', 'a-topic')
-        self.man.create_periodic_tasks()
 
     @mock.patch.object(nova.NovaClientPlugin, 'find_flavor_by_name_or_id')
     @mock.patch.object(glance.GlanceClientPlugin, 'find_image_by_name_or_id')
+    @mock.patch.object(heat_plugin.HeatClientPlugin, 'get_heat_cfn_url')
     @mock.patch.object(instance.Instance, 'handle_create')
     @mock.patch.object(instance.Instance, 'check_create_complete')
-    @mock.patch.object(instance.Instance, 'is_service_available')
     @mock.patch.object(scheduler.TaskRunner, '_sleep')
     @mock.patch.object(WaitConditionHandle, 'identifier')
-    def test_wait_metadata(self, mock_identifier, mock_sleep, mock_available,
-                           mock_check, mock_handle, *args):
+    def test_wait_metadata(self, mock_identifier, mock_sleep,
+                           mock_check, mock_handle, mock_get, *args):
         """Tests a wait condition metadata update after a signal call."""
 
-        mock_available.return_value = (True, None)
+        mock_get.return_value = 'http://server.test:8000/v1'
         # Setup Stack
         temp = template_format.parse(TEST_TEMPLATE_WAIT_CONDITION)
         template = tmpl.Template(temp)
@@ -258,7 +270,10 @@ class WaitConditionMetadataUpdateTest(common.HeatTestCase):
             update_metadata('123', 'foo', 'bar')
 
         def side_effect_popper(sleep_time):
-            if self.run_empty:
+            wh = stack['WH']
+            if wh.status == wh.IN_PROGRESS:
+                return
+            elif self.run_empty:
                 self.run_empty = False
                 check_empty(sleep_time)
             else:
@@ -284,7 +299,6 @@ class WaitConditionMetadataUpdateTest(common.HeatTestCase):
             jsonutils.loads(inst.metadata_get(refresh=True)['test']))
 
         # Verify outgoing calls
-        self.assertTrue(mock_available.call_count > 0)
         self.assertEqual(2, mock_handle.call_count)
         self.assertEqual(2, mock_check.call_count)
 
@@ -297,7 +311,7 @@ class MetadataRefreshServerTest(common.HeatTestCase):
                        return_value=1)
     @mock.patch.object(server.Server, 'handle_create')
     @mock.patch.object(server.Server, 'check_create_complete')
-    @mock.patch.object(server.Server, 'FnGetAtt')
+    @mock.patch.object(server.Server, 'get_attribute', new_callable=mock.Mock)
     def test_FnGetAtt_metadata_update(self, mock_get, mock_check,
                                       mock_handle, *args):
         temp = template_format.parse(TEST_TEMPLATE_SERVER)
@@ -310,23 +324,26 @@ class MetadataRefreshServerTest(common.HeatTestCase):
         self.stub_KeypairConstraint_validate()
 
         # Note dummy addresses are from TEST-NET-1 ref rfc5737
-        mock_get.side_effect = ['192.0.2.1', '192.0.2.2', '192.0.2.2']
+        mock_get.side_effect = ['192.0.2.1', '192.0.2.2']
 
         # Test
         stack.create()
         self.assertEqual((stack.CREATE, stack.COMPLETE), stack.state)
 
         s1 = stack['instance1']
+        s2 = stack['instance2']
         md = s1.metadata_get()
-        self.assertEqual({u'template_data': '192.0.2.1'}, md)
+        self.assertEqual({'template_data': '192.0.2.1'}, md)
 
         # Now set some metadata via the resource, like is done by
         # _populate_deployments_metadata. This should be persisted over
         # calls to metadata_update()
-        new_md = {u'template_data': '192.0.2.2', 'set_by_rsrc': 'orange'}
+        new_md = {'template_data': '192.0.2.2', 'set_by_rsrc': 'orange'}
         s1.metadata_set(new_md)
         md = s1.metadata_get(refresh=True)
         self.assertEqual(new_md, md)
+        s2.attributes.reset_resolved_values()
+        stk_defn.update_resource_data(stack.defn, s2.name, s2.node_data())
         s1.metadata_update()
         md = s1.metadata_get(refresh=True)
         self.assertEqual(new_md, md)

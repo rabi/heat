@@ -26,13 +26,13 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import importutils
 
+from heat.common import config
 from heat.common import context
 from heat.common import exception
 from heat.common.i18n import _
-from heat.common.i18n import _LE
-from heat.common.i18n import _LW
+from heat.common import password_gen
 
-LOG = logging.getLogger('heat.engine.clients.keystoneclient')
+LOG = logging.getLogger(__name__)
 
 AccessKey = collections.namedtuple('AccessKey', ['id', 'access', 'secret'])
 
@@ -42,7 +42,8 @@ _default_keystone_backend = (
 keystone_opts = [
     cfg.StrOpt('keystone_backend',
                default=_default_keystone_backend,
-               help="Fully qualified class name to use as a keystone backend.")
+               help=_("Fully qualified class name to use as a "
+                      "keystone backend."))
 ]
 cfg.CONF.register_opts(keystone_opts)
 
@@ -58,7 +59,7 @@ class KsClientWrapper(object):
     directly instantiate instances of this class inside resources themselves.
     """
 
-    def __init__(self, context):
+    def __init__(self, context, region_name):
         # If a trust_id is specified in the context, we immediately
         # authenticate so we can populate the context with a trust token
         # otherwise, we delay client authentication until needed to avoid
@@ -75,6 +76,9 @@ class KsClientWrapper(object):
         self._admin_auth = None
         self._domain_admin_auth = None
         self._domain_admin_client = None
+        self._region_name = region_name
+        self._interface = config.get_client_option('keystone',
+                                                   'endpoint_type')
 
         self.session = self.context.keystone_session
         self.v3_endpoint = self.context.keystone_v3_endpoint
@@ -95,7 +99,7 @@ class KsClientWrapper(object):
         self.domain_admin_user = cfg.CONF.stack_domain_admin
         self.domain_admin_password = cfg.CONF.stack_domain_admin_password
 
-        LOG.debug('Using stack domain %s' % self.stack_domain)
+        LOG.debug('Using stack domain %s', self.stack_domain)
 
     @property
     def context(self):
@@ -119,6 +123,14 @@ class KsClientWrapper(object):
         return self._client
 
     @property
+    def auth_region_name(self):
+        importutils.import_module('keystonemiddleware.auth_token')
+        auth_region = cfg.CONF.keystone_authtoken.region_name
+        if not auth_region:
+            auth_region = self._region_name
+        return auth_region
+
+    @property
     def domain_admin_auth(self):
         if not self._domain_admin_auth:
             # Note we must specify the domain when getting the token
@@ -135,7 +147,7 @@ class KsClientWrapper(object):
             try:
                 auth.get_token(self.session)
             except ks_exception.Unauthorized:
-                LOG.error(_LE("Domain admin client authentication failed"))
+                LOG.error("Domain admin client authentication failed")
                 raise exception.AuthorizationFailure()
 
             self._domain_admin_auth = auth
@@ -147,12 +159,18 @@ class KsClientWrapper(object):
         if not self._domain_admin_client:
             self._domain_admin_client = kc_v3.Client(
                 session=self.session,
-                auth=self.domain_admin_auth)
+                auth=self.domain_admin_auth,
+                connect_retries=cfg.CONF.client_retry_limit,
+                interface=self._interface,
+                region_name=self.auth_region_name)
 
         return self._domain_admin_client
 
     def _v3_client_init(self):
-        client = kc_v3.Client(session=self.session)
+        client = kc_v3.Client(session=self.session,
+                              connect_retries=cfg.CONF.client_retry_limit,
+                              interface=self._interface,
+                              region_name=self.auth_region_name)
 
         if hasattr(self.context.auth_plugin, 'get_access'):
             # NOTE(jamielennox): get_access returns the current token without
@@ -160,20 +178,62 @@ class KsClientWrapper(object):
             try:
                 auth_ref = self.context.auth_plugin.get_access(self.session)
             except ks_exception.Unauthorized:
-                LOG.error(_LE("Keystone client authentication failed"))
+                LOG.error("Keystone client authentication failed")
                 raise exception.AuthorizationFailure()
 
             if self.context.trust_id:
                 # Sanity check
                 if not auth_ref.trust_scoped:
-                    LOG.error(_LE("trust token re-scoping failed!"))
+                    LOG.error("trust token re-scoping failed!")
                     raise exception.AuthorizationFailure()
                 # Sanity check that impersonation is effective
                 if self.context.trustor_user_id != auth_ref.user_id:
-                    LOG.error(_LE("Trust impersonation failed"))
+                    LOG.error("Trust impersonation failed")
                     raise exception.AuthorizationFailure()
 
         return client
+
+    def _create_trust_context(self, trustor_user_id, trustor_proj_id):
+        # We need the service admin user ID (not name), as the trustor user
+        # can't lookup the ID in keystoneclient unless they're admin
+        # workaround this by getting the user_id from admin_client
+        try:
+            trustee_user_id = self.context.trusts_auth_plugin.get_user_id(
+                self.session)
+        except ks_exception.Unauthorized:
+            LOG.error("Domain admin client authentication failed")
+            raise exception.AuthorizationFailure()
+
+        role_kw = {}
+        # inherit the roles of the trustor, unless set trusts_delegated_roles
+        if cfg.CONF.trusts_delegated_roles:
+            role_kw['role_names'] = cfg.CONF.trusts_delegated_roles
+        else:
+            token_info = self.context.auth_token_info
+            if token_info and token_info.get('token', {}).get('roles'):
+                role_kw['role_ids'] = [r['id'] for r in
+                                       token_info['token']['roles']]
+            else:
+                role_kw['role_names'] = self.context.roles
+        allow_redelegation = (cfg.CONF.reauthentication_auth_method == 'trusts'
+                              and cfg.CONF.allow_trusts_redelegation)
+        try:
+            trust = self.client.trusts.create(
+                trustor_user=trustor_user_id, trustee_user=trustee_user_id,
+                project=trustor_proj_id, impersonation=True,
+                allow_redelegation=allow_redelegation, **role_kw)
+        except ks_exception.NotFound:
+            LOG.debug("Failed to find roles %s for user %s",
+                      role_kw, trustor_user_id)
+            raise exception.MissingCredentialError(
+                required=_("roles %s") % role_kw)
+
+        context_data = self.context.to_dict()
+        context_data['overwrite'] = False
+        trust_context = context.RequestContext.from_dict(context_data)
+        trust_context.trust_id = trust.id
+        trust_context.trustor_user_id = trustor_user_id
+        return trust_context
 
     def create_trust_context(self):
         """Create a trust using the trustor identity in the current context.
@@ -188,58 +248,42 @@ class KsClientWrapper(object):
         if self.context.trust_id:
             return self.context
 
-        # We need the service admin user ID (not name), as the trustor user
-        # can't lookup the ID in keystoneclient unless they're admin
-        # workaround this by getting the user_id from admin_client
-        try:
-            trustee_user_id = self.context.trusts_auth_plugin.get_user_id(
-                self.session)
-        except ks_exception.Unauthorized:
-            LOG.error(_LE("Domain admin client authentication failed"))
-            raise exception.AuthorizationFailure()
-
         trustor_user_id = self.context.auth_plugin.get_user_id(self.session)
         trustor_proj_id = self.context.auth_plugin.get_project_id(self.session)
-
-        # inherit the roles of the trustor, unless set trusts_delegated_roles
-        if cfg.CONF.trusts_delegated_roles:
-            roles = cfg.CONF.trusts_delegated_roles
-        else:
-            roles = self.context.roles
-        try:
-            trust = self.client.trusts.create(trustor_user=trustor_user_id,
-                                              trustee_user=trustee_user_id,
-                                              project=trustor_proj_id,
-                                              impersonation=True,
-                                              role_names=roles)
-        except ks_exception.NotFound:
-            LOG.debug("Failed to find roles %s for user %s"
-                      % (roles, trustor_user_id))
-            raise exception.MissingCredentialError(
-                required=_("roles %s") % roles)
-
-        context_data = self.context.to_dict()
-        context_data['overwrite'] = False
-        trust_context = context.RequestContext.from_dict(context_data)
-        trust_context.trust_id = trust.id
-        trust_context.trustor_user_id = trustor_user_id
-        return trust_context
+        return self._create_trust_context(trustor_user_id, trustor_proj_id)
 
     def delete_trust(self, trust_id):
         """Delete the specified trust."""
         try:
             self.client.trusts.delete(trust_id)
-        except ks_exception.NotFound:
+        except (ks_exception.NotFound, ks_exception.Unauthorized):
             pass
 
-    def _get_username(self, username):
-        if(len(username) > 64):
-            LOG.warning(_LW("Truncating the username %s to the last 64 "
-                            "characters."), username)
-        # get the last 64 characters of the username
-        return username[-64:]
+    def regenerate_trust_context(self):
+        """Regenerate a trust using the trustor identity of current user_id.
 
-    def create_stack_user(self, username, password=''):
+        The trust is created with the trustee as the heat service user.
+
+        Returns a context containing the new trust_id.
+        """
+        old_trust_id = self.context.trust_id
+        trustor_user_id = self.context.auth_plugin.get_user_id(self.session)
+        trustor_proj_id = self.context.auth_plugin.get_project_id(self.session)
+        trust_context = self._create_trust_context(trustor_user_id,
+                                                   trustor_proj_id)
+
+        if old_trust_id:
+            self.delete_trust(old_trust_id)
+        return trust_context
+
+    def _get_username(self, username):
+        if len(username) > 255:
+            LOG.warning("Truncating the username %s to the last 255 "
+                        "characters.", username)
+        # get the last 255 characters of the username
+        return username[-255:]
+
+    def create_stack_user(self, username, password):
         """Create a user defined as part of a stack.
 
         The user is defined either via template or created internally by a
@@ -259,17 +303,17 @@ class KsClientWrapper(object):
             # Create the user
             user = self.client.users.create(
                 name=self._get_username(username), password=password,
-                default_project=self.context.tenant_id)
+                default_project=self.context.project_id)
             # Add user to heat_stack_user_role
-            LOG.debug("Adding user %(user)s to role %(role)s" % {
-                      'user': user.id, 'role': role_id})
+            LOG.debug("Adding user %(user)s to role %(role)s",
+                      {'user': user.id, 'role': role_id})
             self.client.roles.grant(role=role_id, user=user.id,
-                                    project=self.context.tenant_id)
+                                    project=self.context.project_id)
         else:
-            LOG.error(_LE("Failed to add user %(user)s to role %(role)s, "
-                          "check role exists!"), {
-                      'user': username,
-                      'role': cfg.CONF.heat_stack_user_role})
+            LOG.error("Failed to add user %(user)s to role %(role)s, "
+                      "check role exists!",
+                      {'user': username,
+                       'role': cfg.CONF.heat_stack_user_role})
             raise exception.Error(_("Can't find role %s")
                                   % cfg.CONF.heat_stack_user_role)
 
@@ -311,6 +355,17 @@ class KsClientWrapper(object):
             # FIXME(shardy): Legacy fallback for folks using old heat.conf
             # files which lack domain configuration
             return self.create_stack_user(username=username, password=password)
+        # We are creating automated user, for which most of security
+        # compliance restrictions possibly set in Keystone should not apply,
+        # https://docs.openstack.org/keystone/latest/admin/security-compliance.html
+        # TODO(pas-ha) find a way to deal with password_regex and
+        # disable_user_account_days_inactive
+        # TODO(pas-ha) think if we also need to add lock_password too
+        user_options = {
+            "ignore_change_password_upon_first_use": True,
+            "ignore_password_expiry": True,
+            "ignore_lockout_failure_attempts": True
+        }
         # We add the new user to a special keystone role
         # This role is designed to allow easier differentiation of the
         # heat-generated "stack users" which will generally have credentials
@@ -322,15 +377,16 @@ class KsClientWrapper(object):
             # Create user
             user = self.domain_admin_client.users.create(
                 name=self._get_username(username), password=password,
-                default_project=project_id, domain=self.stack_domain_id)
+                default_project=project_id, domain=self.stack_domain_id,
+                options=user_options)
             # Add to stack user role
-            LOG.debug("Adding user %(user)s to role %(role)s" % {
-                      'user': user.id, 'role': role_id})
+            LOG.debug("Adding user %(user)s to role %(role)s",
+                      {'user': user.id, 'role': role_id})
             self.domain_admin_client.roles.grant(role=role_id, user=user.id,
                                                  project=project_id)
         else:
-            LOG.error(_LE("Failed to add user %(user)s to role %(role)s, "
-                          "check role exists!"),
+            LOG.error("Failed to add user %(user)s to role %(role)s, "
+                      "check role exists!",
                       {'user': username,
                        'role': cfg.CONF.heat_stack_user_role})
             raise exception.Error(_("Can't find role %s")
@@ -344,7 +400,7 @@ class KsClientWrapper(object):
             try:
                 access = self.domain_admin_auth.get_access(self.session)
             except ks_exception.Unauthorized:
-                LOG.error(_LE("Keystone client authentication failed"))
+                LOG.error("Keystone client authentication failed")
                 raise exception.AuthorizationFailure()
 
             self._stack_domain_id = access.domain_id
@@ -383,10 +439,10 @@ class KsClientWrapper(object):
         if not self.stack_domain:
             # FIXME(shardy): Legacy fallback for folks using old heat.conf
             # files which lack domain configuration
-            return self.context.tenant_id
+            return self.context.project_id
         # Note we use the tenant ID not name to ensure uniqueness in a multi-
         # domain environment (where the tenant name may not be globally unique)
-        project_name = ('%s-%s' % (self.context.tenant_id, stack_id))[:64]
+        project_name = ('%s-%s' % (self.context.project_id, stack_id))[:64]
         desc = "Heat stack user project"
         domain_project = self.domain_admin_client.projects.create(
             name=project_name,
@@ -410,12 +466,12 @@ class KsClientWrapper(object):
         except ks_exception.NotFound:
             return
         except ks_exception.Forbidden:
-            LOG.warning(_LW('Unable to get details for project %s, '
-                            'not deleting'), project_id)
+            LOG.warning('Unable to get details for project %s, '
+                        'not deleting', project_id)
             return
 
         if project.domain_id != self.stack_domain_id:
-            LOG.warning(_LW('Not deleting non heat-domain project'))
+            LOG.warning('Not deleting non heat-domain project')
             return
 
         try:
@@ -470,11 +526,11 @@ class KsClientWrapper(object):
 
     def create_ec2_keypair(self, user_id=None):
         user_id = user_id or self.context.get_access(self.session).user_id
-        project_id = self.context.tenant_id
+        project_id = self.context.project_id
         data_blob = {'access': uuid.uuid4().hex,
-                     'secret': uuid.uuid4().hex}
+                     'secret': password_gen.generate_openstack_password()}
         ec2_creds = self.client.credentials.create(
-            user=user_id, type='ec2', data=jsonutils.dumps(data_blob),
+            user=user_id, type='ec2', blob=jsonutils.dumps(data_blob),
             project=project_id)
 
         # Return a AccessKey namedtuple for easier access to the blob contents
@@ -491,9 +547,9 @@ class KsClientWrapper(object):
             # files which lack domain configuration
             return self.create_ec2_keypair(user_id)
         data_blob = {'access': uuid.uuid4().hex,
-                     'secret': uuid.uuid4().hex}
+                     'secret': password_gen.generate_openstack_password()}
         creds = self.domain_admin_client.credentials.create(
-            user=user_id, type='ec2', data=jsonutils.dumps(data_blob),
+            user=user_id, type='ec2', blob=jsonutils.dumps(data_blob),
             project=project_id)
         return AccessKey(id=creds.id,
                          access=data_blob['access'],
@@ -533,19 +589,28 @@ class KsClientWrapper(object):
         self._check_stack_domain_user(user_id, project_id, 'enable')
         self.domain_admin_client.users.update(user=user_id, enabled=True)
 
-    def url_for(self, **kwargs):
-        default_region_name = (self.context.region_name or
-                               cfg.CONF.region_name_for_services)
-        kwargs.setdefault('region_name', default_region_name)
-        return self.context.auth_plugin.get_endpoint(self.session, **kwargs)
-
-    @property
-    def auth_token(self):
-        return self.context.auth_plugin.get_token(self.session)
-
-    @property
-    def auth_ref(self):
-        return self.context.auth_plugin.get_access(self.session)
+    def server_keystone_endpoint_url(self, fallback_endpoint):
+        ks_endpoint_type = cfg.CONF.server_keystone_endpoint_type
+        if ((ks_endpoint_type == 'public') or (
+            ks_endpoint_type == 'internal') or
+                (ks_endpoint_type == 'admin')):
+            if (hasattr(self.context, 'auth_plugin') and
+                    hasattr(self.context.auth_plugin, 'get_access')):
+                try:
+                    auth_ref = self.context.auth_plugin.get_access(
+                        self.session)
+                    if hasattr(auth_ref, "service_catalog"):
+                        keystone_urls = auth_ref.service_catalog.get_urls(
+                            service_type='identity',
+                            interface=ks_endpoint_type)
+                        if keystone_urls:
+                            keystone_url = keystone_urls[0].rstrip('/')
+                            if not keystone_url.endswith('/v3'):
+                                keystone_url += "/v3"
+                            return keystone_url
+                except ks_exception.Unauthorized:
+                    LOG.error("Keystone client authentication failed")
+        return fallback_endpoint
 
 
 class KeystoneClient(object):
@@ -555,9 +620,9 @@ class KeystoneClient(object):
     needs to be initialized.
     """
 
-    def __new__(cls, context):
+    def __new__(cls, context, region_name=None):
         if cfg.CONF.keystone_backend == _default_keystone_backend:
-            return KsClientWrapper(context)
+            return KsClientWrapper(context, region_name)
         else:
             return importutils.import_object(
                 cfg.CONF.keystone_backend,

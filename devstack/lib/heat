@@ -5,7 +5,7 @@
 
 # To enable, add the following to localrc
 #
-#   ENABLED_SERVICES+=,heat,h-api,h-api-cfn,h-api-cw,h-eng
+#   ENABLED_SERVICES+=,heat,h-api,h-api-cfn,h-eng
 
 # Dependencies:
 # (none)
@@ -16,7 +16,6 @@
 # - install_heat
 # - configure_heatclient
 # - configure_heat
-# - _config_heat_apache_wsgi
 # - init_heat
 # - start_heat
 # - stop_heat
@@ -32,45 +31,20 @@ set +o xtrace
 # set up default directories
 GITDIR["python-heatclient"]=$DEST/python-heatclient
 
-# heat service
-HEAT_REPO=${HEAT_REPO:-${GIT_BASE}/openstack/heat.git}
-HEAT_BRANCH=${HEAT_BRANCH:-master}
-
 # python heat client library
 GITREPO["python-heatclient"]=${HEATCLIENT_REPO:-${GIT_BASE}/openstack/python-heatclient.git}
 GITBRANCH["python-heatclient"]=${HEATCLIENT_BRANCH:-master}
 
-# heat-cfntools server agent
-HEAT_CFNTOOLS_REPO=${HEAT_CFNTOOLS_REPO:-${GIT_BASE}/openstack/heat-cfntools.git}
-HEAT_CFNTOOLS_BRANCH=${HEAT_CFNTOOLS_BRANCH:-master}
-
-# heat example templates and elements
-HEAT_TEMPLATES_REPO=${HEAT_TEMPLATES_REPO:-${GIT_BASE}/openstack/heat-templates.git}
-HEAT_TEMPLATES_BRANCH=${HEAT_TEMPLATES_BRANCH:-master}
-
-# Toggle for deploying Heat-API under HTTPD + mod_wsgi
-HEAT_USE_MOD_WSGI=${HEAT_USE_MOD_WSGI:-False}
-
 HEAT_DIR=$DEST/heat
-HEAT_CFNTOOLS_DIR=$DEST/heat-cfntools
-HEAT_TEMPLATES_REPO_DIR=$DEST/heat-templates
-OCC_DIR=$DEST/os-collect-config
-DIB_UTILS_DIR=$DEST/dib-utils
-ORC_DIR=$DEST/os-refresh-config
-OAC_DIR=$DEST/os-apply-config
 
-HEAT_PIP_REPO=$DATA_DIR/heat-pip-repo
-HEAT_PIP_REPO_PORT=${HEAT_PIP_REPO_PORT:-8899}
-
-HEAT_AUTH_CACHE_DIR=${HEAT_AUTH_CACHE_DIR:-/var/cache/heat}
 HEAT_STANDALONE=$(trueorfalse False HEAT_STANDALONE)
 HEAT_ENABLE_ADOPT_ABANDON=$(trueorfalse False HEAT_ENABLE_ADOPT_ABANDON)
 HEAT_CONF_DIR=/etc/heat
 HEAT_CONF=$HEAT_CONF_DIR/heat.conf
 HEAT_ENV_DIR=$HEAT_CONF_DIR/environment.d
 HEAT_TEMPLATES_DIR=$HEAT_CONF_DIR/templates
-HEAT_API_HOST=${HEAT_API_HOST:-$HOST_IP}
-HEAT_API_PORT=${HEAT_API_PORT:-8004}
+HEAT_API_HOST=${HEAT_API_HOST:-$SERVICE_HOST}
+HEAT_API_CFN_HOST=${HEAT_API_CFN_HOST:-$SERVICE_HOST}
 HEAT_SERVICE_USER=${HEAT_SERVICE_USER:-heat}
 HEAT_TRUSTEE_USER=${HEAT_TRUSTEE_USER:-$HEAT_SERVICE_USER}
 HEAT_TRUSTEE_PASSWORD=${HEAT_TRUSTEE_PASSWORD:-$SERVICE_PASSWORD}
@@ -78,9 +52,19 @@ HEAT_TRUSTEE_DOMAIN=${HEAT_TRUSTEE_DOMAIN:-default}
 
 # Support entry points installation of console scripts
 HEAT_BIN_DIR=$(get_python_exec_prefix)
+HEAT_API_UWSGI_CONF=$HEAT_CONF_DIR/heat-api-uwsgi.ini
+HEAT_CFN_API_UWSGI_CONF=$HEAT_CONF_DIR/heat-api-cfn-uwsgi.ini
+HEAT_API_UWSGI=heat.wsgi.api:application
+HEAT_CFN_API_UWSGI=heat.wsgi.cfn:application
+
+# Flag to set the oslo_policy.enforce_scope and oslo_policy.enforce_new_defaults.
+# This is used to disable the compute API policies scope and new defaults.
+# By Default, it is True.
+# For more detail: https://docs.openstack.org/oslo.policy/latest/configuration/index.html#oslo_policy.enforce_scope
+HEAT_ENFORCE_SCOPE=$(trueorfalse True HEAT_ENFORCE_SCOPE)
 
 # other default options
-if [[ "$HEAT_STANDALONE" = "True" ]]; then
+if [[ "$HEAT_STANDALONE" == "True" ]]; then
     # for standalone, use defaults which require no service user
     HEAT_STACK_DOMAIN=$(trueorfalse False HEAT_STACK_DOMAIN)
     HEAT_DEFERRED_AUTH=${HEAT_DEFERRED_AUTH:-password}
@@ -96,6 +80,7 @@ else
 fi
 HEAT_PLUGIN_DIR=${HEAT_PLUGIN_DIR:-$DATA_DIR/heat/plugins}
 ENABLE_HEAT_PLUGINS=${ENABLE_HEAT_PLUGINS:-}
+HEAT_ENGINE_WORKERS=${HEAT_ENGINE_WORKERS:=$(( ($(nproc)/4)<2 ? 2 : ($(nproc)/4) ))}
 
 # Functions
 # ---------
@@ -110,7 +95,8 @@ function is_heat_enabled {
 # cleanup_heat() - Remove residual data files, anything left over from previous
 # runs that a clean run would need to clean up
 function cleanup_heat {
-    sudo rm -rf $HEAT_AUTH_CACHE_DIR
+    remove_uwsgi_config "$HEAT_API_UWSGI_CONF" "$HEAT_API_UWSGI"
+    remove_uwsgi_config "$HEAT_CFN_API_UWSGI_CONF" "$HEAT_CFN_API_UWSGI"
     sudo rm -rf $HEAT_ENV_DIR
     sudo rm -rf $HEAT_TEMPLATES_DIR
     sudo rm -rf $HEAT_CONF_DIR
@@ -123,49 +109,48 @@ function configure_heat {
     # remove old config files
     rm -f $HEAT_CONF_DIR/heat-*.conf
 
-    HEAT_API_CFN_HOST=${HEAT_API_CFN_HOST:-$HOST_IP}
-    HEAT_API_CFN_PORT=${HEAT_API_CFN_PORT:-8000}
-    HEAT_ENGINE_HOST=${HEAT_ENGINE_HOST:-$SERVICE_HOST}
-    HEAT_ENGINE_PORT=${HEAT_ENGINE_PORT:-8001}
-    HEAT_API_CW_HOST=${HEAT_API_CW_HOST:-$HOST_IP}
-    HEAT_API_CW_PORT=${HEAT_API_CW_PORT:-8003}
     HEAT_API_PASTE_FILE=$HEAT_CONF_DIR/api-paste.ini
-    HEAT_POLICY_FILE=$HEAT_CONF_DIR/policy.json
 
     cp $HEAT_DIR/etc/heat/api-paste.ini $HEAT_API_PASTE_FILE
-    cp $HEAT_DIR/etc/heat/policy.json $HEAT_POLICY_FILE
 
     # common options
     iniset_rpc_backend heat $HEAT_CONF
-    iniset $HEAT_CONF DEFAULT heat_metadata_server_url http://$HEAT_API_CFN_HOST:$HEAT_API_CFN_PORT
-    iniset $HEAT_CONF DEFAULT heat_waitcondition_server_url http://$HEAT_API_CFN_HOST:$HEAT_API_CFN_PORT/v1/waitcondition
-    iniset $HEAT_CONF DEFAULT heat_watch_server_url http://$HEAT_API_CW_HOST:$HEAT_API_CW_PORT
+    iniset $HEAT_CONF DEFAULT heat_metadata_server_url http://$HEAT_API_CFN_HOST/heat-api-cfn
+    iniset $HEAT_CONF DEFAULT heat_waitcondition_server_url http://$HEAT_API_CFN_HOST/heat-api-cfn/v1/waitcondition
+
     iniset $HEAT_CONF database connection `database_connection_url heat`
-    iniset $HEAT_CONF DEFAULT auth_encryption_key $(generate_hex_string 16)
+    # we are using a hardcoded auth_encryption_key as it has to be the same for
+    # multinode deployment.
+    iniset $HEAT_CONF DEFAULT auth_encryption_key "767c3ed056cbaa3b9dfedb8c6f825bf0"
 
     iniset $HEAT_CONF DEFAULT region_name_for_services "$REGION_NAME"
 
     # logging
     iniset $HEAT_CONF DEFAULT debug $ENABLE_DEBUG_LOG_LEVEL
-    iniset $HEAT_CONF DEFAULT use_syslog $SYSLOG
-    if [ "$LOG_COLOR" == "True" ] && [ "$SYSLOG" == "False" ] && [ "$HEAT_USE_MOD_WSGI" == "False" ]  ; then
-        # Add color to logging output
-        setup_colorized_logging $HEAT_CONF DEFAULT tenant user
-    fi
 
-    if [ ! -z "$HEAT_DEFERRED_AUTH" ]; then
+    # reduce Heat engine workers
+    iniset $HEAT_CONF DEFAULT num_engine_workers "$HEAT_ENGINE_WORKERS"
+
+    # Format logging
+    setup_logging $HEAT_CONF
+
+    if [[ ! -z "$HEAT_DEFERRED_AUTH" ]]; then
         iniset $HEAT_CONF DEFAULT deferred_auth_method $HEAT_DEFERRED_AUTH
     fi
 
-    if [ "$HEAT_USE_MOD_WSGI" == "True" ]; then
-        _config_heat_apache_wsgi
-    fi
+    write_uwsgi_config "$HEAT_API_UWSGI_CONF" "$HEAT_API_UWSGI" "/heat-api" "" "heat-api"
+    # configure threads for h-api to avoid IO wait and messaging timeout. We use
+    # 'nproc/4' to calculate API workers, hence, 4 would be probably correct
+    # approximation.
+    iniset "$HEAT_API_UWSGI_CONF" uwsgi threads 4
+    write_uwsgi_config "$HEAT_CFN_API_UWSGI_CONF" "$HEAT_CFN_API_UWSGI" "/heat-api-cfn" "" "heat-api-cfn"
 
     if [[ "$HEAT_STANDALONE" = "True" ]]; then
         iniset $HEAT_CONF paste_deploy flavor standalone
-        iniset $HEAT_CONF clients_heat url "http://$HEAT_API_HOST:$HEAT_API_PORT/v1/%(tenant_id)s"
+        iniset $HEAT_CONF clients_heat url "$SERVICE_PROTOCOL://$HEAT_API_HOST/heat-api/v1/%(tenant_id)s"
     else
-        configure_auth_token_middleware $HEAT_CONF heat $HEAT_AUTH_CACHE_DIR
+        configure_keystone_authtoken_middleware $HEAT_CONF heat
+        configure_keystone_authtoken_middleware $HEAT_CONF heat ec2authtoken
     fi
 
     # If HEAT_DEFERRED_AUTH is unset or explicitly set to trusts, configure
@@ -181,26 +166,13 @@ function configure_heat {
     # clients_keystone
     iniset $HEAT_CONF clients_keystone auth_uri $KEYSTONE_AUTH_URI
 
-    # OpenStack API
-    iniset $HEAT_CONF heat_api bind_port $HEAT_API_PORT
-    iniset $HEAT_CONF heat_api workers "$API_WORKERS"
-
-    # Cloudformation API
-    iniset $HEAT_CONF heat_api_cfn bind_port $HEAT_API_CFN_PORT
-
-    # Cloudwatch API
-    iniset $HEAT_CONF heat_api_cloudwatch bind_port $HEAT_API_CW_PORT
-
-    if is_ssl_enabled_service "key" || is_service_enabled tls-proxy; then
+    if is_service_enabled tls-proxy; then
         iniset $HEAT_CONF clients_keystone ca_file $SSL_BUNDLE_FILE
-    fi
-
-    if is_ssl_enabled_service "nova" || is_service_enabled tls-proxy; then
         iniset $HEAT_CONF clients_nova ca_file $SSL_BUNDLE_FILE
-    fi
-
-    if is_ssl_enabled_service "cinder" || is_service_enabled tls-proxy; then
         iniset $HEAT_CONF clients_cinder ca_file $SSL_BUNDLE_FILE
+        iniset $HEAT_CONF clients_neutron ca_file $SSL_BUNDLE_FILE
+        iniset $HEAT_CONF clients_glance ca_file $SSL_BUNDLE_FILE
+        iniset $HEAT_CONF clients_swift ca_file $SSL_BUNDLE_FILE
     fi
 
     if [[ "$HEAT_ENABLE_ADOPT_ABANDON" = "True" ]]; then
@@ -213,6 +185,14 @@ function configure_heat {
 
     if ! is_service_enabled c-bak; then
         iniset $HEAT_CONF volumes backups_enabled false
+    fi
+
+    if [[ "$HEAT_ENFORCE_SCOPE" == True || "$ENFORCE_SCOPE" == True ]] ; then
+        iniset $HEAT_CONF oslo_policy enforce_scope true
+        iniset $HEAT_CONF oslo_policy enforce_new_defaults true
+    else
+        iniset $HEAT_CONF oslo_policy enforce_scope false
+        iniset $HEAT_CONF oslo_policy enforce_new_defaults false
     fi
 
     sudo install -d -o $STACK_USER $HEAT_ENV_DIR $HEAT_TEMPLATES_DIR
@@ -234,7 +214,7 @@ function configure_heat {
     # while still allowing the plugins to be edited in-tree.
     local err_count=0
 
-    if [ -n "$ENABLE_HEAT_PLUGINS" ]; then
+    if [[ -n "$ENABLE_HEAT_PLUGINS" ]]; then
         mkdir -p $HEAT_PLUGIN_DIR
         # Clean up cruft from any previous runs
         rm -f $HEAT_PLUGIN_DIR/*
@@ -242,7 +222,7 @@ function configure_heat {
     fi
 
     for heat_plugin in $ENABLE_HEAT_PLUGINS; do
-        if [ -d $HEAT_DIR/contrib/$heat_plugin ]; then
+        if [[ -d $HEAT_DIR/contrib/$heat_plugin ]]; then
             setup_package $HEAT_DIR/contrib/$heat_plugin -e
             ln -s $HEAT_DIR/contrib/$heat_plugin/$heat_plugin/resources $HEAT_PLUGIN_DIR/$heat_plugin
         else
@@ -254,26 +234,16 @@ function configure_heat {
     [ $err_count -eq 0 ] || die $LINENO "$err_count of the requested Heat plugins could not be installed."
 }
 
-# dummy function called by stack.sh, remove it once moved to plugin
-function init_heat {
-    :
-}
-
 # init_heat() - Initialize database
-function init_heat_with_plugin {
-
-    # (re)create heat database
-    recreate_database heat
-
-    $HEAT_BIN_DIR/heat-manage db_sync
-    create_heat_cache_dir
+function init_heat {
+    # recreate db only if one of the db services is enabled
+    if is_service_enabled $DATABASE_BACKENDS; then
+        # (re)create heat database
+        recreate_database heat
+        $HEAT_BIN_DIR/heat-manage db_sync
+    fi
 }
 
-# create_heat_cache_dir() - Part of the init_heat() process
-function create_heat_cache_dir {
-    # Create cache dirs
-    sudo install -d -o $STACK_USER $HEAT_AUTH_CACHE_DIR
-}
 
 # install_heatclient() - Collect source and prepare
 function install_heatclient {
@@ -286,156 +256,45 @@ function install_heatclient {
 
 # install_heat() - Collect source and prepare
 function install_heat {
-    git_clone $HEAT_REPO $HEAT_DIR $HEAT_BRANCH
     setup_develop $HEAT_DIR
-    if [ "$HEAT_USE_MOD_WSGI" == "True" ]; then
-        install_apache_wsgi
+    if [[ "$GLOBAL_VENV" == "True" ]] ; then
+        # TODO(tkajinam): find a better solution for this
+        sudo ln -sf $HEAT_BIN_DIR/heat-manage /usr/local/bin
     fi
-}
-
-# install_heat_other() - Collect source and prepare
-function install_heat_other {
-    git_clone $HEAT_CFNTOOLS_REPO $HEAT_CFNTOOLS_DIR $HEAT_CFNTOOLS_BRANCH
-    git_clone $HEAT_TEMPLATES_REPO $HEAT_TEMPLATES_REPO_DIR $HEAT_TEMPLATES_BRANCH
-    git_clone $OAC_REPO $OAC_DIR $OAC_BRANCH
-    git_clone $OCC_REPO $OCC_DIR $OCC_BRANCH
-    git_clone $ORC_REPO $ORC_DIR $ORC_BRANCH
-    git_clone $DIB_UTILS_REPO $DIB_UTILS_DIR $DIB_UTILS_BRANCH
-}
-
-# dummy function called by stack.sh, remove it once moved to plugin
-function start_heat {
-    :
 }
 
 # start_heat() - Start running processes, including screen
-function start_heat_with_plugin {
+function start_heat {
     run_process h-eng "$HEAT_BIN_DIR/heat-engine --config-file=$HEAT_CONF"
 
     # If the site is not enabled then we are in a grenade scenario
-    local enabled_site_file
-    enabled_site_file=$(apache_site_config_for heat-api)
-    if [ -f ${enabled_site_file} ] && [ "$HEAT_USE_MOD_WSGI" == "True" ]; then
-        enable_apache_site heat-api
-        enable_apache_site heat-api-cfn
-        enable_apache_site heat-api-cloudwatch
-        restart_apache_server
-        tail_log heat-api /var/log/$APACHE_NAME/heat-api.log
-        tail_log heat-api-cfn /var/log/$APACHE_NAME/heat-api-cfn.log
-        tail_log heat-api-cloudwatch /var/log/$APACHE_NAME/heat-api-cloudwatch.log
-    else
-        run_process h-api "$HEAT_BIN_DIR/heat-api --config-file=$HEAT_CONF"
-        run_process h-api-cfn "$HEAT_BIN_DIR/heat-api-cfn --config-file=$HEAT_CONF"
-        run_process h-api-cw "$HEAT_BIN_DIR/heat-api-cloudwatch --config-file=$HEAT_CONF"
-    fi
+    run_process h-api "$(which uwsgi) --ini $HEAT_API_UWSGI_CONF" ""
+    run_process h-api-cfn "$(which uwsgi) --ini $HEAT_CFN_API_UWSGI_CONF" ""
 }
 
 # stop_heat() - Stop running processes
 function stop_heat {
     # Kill the screen windows
+    stop_process h-api
+    stop_process h-api-cfn
     stop_process h-eng
-
-    if [ "$HEAT_USE_MOD_WSGI" == "True" ]; then
-        disable_apache_site heat-api
-        disable_apache_site heat-api-cfn
-        disable_apache_site heat-api-cloudwatch
-        restart_apache_server
-    else
-        local serv
-        for serv in h-api h-api-cfn h-api-cw; do
-            stop_process $serv
-        done
-    fi
-
-}
-
-# _cleanup_heat_apache_wsgi() - Remove wsgi files, disable and remove apache vhost file
-function _cleanup_heat_apache_wsgi {
-    sudo rm -f $(apache_site_config_for heat-api)
-    sudo rm -f $(apache_site_config_for heat-api-cfn)
-    sudo rm -f $(apache_site_config_for heat-api-cloudwatch)
-}
-
-# _config_heat_apache_wsgi() - Set WSGI config files of Heat
-function _config_heat_apache_wsgi {
-
-    local heat_apache_conf
-    heat_apache_conf=$(apache_site_config_for heat-api)
-    local heat_cfn_apache_conf
-    heat_cfn_apache_conf=$(apache_site_config_for heat-api-cfn)
-    local heat_cloudwatch_apache_conf
-    heat_cloudwatch_apache_conf=$(apache_site_config_for heat-api-cloudwatch)
-    local heat_ssl=""
-    local heat_certfile=""
-    local heat_keyfile=""
-    local heat_api_port=$HEAT_API_PORT
-    local heat_cfn_api_port=$HEAT_API_CFN_PORT
-    local heat_cw_api_port=$HEAT_API_CW_PORT
-    local venv_path=""
-
-    sudo cp $FILES/apache-heat-api.template $heat_apache_conf
-    sudo sed -e "
-        s|%PUBLICPORT%|$heat_api_port|g;
-        s|%APACHE_NAME%|$APACHE_NAME|g;
-        s|%HEAT_BIN_DIR%|$HEAT_BIN_DIR|g;
-        s|%SSLENGINE%|$heat_ssl|g;
-        s|%SSLCERTFILE%|$heat_certfile|g;
-        s|%SSLKEYFILE%|$heat_keyfile|g;
-        s|%USER%|$STACK_USER|g;
-        s|%VIRTUALENV%|$venv_path|g
-    " -i $heat_apache_conf
-
-    sudo cp $FILES/apache-heat-api-cfn.template $heat_cfn_apache_conf
-    sudo sed -e "
-        s|%PUBLICPORT%|$heat_cfn_api_port|g;
-        s|%APACHE_NAME%|$APACHE_NAME|g;
-        s|%HEAT_BIN_DIR%|$HEAT_BIN_DIR|g;
-        s|%SSLENGINE%|$heat_ssl|g;
-        s|%SSLCERTFILE%|$heat_certfile|g;
-        s|%SSLKEYFILE%|$heat_keyfile|g;
-        s|%USER%|$STACK_USER|g;
-        s|%VIRTUALENV%|$venv_path|g
-    " -i $heat_cfn_apache_conf
-
-    sudo cp $FILES/apache-heat-api-cloudwatch.template $heat_cloudwatch_apache_conf
-    sudo sed -e "
-        s|%PUBLICPORT%|$heat_cw_api_port|g;
-        s|%APACHE_NAME%|$APACHE_NAME|g;
-        s|%HEAT_BIN_DIR%|$HEAT_BIN_DIR|g;
-        s|%SSLENGINE%|$heat_ssl|g;
-        s|%SSLCERTFILE%|$heat_certfile|g;
-        s|%SSLKEYFILE%|$heat_keyfile|g;
-        s|%USER%|$STACK_USER|g;
-        s|%VIRTUALENV%|$venv_path|g
-    " -i $heat_cloudwatch_apache_conf
-}
-
-
-# dummy function called by stack.sh, remove it once moved to plugin
-function create_heat_accounts {
-    :
 }
 
 # create_heat_accounts() - Set up common required heat accounts
-function create_heat_accounts_with_plugin {
+function create_heat_accounts {
     if [[ "$HEAT_STANDALONE" != "True" ]]; then
-
         create_service_user "heat" "admin"
         get_or_create_service "heat" "orchestration" "Heat Orchestration Service"
         get_or_create_endpoint \
             "orchestration" \
             "$REGION_NAME" \
-            "$SERVICE_PROTOCOL://$HEAT_API_HOST:$HEAT_API_PORT/v1/\$(project_id)s" \
-            "$SERVICE_PROTOCOL://$HEAT_API_HOST:$HEAT_API_PORT/v1/\$(project_id)s" \
-            "$SERVICE_PROTOCOL://$HEAT_API_HOST:$HEAT_API_PORT/v1/\$(project_id)s"
+            "$SERVICE_PROTOCOL://$HEAT_API_HOST/heat-api/v1/\$(project_id)s"
 
         get_or_create_service "heat-cfn" "cloudformation" "Heat CloudFormation Service"
         get_or_create_endpoint \
             "cloudformation"  \
             "$REGION_NAME" \
-            "$SERVICE_PROTOCOL://$HEAT_API_CFN_HOST:$HEAT_API_CFN_PORT/v1" \
-            "$SERVICE_PROTOCOL://$HEAT_API_CFN_HOST:$HEAT_API_CFN_PORT/v1" \
-            "$SERVICE_PROTOCOL://$HEAT_API_CFN_HOST:$HEAT_API_CFN_PORT/v1"
+            "$SERVICE_PROTOCOL://$HEAT_API_CFN_HOST/heat-api-cfn/v1"
 
         # heat_stack_user role is for users created by Heat
         get_or_create_role "heat_stack_user"
@@ -452,52 +311,76 @@ function create_heat_accounts_with_plugin {
     fi
 }
 
-# build_heat_pip_mirror() - Build a pip mirror containing heat agent projects
-function build_heat_pip_mirror {
-    local project_dirs="$OCC_DIR $OAC_DIR $ORC_DIR $HEAT_CFNTOOLS_DIR $DIB_UTILS_DIR"
-    local projpath proj package
+# configure_tempest_for_heat()
+# NOTE (gmann): Configure all the Tempest setting for Heat service in
+# this function.
+function configure_tempest_for_heat {
+    # Skip SoftwareConfigIntegrationTest because it requires a custom image
+    SKIP_SCENARIO_TEST_LIST='SoftwareConfigIntegrationTest'
+    SKIP_SCENARIO_TEST_LIST+=',AodhAlarmTest'
+    # Skip CfnInitIntegrationTest as latest fedora images don't have heat-cfntools
+    SKIP_SCENARIO_TEST_LIST+=',CfnInitIntegrationTest'
+    iniset $TEMPEST_CONFIG heat_plugin skip_scenario_test_list $SKIP_SCENARIO_TEST_LIST
 
-    rm -rf $HEAT_PIP_REPO
-    mkdir -p $HEAT_PIP_REPO
+    SKIP_FUNCTIONAL_TEST_LIST='NotificationTest'
+    iniset $TEMPEST_CONFIG heat_plugin skip_functional_test_list $SKIP_FUNCTIONAL_TEST_LIST
 
-    echo "<html><body>" > $HEAT_PIP_REPO/index.html
-    for projpath in $project_dirs; do
-        proj=$(basename $projpath)
-        mkdir -p $HEAT_PIP_REPO/$proj
-        pushd $projpath
-        rm -rf dist
-        python setup.py sdist
-        pushd dist
-        package=$(ls *)
-        mv $package $HEAT_PIP_REPO/$proj/$package
-        popd
+    openstack flavor show m1.heat_int || openstack flavor create m1.heat_int --ram 1024 --vcpus 2 --disk 10
+    openstack flavor show m1.heat_micro || openstack flavor create m1.heat_micro --ram 128 --disk 1
 
-        echo "<html><body><a href=\"$package\">$package</a></body></html>" > $HEAT_PIP_REPO/$proj/index.html
-        echo "<a href=\"$proj\">$proj</a><br/>" >> $HEAT_PIP_REPO/index.html
+    export OS_CLOUD=devstack
+    openstack network show heat-net || openstack network create heat-net
+    openstack subnet show heat-subnet || openstack subnet create heat-subnet --network heat-net --subnet-range 10.0.5.0/24
+    openstack router add subnet router1 heat-subnet
 
-        popd
-    done
+    # NOTE(ianw) OpenDev infra only keeps the latest two Fedora's
+    # around; prefer the mirror but allow fallback
+    if [[ -e /etc/ci/mirror_info.sh ]]; then
+        source /etc/ci/mirror_info.sh
+    fi
+    HEAT_TEST_FEDORA_IMAGE_UPSTREAM=https://download.fedoraproject.org/pub/fedora/linux
+    HEAT_TEST_FEDORA_IMAGE_UPSTREAM_ARCHIVE=https://download.fedoraproject.org/pub/archive/fedora/linux/
+    HEAT_TEST_FEDORA_IMAGE_PATH=releases/37/Cloud/x86_64/images/Fedora-Cloud-Base-37-1.7.x86_64.qcow2
+    if curl --location --output /dev/null --silent --head --fail "${NODEPOOL_FEDORA_MIRROR}/${HEAT_TEST_FEDORA_IMAGE_PATH}"; then
+        export HEAT_TEST_FEDORA_IMAGE="${NODEPOOL_FEDORA_MIRROR}/${HEAT_TEST_FEDORA_IMAGE_PATH}"
+    elif curl --location --output /dev/null --silent --head --fail "${HEAT_TEST_FEDORA_IMAGE_UPSTREAM}/${HEAT_TEST_FEDORA_IMAGE_PATH}"; then
+        export HEAT_TEST_FEDORA_IMAGE="${HEAT_TEST_FEDORA_IMAGE_UPSTREAM}/${HEAT_TEST_FEDORA_IMAGE_PATH}"
+    else
+        export HEAT_TEST_FEDORA_IMAGE="${HEAT_TEST_FEDORA_IMAGE_UPSTREAM_ARCHIVE}/${HEAT_TEST_FEDORA_IMAGE_PATH}"
+    fi
+    TOKEN=$(openstack token issue -c id -f value)
+    local image_exists=$( openstack image list | grep "Fedora-Cloud-Base-37-1.7.x86_64" )
+    if [[ -z $image_exists ]]; then
+        if is_service_enabled g-api; then
+            upload_image $HEAT_TEST_FEDORA_IMAGE $TOKEN
+        fi
+    fi
 
-    echo "</body></html>" >> $HEAT_PIP_REPO/index.html
+    if is_service_enabled tls-proxy; then
+        iniset $TEMPEST_CONFIG heat_plugin ca_file $SSL_BUNDLE_FILE
+    fi
+    # add application credential and secret to support test multi-cloud
+    app_cred_id=$(openstack application credential show  heat_multicloud || openstack application credential create heat_multicloud \
+        --secret secret --unrestricted -c id -f value)
+    export OS_CREDENTIAL_SECRET_ID=$(openstack secret store -n heat-multi-cloud-test-cred --payload \
+        '{"auth_type": "v3applicationcredential", "auth": {"auth_url": $OS_AUTH_URL, "application_credential_id": $app_cred_id, "application_credential_secret": "secret"}}'\
+        -c "Secret href" -f value)
+    source $TOP_DIR/openrc demo demo
+    iniset $TEMPEST_CONFIG heat_plugin username $OS_USERNAME
+    iniset $TEMPEST_CONFIG heat_plugin password $OS_PASSWORD
+    iniset $TEMPEST_CONFIG heat_plugin project_name $OS_PROJECT_NAME
+    iniset $TEMPEST_CONFIG heat_plugin auth_url $OS_AUTH_URL
+    iniset $TEMPEST_CONFIG heat_plugin user_domain_id $OS_USER_DOMAIN_ID
+    iniset $TEMPEST_CONFIG heat_plugin project_domain_id $OS_PROJECT_DOMAIN_ID
+    iniset $TEMPEST_CONFIG heat_plugin user_domain_name $OS_USER_DOMAIN_NAME
+    iniset $TEMPEST_CONFIG heat_plugin project_domain_name $OS_PROJECT_DOMAIN_NAME
+    iniset $TEMPEST_CONFIG heat_plugin region $OS_REGION_NAME
 
-    local heat_pip_repo_apache_conf
-    heat_pip_repo_apache_conf=$(apache_site_config_for heat_pip_repo)
-
-    sudo cp $FILES/apache-heat-pip-repo.template $heat_pip_repo_apache_conf
-    sudo sed -e "
-        s|%HEAT_PIP_REPO%|$HEAT_PIP_REPO|g;
-        s|%HEAT_PIP_REPO_PORT%|$HEAT_PIP_REPO_PORT|g;
-        s|%APACHE_NAME%|$APACHE_NAME|g;
-    " -i $heat_pip_repo_apache_conf
-    enable_apache_site heat_pip_repo
-    restart_apache_server
-    sudo iptables -I INPUT -d $HOST_IP -p tcp --dport $HEAT_PIP_REPO_PORT -j ACCEPT || true
+    source $TOP_DIR/openrc admin admin
+    iniset $TEMPEST_CONFIG heat_plugin admin_username $OS_USERNAME
+    iniset $TEMPEST_CONFIG heat_plugin admin_password $OS_PASSWORD
+    export OS_CLOUD=devstack-admin
 }
 
 # Restore xtrace
 $_XTRACE_HEAT
-
-# Tell emacs to use shell-script-mode
-## Local variables:
-## mode: shell-script
-## End:

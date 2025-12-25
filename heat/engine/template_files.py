@@ -12,10 +12,10 @@
 #    under the License.
 
 import collections
-import six
 import weakref
 
 from heat.common import context
+from heat.common import exception
 from heat.common.i18n import _
 from heat.db import api as db_api
 from heat.objects import raw_template_files
@@ -28,7 +28,7 @@ class ReadOnlyDict(dict):
         raise ValueError("Attempted to write to internal TemplateFiles cache")
 
 
-class TemplateFiles(collections.Mapping):
+class TemplateFiles(collections.abc.Mapping):
 
     def __init__(self, files):
         self.files = None
@@ -39,7 +39,7 @@ class TemplateFiles(collections.Mapping):
             self.files_id = files.files_id
             self.files = files.files
             return
-        if isinstance(files, six.integer_types):
+        if isinstance(files, int):
             self.files_id = files
             if self.files_id in _d:
                 self.files = _d[self.files_id]
@@ -49,7 +49,7 @@ class TemplateFiles(collections.Mapping):
                                '(value is %(val)s)') %
                              {'cname': files.__class__,
                               'val': str(files)})
-        # the dict has not been persisted as a raw_template_files db obj
+        # the dict has not been persisted as a raw_template_files DB obj
         # yet, so no self.files_id
         self.files = ReadOnlyDict(files)
 
@@ -76,12 +76,12 @@ class TemplateFiles(collections.Mapping):
 
     def __iter__(self):
         self._refresh_if_needed()
-        if self.files_id is None:
+        if self.files is None:
             return iter(ReadOnlyDict({}))
         return iter(self.files)
 
     def _refresh_if_needed(self):
-        # retrieve files from db if needed
+        # retrieve files from DB if needed
         if self.files_id is None:
             return
         if self.files_id in _d:
@@ -111,13 +111,13 @@ class TemplateFiles(collections.Mapping):
 
     def update(self, files):
         # Sets up the next call to store() to create a new
-        # raw_template_files db obj. It seems like we *could* just
+        # raw_template_files DB obj. It seems like we *could* just
         # update the existing raw_template_files obj, but the problem
         # with that is other heat-engine processes' _d dictionaries
         # would have stale data for a given raw_template_files.id with
         # no way of knowing whether that data should be refreshed or
         # not. So, just avoid the potential for weird race conditions
-        # and create another db obj in the next store().
+        # and create another DB obj in the next store().
         if len(files) == 0:
             return
         if not isinstance(files, dict):
@@ -134,3 +134,21 @@ class TemplateFiles(collections.Mapping):
             new_files = files
         self.files_id = None  # not persisted yet
         self.files = ReadOnlyDict(new_files)
+
+
+def get_files_from_container(cnxt, files_container, files=None):
+
+    if files is None:
+        files = {}
+    else:
+        files = files.copy()
+
+    swift_plugin = cnxt.clients.client_plugin('swift')
+
+    if not swift_plugin:
+        raise exception.ClientNotAvailable(client_name='swift')
+
+    new_files = swift_plugin.get_files_from_container(files_container,
+                                                      list(files.keys()))
+    new_files.update(files)
+    return new_files
